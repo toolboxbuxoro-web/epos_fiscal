@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "EPOS Fiscal",
-  "version": "0.1.0",
-  "identifier": "uz.eposfiscal.app",
+  "version": "0.1.1",
+  "identifier": "uz.eposfiscal.desktop",
   "build": {
     "beforeDevCommand": "npm run dev:vite",
     "beforeBuildCommand": "npm run build:vite",
