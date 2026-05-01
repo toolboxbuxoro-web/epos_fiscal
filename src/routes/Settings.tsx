@@ -1,28 +1,52 @@
 import { useEffect, useState } from 'react'
-import { getAllSettings, setSettings, SettingKey } from '@/lib/db'
-import { MoyskladClient } from '@/lib/moysklad/client'
+import { getAllSettings, setSetting, setSettings, SettingKey } from '@/lib/db'
+import {
+  authenticateMoysklad,
+  MoyskladClient,
+  MoyskladError,
+  type MsEmployee,
+  type MsRetailStore,
+} from '@/lib/moysklad'
 import { EposClient } from '@/lib/epos'
 import { Button } from '@/components/ui/Button'
 import { Input } from '@/components/ui/Input'
 import { Select } from '@/components/ui/Select'
 
 interface FormState {
+  // МойСклад логин
+  moyskladLogin: string
+  moyskladPassword: string
+  // МойСклад данные после логина
   moyskladToken: string
+  moyskladRetailStoreId: string
+  moyskladRetailStoreName: string
+  moyskladEmployeeId: string
+  moyskladEmployeeName: string
+  // Опрос
   moyskladPollInterval: string
+  // EPOS
   eposCommunicatorUrl: string
   eposToken: string
+  // Реквизиты
   companyName: string
   companyInn: string
   companyAddress: string
   companyPhone: string
   printerSize: string
+  // Matcher
   matchToleranceTiyin: string
   autoFiscalize: 'true' | 'false'
   replacementEnabled: 'true' | 'false'
 }
 
 const empty: FormState = {
+  moyskladLogin: '',
+  moyskladPassword: '',
   moyskladToken: '',
+  moyskladRetailStoreId: '',
+  moyskladRetailStoreName: '',
+  moyskladEmployeeId: '',
+  moyskladEmployeeName: '',
   moyskladPollInterval: '30',
   eposCommunicatorUrl: 'http://localhost:8347/uzpos',
   eposToken: 'DXJFX32CN1296678504F2',
@@ -40,8 +64,11 @@ export default function Settings() {
   const [form, setForm] = useState<FormState>(empty)
   const [busy, setBusy] = useState(false)
   const [saved, setSaved] = useState(false)
-  const [errors, setErrors] = useState<string | null>(null)
-  const [msTest, setMsTest] = useState<string>('')
+  const [error, setError] = useState<string | null>(null)
+  const [authError, setAuthError] = useState<string | null>(null)
+  const [authBusy, setAuthBusy] = useState(false)
+  const [stores, setStores] = useState<MsRetailStore[]>([])
+  const [employees, setEmployees] = useState<MsEmployee[]>([])
   const [eposTest, setEposTest] = useState<string>('')
 
   useEffect(() => {
@@ -50,8 +77,14 @@ export default function Settings() {
 
   async function load() {
     const all = await getAllSettings()
-    setForm({
+    setForm((f) => ({
+      ...f,
+      moyskladLogin: all[SettingKey.MoyskladLogin] ?? '',
       moyskladToken: all[SettingKey.MoyskladToken] ?? '',
+      moyskladRetailStoreId: all[SettingKey.MoyskladRetailStoreId] ?? '',
+      moyskladRetailStoreName: all[SettingKey.MoyskladRetailStoreName] ?? '',
+      moyskladEmployeeId: all[SettingKey.MoyskladEmployeeId] ?? '',
+      moyskladEmployeeName: all[SettingKey.MoyskladEmployeeName] ?? '',
       moyskladPollInterval: all[SettingKey.MoyskladPollIntervalSec] ?? '30',
       eposCommunicatorUrl:
         all[SettingKey.EposCommunicatorUrl] ?? 'http://localhost:8347/uzpos',
@@ -62,11 +95,14 @@ export default function Settings() {
       companyPhone: all[SettingKey.CompanyPhone] ?? '',
       printerSize: all[SettingKey.PrinterSize] ?? '80',
       matchToleranceTiyin: all[SettingKey.MatchToleranceTiyin] ?? '0',
-      autoFiscalize:
-        (all[SettingKey.AutoFiscalize] ?? 'false') as 'true' | 'false',
-      replacementEnabled:
-        (all[SettingKey.ReplacementEnabled] ?? 'true') as 'true' | 'false',
-    })
+      autoFiscalize: (all[SettingKey.AutoFiscalize] ?? 'false') as 'true' | 'false',
+      replacementEnabled: (all[SettingKey.ReplacementEnabled] ?? 'true') as 'true' | 'false',
+    }))
+    // если уже есть токен — подгрузим списки
+    const tok = all[SettingKey.MoyskladToken]
+    if (tok) {
+      void loadDirectories(tok)
+    }
   }
 
   function setField<K extends keyof FormState>(field: K, value: FormState[K]) {
@@ -74,12 +110,90 @@ export default function Settings() {
     setSaved(false)
   }
 
+  async function loadDirectories(token: string) {
+    try {
+      const client = new MoyskladClient({ token })
+      const [s, e] = await Promise.all([
+        client.listRetailStores(),
+        client.listEmployees(),
+      ])
+      setStores(s)
+      setEmployees(e)
+    } catch (err) {
+      // тихо: токен мог протухнуть
+      if (err instanceof MoyskladError && err.status === 401) {
+        setAuthError('Сессия истекла, войдите снова')
+      }
+    }
+  }
+
+  async function signIn() {
+    setAuthBusy(true)
+    setAuthError(null)
+    try {
+      const token = await authenticateMoysklad(form.moyskladLogin, form.moyskladPassword)
+      // Сохраняем токен и логин (пароль НЕ сохраняем).
+      await setSettings({
+        [SettingKey.MoyskladToken]: token,
+        [SettingKey.MoyskladLogin]: form.moyskladLogin,
+      })
+      setForm((f) => ({ ...f, moyskladToken: token, moyskladPassword: '' }))
+      await loadDirectories(token)
+    } catch (e) {
+      setAuthError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setAuthBusy(false)
+    }
+  }
+
+  async function signOut() {
+    await setSettings({
+      [SettingKey.MoyskladToken]: '',
+      [SettingKey.MoyskladLogin]: '',
+      [SettingKey.MoyskladRetailStoreId]: '',
+      [SettingKey.MoyskladRetailStoreName]: '',
+      [SettingKey.MoyskladEmployeeId]: '',
+      [SettingKey.MoyskladEmployeeName]: '',
+    })
+    setForm((f) => ({
+      ...f,
+      moyskladToken: '',
+      moyskladLogin: '',
+      moyskladRetailStoreId: '',
+      moyskladRetailStoreName: '',
+      moyskladEmployeeId: '',
+      moyskladEmployeeName: '',
+    }))
+    setStores([])
+    setEmployees([])
+  }
+
+  async function pickStore(id: string) {
+    const s = stores.find((x) => x.id === id)
+    setField('moyskladRetailStoreId', id)
+    setField('moyskladRetailStoreName', s?.name ?? '')
+    await setSettings({
+      [SettingKey.MoyskladRetailStoreId]: id,
+      [SettingKey.MoyskladRetailStoreName]: s?.name ?? '',
+    })
+  }
+
+  async function pickEmployee(id: string) {
+    const e = employees.find((x) => x.id === id)
+    const fio = e?.shortFio ?? e?.fullName ?? e?.name ?? ''
+    setField('moyskladEmployeeId', id)
+    setField('moyskladEmployeeName', fio)
+    await setSettings({
+      [SettingKey.MoyskladEmployeeId]: id,
+      [SettingKey.MoyskladEmployeeName]: fio,
+    })
+  }
+
   async function save() {
     setBusy(true)
-    setErrors(null)
+    setError(null)
     try {
       await setSettings({
-        [SettingKey.MoyskladToken]: form.moyskladToken,
         [SettingKey.MoyskladPollIntervalSec]: form.moyskladPollInterval,
         [SettingKey.EposCommunicatorUrl]: form.eposCommunicatorUrl,
         [SettingKey.EposToken]: form.eposToken,
@@ -94,20 +208,9 @@ export default function Settings() {
       })
       setSaved(true)
     } catch (e) {
-      setErrors(e instanceof Error ? e.message : String(e))
+      setError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(false)
-    }
-  }
-
-  async function testMoysklad() {
-    setMsTest('Проверяю…')
-    try {
-      const c = new MoyskladClient({ token: form.moyskladToken })
-      await c.ping()
-      setMsTest('OK — токен принят МойСклад')
-    } catch (e) {
-      setMsTest('Ошибка: ' + (e instanceof Error ? e.message : String(e)))
     }
   }
 
@@ -122,38 +225,102 @@ export default function Settings() {
     }
   }
 
+  const isAuthenticated = !!form.moyskladToken
+
   return (
     <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">Настройки</h1>
         <p className="mt-1 text-sm text-slate-500">
-          Подключения к МойСклад и EPOS Communicator, реквизиты компании, правила подбора.
+          Подключения к МойСклад и EPOS Communicator, реквизиты компании.
         </p>
       </div>
 
       <Section title="МойСклад">
-        <Field label="Bearer-токен">
-          <Input
-            type="password"
-            value={form.moyskladToken}
-            onChange={(e) => setField('moyskladToken', e.target.value)}
-            placeholder="Создайте сервисный токен в Настройки → Сервис"
-          />
-        </Field>
-        <Field label="Интервал опроса, сек">
-          <Input
-            type="number"
-            min={5}
-            value={form.moyskladPollInterval}
-            onChange={(e) => setField('moyskladPollInterval', e.target.value)}
-          />
-        </Field>
-        <div className="flex items-center gap-3">
-          <Button variant="secondary" size="sm" onClick={testMoysklad}>
-            Проверить подключение
-          </Button>
-          <span className="text-xs text-slate-600">{msTest}</span>
-        </div>
+        {!isAuthenticated ? (
+          <>
+            <Field label="Email или логин">
+              <Input
+                value={form.moyskladLogin}
+                onChange={(e) => setField('moyskladLogin', e.target.value)}
+                placeholder="user@example.com"
+                autoComplete="username"
+              />
+            </Field>
+            <Field label="Пароль">
+              <Input
+                type="password"
+                value={form.moyskladPassword}
+                onChange={(e) => setField('moyskladPassword', e.target.value)}
+                placeholder="••••••••"
+                autoComplete="current-password"
+              />
+            </Field>
+            <div className="col-span-1 md:col-span-2 flex items-center gap-3">
+              <Button
+                variant="primary"
+                disabled={authBusy || !form.moyskladLogin || !form.moyskladPassword}
+                onClick={signIn}
+              >
+                {authBusy ? 'Вход…' : 'Войти в МойСклад'}
+              </Button>
+              {authError && (
+                <span className="text-sm text-red-700">{authError}</span>
+              )}
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="col-span-1 md:col-span-2 flex items-center justify-between rounded-md bg-emerald-50 p-3 text-sm">
+              <div>
+                <span className="text-emerald-700">Залогинен как</span>{' '}
+                <span className="font-medium">{form.moyskladLogin || 'пользователь'}</span>
+              </div>
+              <Button variant="ghost" size="sm" onClick={signOut}>
+                Выйти
+              </Button>
+            </div>
+
+            <Field label="Точка продаж">
+              <Select
+                value={form.moyskladRetailStoreId}
+                onChange={(e) => void pickStore(e.target.value)}
+              >
+                <option value="">— выберите —</option>
+                {stores.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="Кассир (ФИО для чека)">
+              <Select
+                value={form.moyskladEmployeeId}
+                onChange={(e) => void pickEmployee(e.target.value)}
+              >
+                <option value="">— выберите —</option>
+                {employees.map((e) => (
+                  <option key={e.id} value={e.id}>
+                    {e.shortFio ?? e.fullName ?? e.name}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+
+            <Field label="Интервал опроса, сек">
+              <Input
+                type="number"
+                min={5}
+                value={form.moyskladPollInterval}
+                onChange={(e) => {
+                  setField('moyskladPollInterval', e.target.value)
+                  void setSetting(SettingKey.MoyskladPollIntervalSec, e.target.value)
+                }}
+              />
+            </Field>
+          </>
+        )}
       </Section>
 
       <Section title="EPOS Communicator">
@@ -179,7 +346,7 @@ export default function Settings() {
             <option value="80">80 мм</option>
           </Select>
         </Field>
-        <div className="flex items-center gap-3">
+        <div className="col-span-1 md:col-span-2 flex items-center gap-3">
           <Button variant="secondary" size="sm" onClick={testEpos}>
             Проверить подключение
           </Button>
@@ -229,7 +396,9 @@ export default function Settings() {
         <Field label="Подмена ИКПУ для товаров без приходов">
           <Select
             value={form.replacementEnabled}
-            onChange={(e) => setField('replacementEnabled', e.target.value as 'true' | 'false')}
+            onChange={(e) =>
+              setField('replacementEnabled', e.target.value as 'true' | 'false')
+            }
           >
             <option value="true">Включена</option>
             <option value="false">Выключена</option>
@@ -238,7 +407,9 @@ export default function Settings() {
         <Field label="Автоматическая фискализация без подтверждения">
           <Select
             value={form.autoFiscalize}
-            onChange={(e) => setField('autoFiscalize', e.target.value as 'true' | 'false')}
+            onChange={(e) =>
+              setField('autoFiscalize', e.target.value as 'true' | 'false')
+            }
           >
             <option value="false">Только по подтверждению оператора</option>
             <option value="true">Автоматически (рискованно)</option>
@@ -246,19 +417,17 @@ export default function Settings() {
         </Field>
       </Section>
 
-      {errors && (
+      {error && (
         <div className="rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-800">
-          {errors}
+          {error}
         </div>
       )}
 
       <div className="flex items-center gap-3 border-t border-slate-200 pt-4">
         <Button variant="primary" disabled={busy} onClick={save}>
-          {busy ? 'Сохранение…' : 'Сохранить'}
+          {busy ? 'Сохранение…' : 'Сохранить остальные настройки'}
         </Button>
-        {saved && (
-          <span className="text-sm text-emerald-700">Настройки сохранены</span>
-        )}
+        {saved && <span className="text-sm text-emerald-700">Сохранено</span>}
       </div>
     </div>
   )

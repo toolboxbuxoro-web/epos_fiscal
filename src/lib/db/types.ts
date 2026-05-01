@@ -19,8 +19,18 @@ export interface SettingRow {
 
 /** Известные ключи настроек. */
 export const SettingKey = {
-  /** Bearer-токен для МойСклад API */
+  /** Bearer-токен МойСклад (получен после ввода login/password). */
   MoyskladToken: 'moysklad.token',
+  /** Email/логин текущего залогиненного пользователя МойСклад (для UI). */
+  MoyskladLogin: 'moysklad.login',
+  /** ID выбранной точки продаж МойСклад. */
+  MoyskladRetailStoreId: 'moysklad.retailstore_id',
+  /** Имя выбранной точки продаж (для UI). */
+  MoyskladRetailStoreName: 'moysklad.retailstore_name',
+  /** ID выбранного кассира. */
+  MoyskladEmployeeId: 'moysklad.employee_id',
+  /** ФИО кассира (печатается в `staffName` чека EPOS). */
+  MoyskladEmployeeName: 'moysklad.employee_name',
   /** Интервал поллинга МойСклад в секундах */
   MoyskladPollIntervalSec: 'moysklad.poll_interval_sec',
   /** Адрес EPOS Communicator (обычно http://localhost:8347/uzpos) */

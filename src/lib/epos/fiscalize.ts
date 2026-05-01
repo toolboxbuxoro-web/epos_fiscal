@@ -58,6 +58,9 @@ export async function fiscalize(
   const eposToken = (await getSetting(SettingKey.EposToken))
     ?? 'DXJFX32CN1296678504F2'
   const printerSize = ((await getSetting(SettingKey.PrinterSize)) === '58' ? 58 : 80) as 58 | 80
+  // Имя кассира: либо переданное, либо выбранный в Settings, либо undefined.
+  const staffName =
+    opts.staffName ?? (await getSetting(SettingKey.MoyskladEmployeeName)) ?? undefined
 
   // 1. Сохранить ms_receipt в БД (или взять из opts).
   let msReceiptId: number
@@ -134,7 +137,7 @@ export async function fiscalize(
     companyName: company.name,
     companyAddress: company.address,
     companyINN: company.inn,
-    staffName: opts.staffName,
+    staffName,
     printerSize,
     phoneNumber: company.phone || undefined,
     companyPhoneNumber: company.phone || undefined,

@@ -1,8 +1,11 @@
 import { fetch } from '@tauri-apps/plugin-http'
 import {
   formatMsMoment,
+  type MsEmployee,
   type MsListResponse,
   type MsRetailDemand,
+  type MsRetailStore,
+  type MsTokenResponse,
 } from './types'
 
 const BASE_URL = 'https://api.moysklad.ru/api/remap/1.2'
@@ -24,6 +27,47 @@ export interface MoyskladClientOptions {
   fetchImpl?: typeof fetch
   /** Прерывание (AbortSignal) — пробрасывается во все запросы. */
   signal?: AbortSignal
+}
+
+/**
+ * Обменять login/password на access_token (одно действие, дальше пароль не нужен).
+ *
+ * @param login    email/имя пользователя МойСклад
+ * @param password пароль
+ * @param permanent  если true — токен живёт максимально долго (рекомендуем для нашего кейса);
+ *                   иначе ~24 часа.
+ */
+export async function authenticateMoysklad(
+  login: string,
+  password: string,
+  permanent = true,
+): Promise<string> {
+  const url = `${BASE_URL}/security/token${permanent ? '?permanentToken=true' : ''}`
+  const credentials = btoa(unescape(encodeURIComponent(`${login}:${password}`)))
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${credentials}`,
+      Accept: 'application/json;charset=utf-8',
+    },
+  })
+  if (!res.ok) {
+    let body: unknown
+    try {
+      body = await res.json()
+    } catch {
+      body = await res.text()
+    }
+    throw new MoyskladError(
+      res.status === 401
+        ? 'Неверный логин или пароль МойСклад'
+        : `Ошибка авторизации МойСклад: ${res.status}`,
+      res.status,
+      body,
+    )
+  }
+  const data = (await res.json()) as MsTokenResponse
+  return data.access_token
 }
 
 export class MoyskladClient {
@@ -99,5 +143,33 @@ export class MoyskladClient {
   async ping(): Promise<{ ok: true }> {
     await this.request<unknown>('/entity/employee?limit=1')
     return { ok: true }
+  }
+
+  // ── retailstore + employee ──────────────────────────────────
+
+  /** Получить активные торговые точки (для выбора в Settings). */
+  async listRetailStores(): Promise<MsRetailStore[]> {
+    const res = await this.request<MsListResponse<MsRetailStore>>(
+      '/entity/retailstore?limit=100',
+    )
+    return res.rows.filter((s) => s.archived !== true)
+  }
+
+  /** Получить активных сотрудников (кассиров). */
+  async listEmployees(): Promise<MsEmployee[]> {
+    const res = await this.request<MsListResponse<MsEmployee>>(
+      '/entity/employee?limit=200',
+    )
+    return res.rows.filter((e) => e.archived !== true)
+  }
+
+  /** Получить текущего пользователя (для отображения «залогинен как…»). */
+  async getMe(): Promise<MsEmployee | null> {
+    try {
+      const me = await this.request<MsEmployee>('/context/employee')
+      return me
+    } catch {
+      return null
+    }
   }
 }

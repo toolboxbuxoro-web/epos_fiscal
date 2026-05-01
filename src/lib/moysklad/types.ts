@@ -1,6 +1,37 @@
 // Типы МойСклад JSON API 1.2 (https://dev.moysklad.ru/doc/api/remap/1.2/).
 // Здесь только то, что нам нужно для работы с retaildemand и сопутствующими сущностями.
 
+// ── Auth ─────────────────────────────────────────────────────────
+
+export interface MsTokenResponse {
+  access_token: string
+}
+
+// ── Сотрудники / точки продаж ───────────────────────────────────
+
+export interface MsRetailStore {
+  meta: MsMeta
+  id: string
+  accountId: string
+  name: string
+  address?: string
+  archived?: boolean
+  active?: boolean
+  cashiers?: MsRef
+  organization?: MsRef
+}
+
+export interface MsEmployee {
+  meta: MsMeta
+  id: string
+  accountId: string
+  name: string
+  email?: string
+  fullName?: string
+  shortFio?: string
+  archived?: boolean
+}
+
 export interface MsMeta {
   href: string
   metadataHref?: string
