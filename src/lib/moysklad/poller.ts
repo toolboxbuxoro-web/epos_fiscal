@@ -100,7 +100,15 @@ export class MoyskladPoller {
       const client = new MoyskladClient(
         basic ? { basic } : { token: token! },
       )
-      const items = await client.listRecentRetailDemands(lastSync, 200)
+      // Фильтруем по выбранной точке продаж — иначе в multi-shop сценарии
+      // программа в магазине №1 увидела бы чеки магазина №2 и попыталась
+      // фискализировать их через свою USB-карту.
+      const retailStoreId = await getSetting(SettingKey.MoyskladRetailStoreId)
+      const items = await client.listRecentRetailDemands(
+        lastSync,
+        retailStoreId || null,
+        200,
+      )
 
       for (const item of items) {
         await this.persist(item)

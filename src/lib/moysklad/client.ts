@@ -100,15 +100,27 @@ export class MoyskladClient {
    * Получить розничные продажи, обновлённые с указанного момента.
    * Идеально для поллинга: передаём lastSync, получаем только новые/изменённые.
    *
-   * @param updatedFrom — epoch секунды (МойСклад принимает дату с миллисекундами)
+   * @param updatedFrom — epoch секунды
+   * @param retailStoreId — UUID точки продаж. Если задан, поллер видит только
+   *   чеки этой точки (важно для multi-shop: каждый магазин ставит свой
+   *   retailStoreId, чтобы не пытаться фискализировать чужие чеки через
+   *   свою USB-карту).
    * @param limit — максимум 1000 за запрос
    */
   async listRecentRetailDemands(
     updatedFrom: number,
+    retailStoreId?: string | null,
     limit = 100,
   ): Promise<MsRetailDemand[]> {
     const params = new URLSearchParams()
-    params.set('filter', `updated>${formatMsMoment(updatedFrom)}`)
+    // Фильтры МойСклад API объединяются через `;` в одном параметре `filter`.
+    const filters = [`updated>${formatMsMoment(updatedFrom)}`]
+    if (retailStoreId) {
+      filters.push(
+        `retailStore=https://api.moysklad.ru/api/remap/1.2/entity/retailstore/${retailStoreId}`,
+      )
+    }
+    params.set('filter', filters.join(';'))
     params.set('order', 'updated,asc')
     params.set('limit', String(Math.min(limit, 1000)))
     params.set('expand', 'positions.assortment')
