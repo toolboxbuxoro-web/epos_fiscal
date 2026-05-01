@@ -234,16 +234,41 @@ export default function Settings() {
 
   async function testEpos() {
     setEposTest('Проверяю…')
-    try {
-      const c = new EposClient({ url: form.eposCommunicatorUrl, token: form.eposToken })
-      const v = await c.getVersion()
-      setEposTest('OK — Communicator: ' + v)
-      await log.info('epos', `Communicator OK, версия: ${v}`, { url: form.eposCommunicatorUrl })
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      setEposTest('Ошибка: ' + msg)
-      await log.error('epos', 'Communicator недоступен', { url: form.eposCommunicatorUrl, error: msg })
+    const c = new EposClient({ url: form.eposCommunicatorUrl, token: form.eposToken })
+    // Разные сборки Communicator поддерживают разный набор служебных
+    // методов. Пробуем по порядку, останавливаемся на первом работающем.
+    const probes: Array<{ method: string; describe: (r: unknown) => string }> = [
+      { method: 'getVersion', describe: (r) => `версия ${String(r)}` },
+      { method: 'checkStatus', describe: () => 'checkStatus OK' },
+      { method: 'getDeviceId', describe: (r) => `device ${String(r)}` },
+      { method: 'getZReportCount', describe: (r) => `Z-отчётов ${String(r)}` },
+    ]
+
+    let lastError: unknown = null
+    for (const probe of probes) {
+      try {
+        const result = await c.call({ method: probe.method as never })
+        const desc = probe.describe(result)
+        setEposTest(`OK — Communicator отвечает (${desc})`)
+        await log.info('epos', `Communicator OK через ${probe.method}`, {
+          url: form.eposCommunicatorUrl,
+          method: probe.method,
+          result,
+        })
+        return
+      } catch (e) {
+        lastError = e
+        // продолжаем со следующим методом
+      }
     }
+
+    const msg = lastError instanceof Error ? lastError.message : String(lastError)
+    setEposTest('Ошибка: ' + msg)
+    await log.error('epos', 'Communicator не отвечает ни на один служебный метод', {
+      url: form.eposCommunicatorUrl,
+      error: msg,
+      tried: probes.map((p) => p.method),
+    })
   }
 
   async function checkUpdate() {
