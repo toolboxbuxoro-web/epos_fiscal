@@ -5,6 +5,7 @@ import {
   SettingKey,
   now,
 } from '@/lib/db'
+import { log } from '@/lib/log'
 import { MoyskladClient, MoyskladError } from './client'
 import { parseMsMoment, type MsRetailDemand } from './types'
 
@@ -113,6 +114,13 @@ export class MoyskladPoller {
           return t > acc ? t : acc
         }, lastSync)
         await setSetting(LAST_SYNC_KEY as never, String(latest + 1))
+        await log.info(
+          'poller',
+          `Получено ${items.length} новых/изменённых чеков из МойСклад`,
+          { count: items.length, names: items.map((i) => i.name).slice(0, 10) },
+        )
+      } else {
+        await log.debug('poller', 'Опрос завершён, новых чеков нет')
       }
 
       this.status.lastSuccessAt = now()
@@ -125,6 +133,10 @@ export class MoyskladPoller {
           : err instanceof Error
             ? err.message
             : String(err)
+      await log.error('poller', 'Ошибка опроса МойСклад', {
+        error: this.status.lastError,
+        status: err instanceof MoyskladError ? err.status : undefined,
+      })
     } finally {
       this.notify()
     }

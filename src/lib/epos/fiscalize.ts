@@ -7,6 +7,7 @@ import {
   getSetting,
   SettingKey,
 } from '@/lib/db'
+import { log } from '@/lib/log'
 import type { BuildMatchResult } from '@/lib/matcher/types'
 import { EposClient } from './client'
 import type {
@@ -151,11 +152,30 @@ export async function fiscalize(
   }
 
   // 4. Вызвать Communicator.
+  await log.info('fiscalize', `Отправляю чек ${build.receipt.name} в EPOS`, {
+    method: opts.fast ? 'fastSale' : 'sale',
+    items: items.length,
+    total,
+    eposUrl,
+  })
   const client = new EposClient({ url: eposUrl, token: eposToken })
-  await client.call(request)
+  try {
+    await client.call(request)
+  } catch (e) {
+    await log.error('fiscalize', 'EPOS Communicator вернул ошибку', {
+      error: e instanceof Error ? e.message : String(e),
+      eposUrl,
+    })
+    throw e
+  }
 
   // 5. Получить фискальный признак из getLastRegisteredReceipt.
   const fiscal = await client.getLastRegisteredReceipt()
+  await log.info('fiscalize', `Чек фискализирован: ${fiscal.FiscalSign}`, {
+    terminalId: fiscal.TerminalID,
+    receiptSeq: fiscal.ReceiptSeq,
+    qr: fiscal.QRCodeURL,
+  })
 
   // 6. Списать остатки на esf_items.
   for (const pm of build.positions) {

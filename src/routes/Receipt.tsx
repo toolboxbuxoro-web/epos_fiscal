@@ -1,15 +1,17 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import {
+  getDb,
   getMsReceipt,
   getSetting,
   setMsReceiptStatus,
   SettingKey,
+  now,
 } from '@/lib/db'
 import type { MsReceiptRow } from '@/lib/db/types'
 import { buildMatch, type BuildMatchResult } from '@/lib/matcher'
 import { fiscalize } from '@/lib/epos'
-import type { MsRetailDemand } from '@/lib/moysklad/types'
+import { MoyskladClient, inlinePositions, type MsRetailDemand } from '@/lib/moysklad'
 import { Button } from '@/components/ui/Button'
 import {
   formatDateTime,
@@ -51,7 +53,34 @@ export default function Receipt() {
         return
       }
       setReceipt(r)
-      const parsed = JSON.parse(r.raw_json) as MsRetailDemand
+
+      let parsed = JSON.parse(r.raw_json) as MsRetailDemand
+
+      // МойСклад в list-запросе не отдаёт inline positions.
+      // Если их нет — делаем одиночный запрос с expand (там работает),
+      // обновляем raw_json в БД, чтобы повторно не дёргать.
+      if (!inlinePositions(parsed)) {
+        const basic = await getSetting(SettingKey.MoyskladCredentials)
+        const token = basic ? null : await getSetting(SettingKey.MoyskladToken)
+        if (basic || token) {
+          try {
+            const client = new MoyskladClient(
+              basic ? { basic } : { token: token! },
+            )
+            const full = await client.getRetailDemand(parsed.id)
+            const db = await getDb()
+            await db.execute(
+              'UPDATE ms_receipts SET raw_json = $1, updated_at = $2 WHERE id = $3',
+              [JSON.stringify(full), now(), r.id],
+            )
+            parsed = full
+          } catch (fetchErr) {
+            // Не критично — продолжим без позиций, покажем варнинг.
+            console.warn('Не удалось дозагрузить позиции чека:', fetchErr)
+          }
+        }
+      }
+
       const tolStr = (await getSetting(SettingKey.MatchToleranceTiyin)) ?? '0'
       const tolerance = Number.parseInt(tolStr, 10) || 0
       const result = await buildMatch(parsed, { toleranceTiyin: tolerance })

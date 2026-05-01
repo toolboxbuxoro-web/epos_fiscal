@@ -4,6 +4,7 @@ const links = [
   { to: '/', label: 'Очередь' },
   { to: '/catalog', label: 'Справочник' },
   { to: '/history', label: 'История' },
+  { to: '/logs', label: 'Логи' },
   { to: '/settings', label: 'Настройки' },
 ]
 

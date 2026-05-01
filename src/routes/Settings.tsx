@@ -8,6 +8,8 @@ import {
   type MsRetailStore,
 } from '@/lib/moysklad'
 import { EposClient } from '@/lib/epos'
+import { applyUpdate, checkForUpdate } from '@/lib/updater'
+import { log } from '@/lib/log'
 import { Button } from '@/components/ui/Button'
 import { Input } from '@/components/ui/Input'
 import { Select } from '@/components/ui/Select'
@@ -70,6 +72,7 @@ export default function Settings() {
   const [stores, setStores] = useState<MsRetailStore[]>([])
   const [employees, setEmployees] = useState<MsEmployee[]>([])
   const [eposTest, setEposTest] = useState<string>('')
+  const [updateMsg, setUpdateMsg] = useState<string>('')
 
   useEffect(() => {
     void load()
@@ -235,8 +238,33 @@ export default function Settings() {
       const c = new EposClient({ url: form.eposCommunicatorUrl, token: form.eposToken })
       const v = await c.getVersion()
       setEposTest('OK — Communicator: ' + v)
+      await log.info('epos', `Communicator OK, версия: ${v}`, { url: form.eposCommunicatorUrl })
     } catch (e) {
-      setEposTest('Ошибка: ' + (e instanceof Error ? e.message : String(e)))
+      const msg = e instanceof Error ? e.message : String(e)
+      setEposTest('Ошибка: ' + msg)
+      await log.error('epos', 'Communicator недоступен', { url: form.eposCommunicatorUrl, error: msg })
+    }
+  }
+
+  async function checkUpdate() {
+    setUpdateMsg('Проверяю…')
+    try {
+      const update = await checkForUpdate()
+      if (!update) {
+        setUpdateMsg('Установлена последняя версия')
+        return
+      }
+      const ok = confirm(
+        `Доступно обновление: v${update.version}\n\n${update.body ?? ''}\n\nУстановить сейчас? Приложение перезапустится.`,
+      )
+      if (!ok) {
+        setUpdateMsg(`Доступна v${update.version} — установка отложена`)
+        return
+      }
+      setUpdateMsg(`Скачиваю и устанавливаю v${update.version}…`)
+      await applyUpdate(update)
+    } catch (e) {
+      setUpdateMsg('Ошибка: ' + (e instanceof Error ? e.message : String(e)))
     }
   }
 
@@ -430,6 +458,19 @@ export default function Settings() {
             <option value="true">Автоматически (рискованно)</option>
           </Select>
         </Field>
+      </Section>
+
+      <Section title="Обновления">
+        <div className="col-span-1 md:col-span-2 flex items-center gap-3">
+          <Button variant="secondary" size="sm" onClick={checkUpdate}>
+            Проверить обновления
+          </Button>
+          <span className="text-xs text-slate-600">{updateMsg}</span>
+        </div>
+        <div className="col-span-1 md:col-span-2 text-xs text-slate-500">
+          Приложение само проверяет наличие новой версии при запуске.
+          Кнопка выше делает это вручную.
+        </div>
       </Section>
 
       {error && (

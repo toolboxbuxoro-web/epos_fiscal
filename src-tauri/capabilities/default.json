@@ -16,6 +16,8 @@
     "sql:allow-select",
     "sql:allow-close",
     "updater:default",
+    "process:default",
+    "process:allow-restart",
     {
       "identifier": "http:default",
       "allow": [
