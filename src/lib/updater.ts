@@ -58,13 +58,23 @@ export async function applyUpdate(update: Update): Promise<void> {
 }
 
 /**
- * Проверить обновления при старте приложения. Тихо, без UI:
- * если есть — пишем в лог, а UI показывает только при ручном запросе.
+ * При старте приложения тихо проверяет, есть ли новая версия,
+ * и если есть — сразу скачивает + ставит + перезапускается.
+ *
+ * Без диалогов и подтверждений: пользователь видит, как приложение
+ * закрылось и открылось — уже новой версии. Логи операций пишутся
+ * на страницу «Логи» (источник: updater).
  */
-export async function backgroundCheckOnStartup(): Promise<void> {
+export async function autoApplyOnStartup(): Promise<void> {
   try {
-    await checkForUpdate()
+    const update = await checkForUpdate()
+    if (!update) return
+    await log.info('updater', `Применяю обновление v${update.version} автоматически`)
+    await applyUpdate(update)
   } catch {
     // ошибки уже залогированы внутри
   }
 }
+
+/** Алиас на старое имя — оставлен на случай существующих импортов. */
+export const backgroundCheckOnStartup = autoApplyOnStartup

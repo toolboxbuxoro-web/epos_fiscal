@@ -7,13 +7,15 @@ import History from '@/routes/History'
 import Logs from '@/routes/Logs'
 import Settings from '@/routes/Settings'
 import { useEffect } from 'react'
-import { backgroundCheckOnStartup } from '@/lib/updater'
+import { autoApplyOnStartup } from '@/lib/updater'
 import { log } from '@/lib/log'
 
 export default function App() {
   useEffect(() => {
     void log.info('app', 'Приложение запущено')
-    void backgroundCheckOnStartup()
+    // Авто-обновление: если есть новая версия — само скачивается
+    // и перезапускает приложение в новой версии. Без диалогов.
+    void autoApplyOnStartup()
   }, [])
 
   return (

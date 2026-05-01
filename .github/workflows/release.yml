@@ -82,6 +82,6 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: 'EPOS Fiscal ${{ github.ref_name }}'
           releaseBody: 'См. CHANGELOG.md'
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
