@@ -22,20 +22,34 @@ export interface CreateMatchInput {
   items: NewMatchItem[]
 }
 
-/** Создать подбор + позиции одной транзакцией. Возвращает id подбора. */
+/**
+ * Создать подбор + позиции. Возвращает id подбора.
+ *
+ * Раньше тут был BEGIN/COMMIT/ROLLBACK, но в tauri-plugin-sql это не работает
+ * как настоящая транзакция — каждый db.execute берёт свой коннект из пула,
+ * BEGIN на нём бесполезен, а COMMIT падает с «cannot commit - no transaction
+ * is active» если попадает на другой коннект. Это и ронял фискализацию.
+ *
+ * Теперь: создаём matches, затем match_items по очереди. Если что-то из
+ * match_items упало — удаляем matches чтобы не оставлять сиротскую запись.
+ * Это слабее ACID, но такого надёжного транзакционного API в tauri-plugin-sql
+ * сейчас нет (без перехода на rust-side wrapper).
+ */
 export async function createMatch(input: CreateMatchInput): Promise<number> {
   const db = await getDb()
   const ts = now()
 
-  await db.execute('BEGIN')
-  try {
-    const matchResult = await db.execute(
-      `INSERT INTO matches (ms_receipt_id, strategy, total_tiyin, diff_tiyin, created_at)
-       VALUES ($1,$2,$3,$4,$5)`,
-      [input.ms_receipt_id, input.strategy, input.total_tiyin, input.diff_tiyin, ts],
-    )
-    const matchId = matchResult.lastInsertId ?? 0
+  const matchResult = await db.execute(
+    `INSERT INTO matches (ms_receipt_id, strategy, total_tiyin, diff_tiyin, created_at)
+     VALUES ($1,$2,$3,$4,$5)`,
+    [input.ms_receipt_id, input.strategy, input.total_tiyin, input.diff_tiyin, ts],
+  )
+  const matchId = matchResult.lastInsertId ?? 0
+  if (matchId === 0) {
+    throw new Error('createMatch: SQLite не вернул lastInsertId')
+  }
 
+  try {
     for (const item of input.items) {
       await db.execute(
         `INSERT INTO match_items (match_id, esf_item_id, quantity, price_tiyin, vat_tiyin)
@@ -43,11 +57,15 @@ export async function createMatch(input: CreateMatchInput): Promise<number> {
         [matchId, item.esf_item_id, item.quantity, item.price_tiyin, item.vat_tiyin],
       )
     }
-
-    await db.execute('COMMIT')
     return matchId
   } catch (err) {
-    await db.execute('ROLLBACK')
+    // Откат вручную: убираем matches чтобы не остался без позиций.
+    // Если этот DELETE тоже упадёт — пробрасываем оригинальную ошибку.
+    try {
+      await db.execute('DELETE FROM matches WHERE id = $1', [matchId])
+    } catch {
+      /* ignore — оригинальная ошибка важнее */
+    }
     throw err
   }
 }
