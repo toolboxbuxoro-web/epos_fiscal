@@ -51,13 +51,20 @@ export async function authenticateMoysklad(
       Accept: 'application/json;charset=utf-8',
     },
   })
-  if (!res.ok) {
-    let body: unknown
+
+  // Читаем тело один раз — иначе на повторном чтении ловим
+  // "Body is disturbed or locked".
+  const text = await res.text()
+  let body: unknown = text
+  if (text) {
     try {
-      body = await res.json()
+      body = JSON.parse(text)
     } catch {
-      body = await res.text()
+      // оставляем как text
     }
+  }
+
+  if (!res.ok) {
     throw new MoyskladError(
       res.status === 401
         ? 'Неверный логин или пароль МойСклад'
@@ -66,8 +73,7 @@ export async function authenticateMoysklad(
       body,
     )
   }
-  const data = (await res.json()) as MsTokenResponse
-  return data.access_token
+  return (body as MsTokenResponse).access_token
 }
 
 export class MoyskladClient {
@@ -89,20 +95,25 @@ export class MoyskladClient {
       signal: init.signal ?? this.opts.signal,
     })
 
-    if (!res.ok) {
-      let body: unknown
+    // Читаем тело один раз — повторное чтение даёт "Body is disturbed or locked".
+    const text = await res.text()
+    let body: unknown = text
+    if (text) {
       try {
-        body = await res.json()
+        body = JSON.parse(text)
       } catch {
-        body = await res.text()
+        // оставляем text как есть
       }
+    }
+
+    if (!res.ok) {
       throw new MoyskladError(
         `MoySklad ${res.status} ${res.statusText} on ${url}`,
         res.status,
         body,
       )
     }
-    return (await res.json()) as T
+    return body as T
   }
 
   // ── retaildemand ────────────────────────────────────────────
