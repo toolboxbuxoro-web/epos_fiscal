@@ -10,6 +10,7 @@ import {
 import { log } from '@/lib/log'
 import type { BuildMatchResult } from '@/lib/matcher/types'
 import { EposClient } from './client'
+import { JsonRpcEposClient, type JsonRpcReceipt } from './jsonrpc-client'
 import type {
   CommunicatorItem,
   CommunicatorParams,
@@ -19,21 +20,14 @@ import type {
 import { vatIncluded } from '@/lib/matcher/strategies'
 
 export interface FiscalizeOptions {
-  /** Использовать `fastSale` (без печати чека). */
+  /** Использовать `fastSale` (без печати чека) — только для legacy /uzpos. */
   fast?: boolean
-  /** Имя кассира. */
   staffName?: string
-  /** ИНН клиента (если есть). */
   clientTin?: string
-  /** ПИНФЛ клиента (если есть). */
   clientPinfl?: string
-  /** Тип карты: 1=корп, 2=физлицо. По умолчанию 2. */
   cardType?: 1 | 2
-  /** Принято наличными, тийины. По умолчанию вся сумма. */
   receivedCash?: number
-  /** Принято картой, тийины. */
   receivedCard?: number
-  /** Перезаписать ms_receipt_id (для повторных попыток). */
   msReceiptId?: number
 }
 
@@ -44,62 +38,171 @@ export interface FiscalizeResult {
 }
 
 /**
- * Превратить план подбора в запрос Communicator, отправить, сохранить результат.
+ * Главная функция фискализации.
+ *
+ * Авто-определяет протокол по URL Communicator:
+ *   • URL содержит `/rpc/api` → новый JSON-RPC 2.0 (Api.SendSaleReceipt)
+ *   • иначе → legacy /uzpos (sale/fastSale)
  *
  * Все денежные значения и количество приходят уже в правильных единицах
- * (тийины и тысячные), доп. конвертация не нужна.
+ * (тийины и тысячные).
  */
 export async function fiscalize(
   build: BuildMatchResult,
   opts: FiscalizeOptions = {},
 ): Promise<FiscalizeResult> {
-  const company = await readCompanySettings()
-  const eposUrl = (await getSetting(SettingKey.EposCommunicatorUrl))
-    ?? 'http://localhost:8347/uzpos'
-  const eposToken = (await getSetting(SettingKey.EposToken))
-    ?? 'DXJFX32CN1296678504F2'
-  const printerSize = ((await getSetting(SettingKey.PrinterSize)) === '58' ? 58 : 80) as 58 | 80
-  // Имя кассира: либо переданное, либо выбранный в Settings, либо undefined.
-  const staffName =
-    opts.staffName ?? (await getSetting(SettingKey.MoyskladEmployeeName)) ?? undefined
+  const eposUrl =
+    (await getSetting(SettingKey.EposCommunicatorUrl)) ??
+    'http://localhost:8347/uzpos'
+  const eposToken =
+    (await getSetting(SettingKey.EposToken)) ?? 'DXJFX32CN1296678504F2'
 
-  // 1. Сохранить ms_receipt в БД (или взять из opts).
-  let msReceiptId: number
-  if (opts.msReceiptId) {
-    msReceiptId = opts.msReceiptId
+  // 1-2. Сохранить ms_receipt и match.
+  const { msReceiptId, matchDbId } = await persistMatch(build, opts)
+
+  if (build.positions.length === 0) {
+    throw new Error('Нечего отправлять в Communicator: пустой план')
+  }
+  const matchedTotal = build.positions.reduce(
+    (s, pm) => s + pm.candidates.reduce((cs, c) => cs + c.priceTiyin, 0),
+    0,
+  )
+  const receivedCash = opts.receivedCash ?? matchedTotal
+  const receivedCard = opts.receivedCard ?? 0
+
+  await log.info('fiscalize', `Отправляю чек ${build.receipt.name} в EPOS`, {
+    eposUrl,
+    items: build.positions.length,
+    total: matchedTotal,
+  })
+
+  // 3. Выбрать клиент по URL и отправить.
+  const isJsonRpc = /\/rpc\/?(?:api)?$/i.test(eposUrl) || eposUrl.includes(':3448')
+
+  let fiscal: FiscalReceiptInfo
+  let requestJson: string
+
+  if (isJsonRpc) {
+    const result = await fiscalizeJsonRpc(eposUrl, build, receivedCash, receivedCard)
+    fiscal = result.fiscal
+    requestJson = result.requestJson
   } else {
-    msReceiptId = await upsertMsReceipt({
-      ms_id: build.receipt.id,
-      ms_name: build.receipt.name,
-      ms_moment: 0,
-      ms_sum_tiyin: build.receipt.sum,
-      raw_json: JSON.stringify(build.receipt),
-      fetched_at: Math.floor(Date.now() / 1000),
-    })
+    const result = await fiscalizeLegacy(eposUrl, eposToken, build, opts, receivedCash, receivedCard)
+    fiscal = result.fiscal
+    requestJson = result.requestJson
   }
 
-  // 2. Сохранить план match'а.
-  const matchItems = build.positions.flatMap((pm) =>
+  await log.info('fiscalize', `Чек фискализирован: ${fiscal.FiscalSign}`, {
+    terminalId: fiscal.TerminalID,
+    receiptSeq: fiscal.ReceiptSeq,
+    qr: fiscal.QRCodeURL,
+  })
+
+  // 4. Списать остатки.
+  for (const pm of build.positions) {
+    for (const c of pm.candidates) {
+      await consumeEsfItem(c.esfItem.id, c.quantity)
+    }
+  }
+
+  // 5. Сохранить fiscal_receipt.
+  const fiscalReceiptDbId = await insertFiscalReceipt({
+    ms_receipt_id: msReceiptId,
+    match_id: matchDbId,
+    terminal_id: fiscal.TerminalID,
+    receipt_seq: fiscal.ReceiptSeq,
+    fiscal_sign: fiscal.FiscalSign,
+    qr_code_url: fiscal.QRCodeURL,
+    fiscal_datetime: fiscal.DateTime,
+    applet_version: fiscal.AppletVersion ?? null,
+    request_json: requestJson,
+    response_json: JSON.stringify(fiscal),
+  })
+
+  // 6. Статус.
+  await setMsReceiptStatus(msReceiptId, 'fiscalized')
+  return { fiscal, fiscalReceiptDbId, matchDbId }
+}
+
+// ── Реализация для нового JSON-RPC :3448/rpc/api ──────────────────────
+
+async function fiscalizeJsonRpc(
+  url: string,
+  build: BuildMatchResult,
+  receivedCash: number,
+  receivedCard: number,
+): Promise<{ fiscal: FiscalReceiptInfo; requestJson: string }> {
+  const items = build.positions.flatMap((pm) =>
     pm.candidates.map((c) => ({
-      esf_item_id: c.esfItem.id,
-      quantity: c.quantity,
-      price_tiyin: c.priceTiyin,
-      vat_tiyin: c.vatTiyin,
+      Price: c.priceTiyin,
+      Discount: 0,
+      Barcode: c.esfItem.barcode ?? '0',
+      Amount: c.quantity,
+      VAT: vatIncluded(c.priceTiyin, c.esfItem.vat_percent),
+      Name: c.esfItem.name,
+      Other: 0,
+      // Опциональные поля. Если сервер не знает — игнорирует;
+      // если знает (актуальная версия Communicator) — использует.
+      ClassCode: c.esfItem.class_code,
+      PackageCode: c.esfItem.package_code,
+      VATPercent: c.esfItem.vat_percent,
+      OwnerType: c.esfItem.owner_type,
     })),
   )
 
-  const matchDbId =
-    matchItems.length > 0
-      ? await createMatch({
-          ms_receipt_id: msReceiptId,
-          strategy: build.overallStrategy,
-          total_tiyin: build.matchedTotalTiyin,
-          diff_tiyin: build.totalDiffTiyin,
-          items: matchItems,
-        })
-      : null
+  const receipt: JsonRpcReceipt = {
+    Time: new Date().toISOString().slice(0, 19), // 2026-05-01T15:30:00
+    Items: items,
+    ReceivedCash: receivedCash,
+    ReceivedCard: receivedCard,
+  }
 
-  // 3. Собрать запрос для Communicator.
+  const client = new JsonRpcEposClient({ url })
+  const requestJson = JSON.stringify({
+    jsonrpc: '2.0',
+    method: 'Api.SendSaleReceipt',
+    params: { Receipt: receipt },
+  })
+
+  let answer
+  try {
+    answer = await client.sendSaleReceipt(receipt)
+  } catch (e) {
+    await log.error('fiscalize', 'JSON-RPC EPOS вернул ошибку', {
+      error: e instanceof Error ? e.message : String(e),
+      url,
+    })
+    throw e
+  }
+
+  const fiscal: FiscalReceiptInfo = {
+    TerminalID: answer.TerminalID,
+    ReceiptSeq: answer.ReceiptSeq,
+    DateTime: typeof answer.DateTime === 'string'
+      ? answer.DateTime
+      : new Date(answer.DateTime).toISOString(),
+    FiscalSign: answer.FiscalSign,
+    AppletVersion: answer.AppletVersion,
+    QRCodeURL: answer.QRCodeURL,
+  }
+  return { fiscal, requestJson }
+}
+
+// ── Реализация для legacy :8347/uzpos ─────────────────────────────────
+
+async function fiscalizeLegacy(
+  eposUrl: string,
+  eposToken: string,
+  build: BuildMatchResult,
+  opts: FiscalizeOptions,
+  receivedCash: number,
+  receivedCard: number,
+): Promise<{ fiscal: FiscalReceiptInfo; requestJson: string }> {
+  const company = await readCompanySettings()
+  const printerSize = ((await getSetting(SettingKey.PrinterSize)) === '58' ? 58 : 80) as 58 | 80
+  const staffName =
+    opts.staffName ?? (await getSetting(SettingKey.MoyskladEmployeeName)) ?? undefined
+
   const items: CommunicatorItem[] = build.positions.flatMap((pm) =>
     pm.candidates.map((c) => ({
       price: c.priceTiyin,
@@ -115,14 +218,6 @@ export async function fiscalize(
       ownerType: c.esfItem.owner_type,
     })),
   )
-
-  if (items.length === 0) {
-    throw new Error('Нечего отправлять в Communicator: пустой план')
-  }
-
-  const total = items.reduce((s, i) => s + i.price, 0)
-  const receivedCash = opts.receivedCash ?? total
-  const receivedCard = opts.receivedCard ?? 0
 
   const params: CommunicatorParams = {
     items,
@@ -151,57 +246,62 @@ export async function fiscalize(
     },
   }
 
-  // 4. Вызвать Communicator.
-  await log.info('fiscalize', `Отправляю чек ${build.receipt.name} в EPOS`, {
-    method: opts.fast ? 'fastSale' : 'sale',
-    items: items.length,
-    total,
-    eposUrl,
-  })
   const client = new EposClient({ url: eposUrl, token: eposToken })
   try {
     await client.call(request)
   } catch (e) {
-    await log.error('fiscalize', 'EPOS Communicator вернул ошибку', {
+    await log.error('fiscalize', 'EPOS Communicator (legacy) вернул ошибку', {
       error: e instanceof Error ? e.message : String(e),
       eposUrl,
     })
     throw e
   }
 
-  // 5. Получить фискальный признак из getLastRegisteredReceipt.
   const fiscal = await client.getLastRegisteredReceipt()
-  await log.info('fiscalize', `Чек фискализирован: ${fiscal.FiscalSign}`, {
-    terminalId: fiscal.TerminalID,
-    receiptSeq: fiscal.ReceiptSeq,
-    qr: fiscal.QRCodeURL,
-  })
+  return { fiscal, requestJson: JSON.stringify(request) }
+}
 
-  // 6. Списать остатки на esf_items.
-  for (const pm of build.positions) {
-    for (const c of pm.candidates) {
-      await consumeEsfItem(c.esfItem.id, c.quantity)
-    }
+// ── Helpers ────────────────────────────────────────────────────────
+
+async function persistMatch(
+  build: BuildMatchResult,
+  opts: FiscalizeOptions,
+): Promise<{ msReceiptId: number; matchDbId: number | null }> {
+  let msReceiptId: number
+  if (opts.msReceiptId) {
+    msReceiptId = opts.msReceiptId
+  } else {
+    msReceiptId = await upsertMsReceipt({
+      ms_id: build.receipt.id,
+      ms_name: build.receipt.name,
+      ms_moment: 0,
+      ms_sum_tiyin: build.receipt.sum,
+      raw_json: JSON.stringify(build.receipt),
+      fetched_at: Math.floor(Date.now() / 1000),
+    })
   }
 
-  // 7. Сохранить fiscal_receipt.
-  const fiscalReceiptDbId = await insertFiscalReceipt({
-    ms_receipt_id: msReceiptId,
-    match_id: matchDbId,
-    terminal_id: fiscal.TerminalID,
-    receipt_seq: fiscal.ReceiptSeq,
-    fiscal_sign: fiscal.FiscalSign,
-    qr_code_url: fiscal.QRCodeURL,
-    fiscal_datetime: fiscal.DateTime,
-    applet_version: fiscal.AppletVersion ?? null,
-    request_json: JSON.stringify(request),
-    response_json: JSON.stringify(fiscal),
-  })
+  const matchItems = build.positions.flatMap((pm) =>
+    pm.candidates.map((c) => ({
+      esf_item_id: c.esfItem.id,
+      quantity: c.quantity,
+      price_tiyin: c.priceTiyin,
+      vat_tiyin: c.vatTiyin,
+    })),
+  )
 
-  // 8. Поменять статус ms_receipt.
-  await setMsReceiptStatus(msReceiptId, 'fiscalized')
+  const matchDbId =
+    matchItems.length > 0
+      ? await createMatch({
+          ms_receipt_id: msReceiptId,
+          strategy: build.overallStrategy,
+          total_tiyin: build.matchedTotalTiyin,
+          diff_tiyin: build.totalDiffTiyin,
+          items: matchItems,
+        })
+      : null
 
-  return { fiscal, fiscalReceiptDbId, matchDbId }
+  return { msReceiptId, matchDbId }
 }
 
 interface CompanySettings {
@@ -219,7 +319,7 @@ async function readCompanySettings(): Promise<CompanySettings> {
 
   if (!name || !inn || !address) {
     throw new Error(
-      'Реквизиты компании не заполнены. Откройте «Настройки» и заполните название, ИНН и адрес.',
+      'Реквизиты компании не заполнены (для legacy /uzpos API). Откройте «Настройки».',
     )
   }
   return { name, inn, address, phone }

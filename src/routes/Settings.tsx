@@ -7,7 +7,7 @@ import {
   type MsEmployee,
   type MsRetailStore,
 } from '@/lib/moysklad'
-import { EposClient } from '@/lib/epos'
+import { EposClient, JsonRpcEposClient } from '@/lib/epos'
 import { applyUpdate, checkForUpdate } from '@/lib/updater'
 import { log } from '@/lib/log'
 import { Button } from '@/components/ui/Button'
@@ -234,6 +234,29 @@ export default function Settings() {
 
   async function testEpos() {
     setEposTest('Проверяю…')
+
+    // Сначала пробуем JSON-RPC :3448/rpc/api (актуальный API).
+    // На некоторых установках он есть параллельно со старым /uzpos
+    // и поддерживает больше методов.
+    try {
+      const rpc = new JsonRpcEposClient({
+        url: form.eposCommunicatorUrl.includes('/rpc/')
+          ? form.eposCommunicatorUrl
+          : 'http://localhost:3448/rpc/api',
+      })
+      const status = await rpc.status()
+      const term = Object.keys(status.Sender?.TotalFilesSent ?? {})[0] ?? '—'
+      const sent = Object.values(status.Sender?.TotalFilesSent ?? {}).reduce(
+        (s, v) => s + v,
+        0,
+      )
+      setEposTest(`OK — JSON-RPC API (terminal ${term}, отправлено в ОФД: ${sent})`)
+      await log.info('epos', 'JSON-RPC API доступно', { url: 'rpc/api', status })
+      return
+    } catch {
+      // не упало — пойдём пробовать legacy
+    }
+
     const c = new EposClient({ url: form.eposCommunicatorUrl, token: form.eposToken })
 
     // Стратегия: probe-методы делятся на два класса.
@@ -252,6 +275,15 @@ export default function Settings() {
       describe: (r: unknown) => string
       acceptableErrors?: RegExp[]
     }> = [
+      // Эмпирически: на «холодном» Communicator (без активной сессии Cashdesk)
+      // работает только getUnsentCount. Ставим первым.
+      {
+        method: 'getUnsentCount',
+        describe: (r) => {
+          const c = (r as { Count?: number })?.Count ?? '?'
+          return `неотправленных в ОФД: ${c}`
+        },
+      },
       { method: 'getVersion', describe: (r) => `версия ${String(r)}` },
       { method: 'checkStatus', describe: () => 'checkStatus OK' },
       { method: 'getDeviceId', describe: (r) => `device ${String(r)}` },
@@ -261,7 +293,6 @@ export default function Settings() {
         method: 'getZreportInfo',
         payload: { printerSize: 80, zReportId: 0 },
         describe: () => 'getZreportInfo OK',
-        // «Z уже открыт» / «Z не открыт» = метод существует, Communicator живой.
         acceptableErrors: [/Z\s*отчет/i, /Zreport/i, /not open/i],
       },
     ]
@@ -433,8 +464,13 @@ export default function Settings() {
           <Input
             value={form.eposCommunicatorUrl}
             onChange={(e) => setField('eposCommunicatorUrl', e.target.value)}
-            placeholder="http://localhost:8347/uzpos"
+            placeholder="http://localhost:3448/rpc/api"
           />
+          <div className="mt-1 text-xs text-slate-500">
+            Новый API (рекомендуется): <code className="bg-slate-100 px-1 rounded">http://localhost:3448/rpc/api</code>
+            <br />
+            Старый API: <code className="bg-slate-100 px-1 rounded">http://localhost:8347/uzpos</code>
+          </div>
         </Field>
         <Field label="Токен">
           <Input

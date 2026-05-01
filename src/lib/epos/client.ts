@@ -36,10 +36,13 @@ export class EposClient {
     payload: Omit<CommunicatorRequest, 'token'>,
   ): Promise<T> {
     const f = this.opts.fetchImpl ?? fetch
-    const body: CommunicatorRequest = {
+    // Поле `port: 3448` присутствует в каждом JSON у GBS Market 6.6 (декомпиляция
+    // UzPosCommand.cs). Без него часть установок Communicator не отвечает.
+    const body = {
       token: this.opts.token,
+      port: 3448,
       ...payload,
-    } as CommunicatorRequest
+    } as unknown as CommunicatorRequest
 
     const ctrl = new AbortController()
     const timer =
