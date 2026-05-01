@@ -235,27 +235,48 @@ export default function Settings() {
   async function testEpos() {
     setEposTest('Проверяю…')
 
+    await log.info('epos', '=== Начинаю проверку EPOS Communicator ===', {
+      url: form.eposCommunicatorUrl,
+      token: form.eposToken,
+    })
+
     // Сначала пробуем JSON-RPC :3448/rpc/api (актуальный API).
-    // На некоторых установках он есть параллельно со старым /uzpos
-    // и поддерживает больше методов.
+    const rpcUrl = form.eposCommunicatorUrl.includes('/rpc/')
+      ? form.eposCommunicatorUrl
+      : 'http://localhost:3448/rpc/api'
+
+    await log.info('epos', `[1/2] Пробую JSON-RPC API: ${rpcUrl}`, {
+      url: rpcUrl,
+      method: 'Api.Status',
+    })
+
     try {
-      const rpc = new JsonRpcEposClient({
-        url: form.eposCommunicatorUrl.includes('/rpc/')
-          ? form.eposCommunicatorUrl
-          : 'http://localhost:3448/rpc/api',
-      })
+      const rpc = new JsonRpcEposClient({ url: rpcUrl })
       const status = await rpc.status()
       const term = Object.keys(status.Sender?.TotalFilesSent ?? {})[0] ?? '—'
       const sent = Object.values(status.Sender?.TotalFilesSent ?? {}).reduce(
         (s, v) => s + v,
         0,
       )
-      setEposTest(`OK — JSON-RPC API (terminal ${term}, отправлено в ОФД: ${sent})`)
-      await log.info('epos', 'JSON-RPC API доступно', { url: 'rpc/api', status })
+      setEposTest(`OK — JSON-RPC (terminal ${term}, в ОФД: ${sent})`)
+      await log.info('epos', `✓ JSON-RPC отвечает: terminal ${term}, отправлено ${sent} файлов в ОФД`, {
+        url: rpcUrl,
+        terminalId: term,
+        filesSent: sent,
+        status,
+      })
       return
-    } catch {
-      // не упало — пойдём пробовать legacy
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      await log.warn('epos', `JSON-RPC не отвечает: ${msg}`, {
+        url: rpcUrl,
+        error: msg,
+      })
     }
+
+    await log.info('epos', `[2/2] Пробую legacy /uzpos: ${form.eposCommunicatorUrl}`, {
+      url: form.eposCommunicatorUrl,
+    })
 
     const c = new EposClient({ url: form.eposCommunicatorUrl, token: form.eposToken })
 
@@ -299,30 +320,37 @@ export default function Settings() {
 
     let firstNoMethodError: unknown = null
     for (const probe of probes) {
+      await log.debug('epos', `→ Пробую legacy метод: ${probe.method}`, {
+        method: probe.method,
+        payload: probe.payload,
+      })
       try {
         const result = await c.call({
           method: probe.method as never,
           ...(probe.payload ?? {}),
         } as never)
         setEposTest(`OK — ${probe.describe(result)}`)
-        await log.info('epos', `Communicator OK через ${probe.method}`, {
+        await log.info('epos', `✓ Legacy метод ${probe.method} ответил`, {
           url: form.eposCommunicatorUrl,
           method: probe.method,
+          result,
         })
         return
       } catch (e) {
         const errMsg = e instanceof Error ? e.message : String(e)
-        // Если ошибка соответствует «приемлемой» для probe — Communicator живой.
         if (probe.acceptableErrors?.some((re) => re.test(errMsg))) {
           setEposTest(`OK — Communicator отвечает (${errMsg.slice(0, 80)})`)
           await log.info(
             'epos',
-            `Communicator живой, ${probe.method} вернул ожидаемую ошибку`,
+            `✓ Communicator живой, ${probe.method} вернул ожидаемую ошибку`,
             { url: form.eposCommunicatorUrl, method: probe.method, errMsg },
           )
           return
         }
-        // Запомним первую ошибку про неизвестный метод — на случай если все probe упадут.
+        await log.debug('epos', `← ${probe.method}: ${errMsg}`, {
+          method: probe.method,
+          errMsg,
+        })
         if (!firstNoMethodError && /NO_SUCH_METHOD/i.test(errMsg)) {
           firstNoMethodError = e
         }
@@ -333,7 +361,7 @@ export default function Settings() {
       ? 'Ни один из служебных методов не распознан Communicator. Проверьте версию.'
       : 'Communicator не отвечает. Проверьте URL и что служба запущена.'
     setEposTest('Ошибка: ' + finalMsg)
-    await log.error('epos', finalMsg, {
+    await log.error('epos', `✗ Проверка завершилась ошибкой: ${finalMsg}`, {
       url: form.eposCommunicatorUrl,
       tried: probes.map((p) => p.method),
     })
