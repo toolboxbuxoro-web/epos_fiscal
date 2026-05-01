@@ -5,7 +5,6 @@ import {
   type MsListResponse,
   type MsRetailDemand,
   type MsRetailStore,
-  type MsTokenResponse,
 } from './types'
 
 const BASE_URL = 'https://api.moysklad.ru/api/remap/1.2'
@@ -21,69 +20,48 @@ export class MoyskladError extends Error {
   }
 }
 
+/**
+ * Закодировать login:password в base64 для Basic Auth.
+ *
+ * btoa(unescape(encodeURIComponent(...))) — стандартный приём для
+ * корректной обработки не-ASCII символов в логине/пароле.
+ */
+export function makeBasicCredentials(login: string, password: string): string {
+  return btoa(unescape(encodeURIComponent(`${login}:${password}`)))
+}
+
 export interface MoyskladClientOptions {
-  token: string
-  /** Кастомный fetch (для тестов). По умолчанию — Tauri HTTP. */
+  /**
+   * Один из двух:
+   *   - `basic`: base64 от "login:password" — Authorization: Basic <basic>
+   *   - `token`: Bearer токен — Authorization: Bearer <token>
+   * Если оба — приоритет у `basic`.
+   */
+  basic?: string
+  token?: string
+  /** Кастомный fetch (для тестов). */
   fetchImpl?: typeof fetch
-  /** Прерывание (AbortSignal) — пробрасывается во все запросы. */
+  /** Прерывание (AbortSignal). */
   signal?: AbortSignal
 }
 
-/**
- * Обменять login/password на access_token (одно действие, дальше пароль не нужен).
- *
- * @param login    email/имя пользователя МойСклад
- * @param password пароль
- * @param permanent  если true — токен живёт максимально долго (рекомендуем для нашего кейса);
- *                   иначе ~24 часа.
- */
-export async function authenticateMoysklad(
-  login: string,
-  password: string,
-  permanent = true,
-): Promise<string> {
-  const url = `${BASE_URL}/security/token${permanent ? '?permanentToken=true' : ''}`
-  const credentials = btoa(unescape(encodeURIComponent(`${login}:${password}`)))
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: `Basic ${credentials}`,
-      Accept: 'application/json;charset=utf-8',
-    },
-  })
-
-  // Читаем тело один раз — иначе на повторном чтении ловим
-  // "Body is disturbed or locked".
-  const text = await res.text()
-  let body: unknown = text
-  if (text) {
-    try {
-      body = JSON.parse(text)
-    } catch {
-      // оставляем как text
+export class MoyskladClient {
+  constructor(private readonly opts: MoyskladClientOptions) {
+    if (!opts.basic && !opts.token) {
+      throw new Error('MoyskladClient requires either `basic` or `token`')
     }
   }
 
-  if (!res.ok) {
-    throw new MoyskladError(
-      res.status === 401
-        ? 'Неверный логин или пароль МойСклад'
-        : `Ошибка авторизации МойСклад: ${res.status}`,
-      res.status,
-      body,
-    )
+  private authHeader(): string {
+    if (this.opts.basic) return `Basic ${this.opts.basic}`
+    return `Bearer ${this.opts.token}`
   }
-  return (body as MsTokenResponse).access_token
-}
-
-export class MoyskladClient {
-  constructor(private readonly opts: MoyskladClientOptions) {}
 
   private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
     const f = this.opts.fetchImpl ?? fetch
     const url = path.startsWith('http') ? path : `${BASE_URL}${path}`
     const headers = new Headers(init.headers)
-    headers.set('Authorization', `Bearer ${this.opts.token}`)
+    headers.set('Authorization', this.authHeader())
     headers.set('Accept', 'application/json;charset=utf-8')
     if (init.body && !headers.has('Content-Type')) {
       headers.set('Content-Type', 'application/json')
@@ -107,11 +85,11 @@ export class MoyskladClient {
     }
 
     if (!res.ok) {
-      throw new MoyskladError(
-        `MoySklad ${res.status} ${res.statusText} on ${url}`,
-        res.status,
-        body,
-      )
+      // Достаём осмысленное сообщение из ответа МойСклад, если есть.
+      const errMsg =
+        (body as { errors?: Array<{ error?: string }> })?.errors?.[0]?.error ??
+        `MoySklad ${res.status} ${res.statusText} on ${path}`
+      throw new MoyskladError(errMsg, res.status, body)
     }
     return body as T
   }
@@ -150,15 +128,12 @@ export class MoyskladClient {
     )
   }
 
-  /** Проверка валидности токена. */
-  async ping(): Promise<{ ok: true }> {
-    await this.request<unknown>('/entity/employee?limit=1')
-    return { ok: true }
+  /** Проверка валидности credentials. Возвращает информацию о текущем пользователе. */
+  async getMe(): Promise<MsEmployee> {
+    return this.request<MsEmployee>('/context/employee')
   }
 
-  // ── retailstore + employee ──────────────────────────────────
-
-  /** Получить активные торговые точки (для выбора в Settings). */
+  /** Получить активные торговые точки. */
   async listRetailStores(): Promise<MsRetailStore[]> {
     const res = await this.request<MsListResponse<MsRetailStore>>(
       '/entity/retailstore?limit=100',
@@ -172,15 +147,5 @@ export class MoyskladClient {
       '/entity/employee?limit=200',
     )
     return res.rows.filter((e) => e.archived !== true)
-  }
-
-  /** Получить текущего пользователя (для отображения «залогинен как…»). */
-  async getMe(): Promise<MsEmployee | null> {
-    try {
-      const me = await this.request<MsEmployee>('/context/employee')
-      return me
-    } catch {
-      return null
-    }
   }
 }

@@ -19,8 +19,16 @@ export interface SettingRow {
 
 /** Известные ключи настроек. */
 export const SettingKey = {
-  /** Bearer-токен МойСклад (получен после ввода login/password). */
+  /** Bearer-токен МойСклад (старый способ, fallback). */
   MoyskladToken: 'moysklad.token',
+  /**
+   * Basic-credentials МойСклад (base64 от "login:password").
+   * Современный способ авторизации — отправляется в каждом запросе
+   * как `Authorization: Basic <это>`. Хранится как plaintext base64,
+   * это не шифрование. БД лежит в Application Support, доступ к ней
+   * у других программ ограничен ОС.
+   */
+  MoyskladCredentials: 'moysklad.credentials',
   /** Email/логин текущего залогиненного пользователя МойСклад (для UI). */
   MoyskladLogin: 'moysklad.login',
   /** ID выбранной точки продаж МойСклад. */

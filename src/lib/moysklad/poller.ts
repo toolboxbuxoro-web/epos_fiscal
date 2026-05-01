@@ -82,9 +82,11 @@ export class MoyskladPoller {
     this.status.lastTickAt = now()
 
     try {
-      const token = await getSetting(SettingKey.MoyskladToken)
-      if (!token) {
-        this.status.lastError = 'Токен МойСклад не задан'
+      // Приоритет: новый Basic-флоу, fallback на старый Bearer-токен.
+      const basic = await getSetting(SettingKey.MoyskladCredentials)
+      const token = basic ? null : await getSetting(SettingKey.MoyskladToken)
+      if (!basic && !token) {
+        this.status.lastError = 'Войдите в МойСклад в Настройках'
         this.notify()
         return
       }
@@ -94,7 +96,9 @@ export class MoyskladPoller {
         ? Number.parseInt(lastSyncStr, 10)
         : now() - INITIAL_LOOKBACK_HOURS * 3600
 
-      const client = new MoyskladClient({ token })
+      const client = new MoyskladClient(
+        basic ? { basic } : { token: token! },
+      )
       const items = await client.listRecentRetailDemands(lastSync, 200)
 
       for (const item of items) {

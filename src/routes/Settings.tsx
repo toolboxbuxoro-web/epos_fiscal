@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { getAllSettings, setSetting, setSettings, SettingKey } from '@/lib/db'
 import {
-  authenticateMoysklad,
+  makeBasicCredentials,
   MoyskladClient,
   MoyskladError,
   type MsEmployee,
@@ -16,8 +16,8 @@ interface FormState {
   // МойСклад логин
   moyskladLogin: string
   moyskladPassword: string
-  // МойСклад данные после логина
-  moyskladToken: string
+  // МойСклад данные после логина (Basic credentials в base64)
+  moyskladCredentials: string
   moyskladRetailStoreId: string
   moyskladRetailStoreName: string
   moyskladEmployeeId: string
@@ -42,7 +42,7 @@ interface FormState {
 const empty: FormState = {
   moyskladLogin: '',
   moyskladPassword: '',
-  moyskladToken: '',
+  moyskladCredentials: '',
   moyskladRetailStoreId: '',
   moyskladRetailStoreName: '',
   moyskladEmployeeId: '',
@@ -80,7 +80,7 @@ export default function Settings() {
     setForm((f) => ({
       ...f,
       moyskladLogin: all[SettingKey.MoyskladLogin] ?? '',
-      moyskladToken: all[SettingKey.MoyskladToken] ?? '',
+      moyskladCredentials: all[SettingKey.MoyskladCredentials] ?? '',
       moyskladRetailStoreId: all[SettingKey.MoyskladRetailStoreId] ?? '',
       moyskladRetailStoreName: all[SettingKey.MoyskladRetailStoreName] ?? '',
       moyskladEmployeeId: all[SettingKey.MoyskladEmployeeId] ?? '',
@@ -98,10 +98,10 @@ export default function Settings() {
       autoFiscalize: (all[SettingKey.AutoFiscalize] ?? 'false') as 'true' | 'false',
       replacementEnabled: (all[SettingKey.ReplacementEnabled] ?? 'true') as 'true' | 'false',
     }))
-    // если уже есть токен — подгрузим списки
-    const tok = all[SettingKey.MoyskladToken]
-    if (tok) {
-      void loadDirectories(tok)
+    // если уже есть credentials — подгрузим списки
+    const creds = all[SettingKey.MoyskladCredentials]
+    if (creds) {
+      void loadDirectories(creds)
     }
   }
 
@@ -110,9 +110,9 @@ export default function Settings() {
     setSaved(false)
   }
 
-  async function loadDirectories(token: string) {
+  async function loadDirectories(basic: string) {
     try {
-      const client = new MoyskladClient({ token })
+      const client = new MoyskladClient({ basic })
       const [s, e] = await Promise.all([
         client.listRetailStores(),
         client.listEmployees(),
@@ -120,9 +120,8 @@ export default function Settings() {
       setStores(s)
       setEmployees(e)
     } catch (err) {
-      // тихо: токен мог протухнуть
       if (err instanceof MoyskladError && err.status === 401) {
-        setAuthError('Сессия истекла, войдите снова')
+        setAuthError('Сессия недействительна, войдите снова')
       }
     }
   }
@@ -131,16 +130,31 @@ export default function Settings() {
     setAuthBusy(true)
     setAuthError(null)
     try {
-      const token = await authenticateMoysklad(form.moyskladLogin, form.moyskladPassword)
-      // Сохраняем токен и логин (пароль НЕ сохраняем).
+      const basic = makeBasicCredentials(form.moyskladLogin, form.moyskladPassword)
+      // Проверяем credentials через GET /context/employee — если 401,
+      // выкинет MoyskladError с понятным сообщением.
+      const client = new MoyskladClient({ basic })
+      await client.getMe()
+      // Сохраняем — пароль уже зашит в base64-строку,
+      // отдельно plaintext-пароль не храним.
       await setSettings({
-        [SettingKey.MoyskladToken]: token,
+        [SettingKey.MoyskladCredentials]: basic,
         [SettingKey.MoyskladLogin]: form.moyskladLogin,
       })
-      setForm((f) => ({ ...f, moyskladToken: token, moyskladPassword: '' }))
-      await loadDirectories(token)
+      setForm((f) => ({
+        ...f,
+        moyskladCredentials: basic,
+        moyskladPassword: '',
+      }))
+      await loadDirectories(basic)
     } catch (e) {
-      setAuthError(e instanceof Error ? e.message : String(e))
+      const msg =
+        e instanceof MoyskladError && e.status === 401
+          ? 'Неверный логин или пароль'
+          : e instanceof Error
+            ? e.message
+            : String(e)
+      setAuthError(msg)
     } finally {
       setAuthBusy(false)
     }
@@ -148,6 +162,7 @@ export default function Settings() {
 
   async function signOut() {
     await setSettings({
+      [SettingKey.MoyskladCredentials]: '',
       [SettingKey.MoyskladToken]: '',
       [SettingKey.MoyskladLogin]: '',
       [SettingKey.MoyskladRetailStoreId]: '',
@@ -157,7 +172,7 @@ export default function Settings() {
     })
     setForm((f) => ({
       ...f,
-      moyskladToken: '',
+      moyskladCredentials: '',
       moyskladLogin: '',
       moyskladRetailStoreId: '',
       moyskladRetailStoreName: '',
@@ -225,7 +240,7 @@ export default function Settings() {
     }
   }
 
-  const isAuthenticated = !!form.moyskladToken
+  const isAuthenticated = !!form.moyskladCredentials
 
   return (
     <div className="space-y-6">
