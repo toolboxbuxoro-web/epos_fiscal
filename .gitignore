@@ -43,3 +43,5 @@ Thumbs.db
 *.db
 *.db-shm
 *.db-wal
+clean-prikhody-*.xlsx
+*.xlsx
