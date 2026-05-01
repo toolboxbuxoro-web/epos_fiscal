@@ -26,8 +26,10 @@ serde_json = "1"
 incremental = true
 
 [profile.release]
-codegen-units = 1
-lto = true
-opt-level = "s"
+# codegen-units = 16 (default) + lto = "thin": быстрая компиляция в CI,
+# при этом бинарь почти такой же по размеру и скорости как при full LTO.
+codegen-units = 16
+lto = "thin"
+opt-level = 3
 panic = "abort"
 strip = true
