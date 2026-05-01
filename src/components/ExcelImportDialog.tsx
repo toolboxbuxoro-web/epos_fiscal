@@ -10,6 +10,7 @@ import {
   type ImportResult,
   type RawRow,
 } from '@/lib/esf'
+import { clearAllEsfItems } from '@/lib/db'
 import { Button } from './ui/Button'
 import { Select } from './ui/Select'
 
@@ -40,6 +41,9 @@ export function ExcelImportDialog({ onClose, onImported }: Props) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [planResult, setPlanResult] = useState<ImportResult | null>(null)
+  const [clearBeforeImport, setClearBeforeImport] = useState(false)
+  /** После завершения импорта — финальный результат с реальной статистикой вставки. */
+  const [importResult, setImportResult] = useState<ImportResult | null>(null)
 
   async function onFileSelected(f: File) {
     setBusy(true)
@@ -81,13 +85,24 @@ export function ExcelImportDialog({ onClose, onImported }: Props) {
     setBusy(true)
     setError(null)
     try {
+      if (clearBeforeImport) {
+        await clearAllEsfItems()
+      }
       const result = await importExcelFile(file, mapping)
-      onImported(result)
+      // Показываем результат внутри диалога — пользователь видит реальную
+      // статистику вставки, а не «успех» в воздух. Закрытие диалога — отдельным
+      // действием через кнопку «Готово».
+      setImportResult(result)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(false)
     }
+  }
+
+  function finishAndClose() {
+    if (importResult) onImported(importResult)
+    else onClose()
   }
 
   const requiredMissing = (Object.entries(FIELD_LABELS) as [EsfField, { required: boolean }][])
@@ -196,7 +211,7 @@ export function ExcelImportDialog({ onClose, onImported }: Props) {
                 </div>
               </section>
 
-              {planResult && (
+              {planResult && !importResult && (
                 <section>
                   <h3 className="mb-2 text-sm font-medium text-slate-700">Готовность</h3>
                   <div className="grid grid-cols-3 gap-3 text-sm">
@@ -227,6 +242,91 @@ export function ExcelImportDialog({ onClose, onImported }: Props) {
                       )}
                     </ul>
                   )}
+                  <label className="mt-3 flex items-center gap-2 text-sm text-slate-700">
+                    <input
+                      type="checkbox"
+                      checked={clearBeforeImport}
+                      onChange={(e) => setClearBeforeImport(e.target.checked)}
+                      className="h-4 w-4 rounded border-slate-300"
+                    />
+                    Очистить справочник перед импортом
+                    <span className="text-xs text-slate-500">
+                      (рекомендуется — чтобы не было дубликатов)
+                    </span>
+                  </label>
+                </section>
+              )}
+
+              {importResult && (
+                <section className="rounded-lg border border-slate-200 bg-slate-50 p-4">
+                  <h3 className="mb-3 text-sm font-medium text-slate-800">
+                    Результат импорта
+                  </h3>
+                  <div className="grid grid-cols-4 gap-3 text-sm">
+                    <div className="rounded-md bg-white p-3">
+                      <div className="text-xs text-slate-500">Всего в файле</div>
+                      <div className="text-lg font-semibold">
+                        {importResult.totalRows}
+                      </div>
+                    </div>
+                    <div className="rounded-md bg-white p-3">
+                      <div className="text-xs text-slate-500">Прошли парсинг</div>
+                      <div className="text-lg font-semibold">
+                        {importResult.successRows}
+                      </div>
+                    </div>
+                    <div className="rounded-md bg-emerald-50 p-3">
+                      <div className="text-xs text-emerald-700">Вставлено в БД</div>
+                      <div className="text-lg font-semibold text-emerald-700">
+                        {importResult.insertedRows ?? 0}
+                      </div>
+                    </div>
+                    <div
+                      className={
+                        (importResult.insertErrors?.length ?? 0) > 0
+                          ? 'rounded-md bg-red-50 p-3'
+                          : 'rounded-md bg-slate-100 p-3'
+                      }
+                    >
+                      <div
+                        className={
+                          (importResult.insertErrors?.length ?? 0) > 0
+                            ? 'text-xs text-red-700'
+                            : 'text-xs text-slate-500'
+                        }
+                      >
+                        SQL-ошибок
+                      </div>
+                      <div
+                        className={
+                          (importResult.insertErrors?.length ?? 0) > 0
+                            ? 'text-lg font-semibold text-red-700'
+                            : 'text-lg font-semibold text-slate-500'
+                        }
+                      >
+                        {importResult.insertErrors?.length ?? 0}
+                      </div>
+                    </div>
+                  </div>
+                  {(importResult.insertErrors?.length ?? 0) > 0 && (
+                    <div className="mt-3">
+                      <p className="mb-1 text-xs font-medium text-red-700">
+                        Первые ошибки SQL (нужны для отладки):
+                      </p>
+                      <ul className="max-h-40 overflow-y-auto rounded-md bg-red-50 p-3 text-xs text-red-800">
+                        {(importResult.insertErrors ?? []).slice(0, 10).map((p, i) => (
+                          <li key={i} className="mb-1">
+                            #{p.rowIndex}: {p.message}
+                          </li>
+                        ))}
+                        {(importResult.insertErrors?.length ?? 0) > 10 && (
+                          <li className="italic">
+                            и ещё {(importResult.insertErrors?.length ?? 0) - 10}…
+                          </li>
+                        )}
+                      </ul>
+                    </div>
+                  )}
                 </section>
               )}
             </>
@@ -235,21 +335,29 @@ export function ExcelImportDialog({ onClose, onImported }: Props) {
 
         <div className="flex items-center justify-between border-t border-slate-200 bg-slate-50 px-6 py-3">
           <div className="text-xs text-slate-500">
-            {requiredMissing.length > 0 && preview
+            {requiredMissing.length > 0 && preview && !importResult
               ? `Не сопоставлены: ${requiredMissing.map((f) => FIELD_LABELS[f].label).join(', ')}`
               : ''}
           </div>
           <div className="flex gap-2">
-            <Button variant="ghost" onClick={onClose}>
-              Отмена
-            </Button>
-            <Button
-              variant="primary"
-              disabled={busy || !preview || requiredMissing.length > 0}
-              onClick={doImport}
-            >
-              {busy ? 'Импорт…' : 'Импортировать'}
-            </Button>
+            {!importResult && (
+              <Button variant="ghost" onClick={onClose}>
+                Отмена
+              </Button>
+            )}
+            {importResult ? (
+              <Button variant="primary" onClick={finishAndClose}>
+                Готово
+              </Button>
+            ) : (
+              <Button
+                variant="primary"
+                disabled={busy || !preview || requiredMissing.length > 0}
+                onClick={doImport}
+              >
+                {busy ? 'Импорт…' : 'Импортировать'}
+              </Button>
+            )}
           </div>
         </div>
       </div>

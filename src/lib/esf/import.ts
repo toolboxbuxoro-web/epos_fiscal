@@ -1,5 +1,6 @@
 import { bulkInsertEsfItems } from '@/lib/db'
 import type { NewEsfItem, OwnerType } from '@/lib/db/types'
+import { log } from '@/lib/log'
 import type {
   ColumnMapping,
   EsfField,
@@ -163,8 +164,44 @@ export async function importExcelFile(
 ): Promise<ImportResult> {
   const allRows = await readExcelAllRows(file)
   const plan = buildImportPlan(mapping, allRows)
-  if (plan.items.length > 0) {
-    await bulkInsertEsfItems(plan.items)
+
+  await log.info('esf-import', `План импорта: ${plan.successRows} из ${plan.totalRows}`, {
+    totalRows: plan.totalRows,
+    successRows: plan.successRows,
+    parseProblems: plan.problems.length,
+  })
+
+  if (plan.items.length === 0) {
+    return { ...plan, insertedRows: 0, insertErrors: [] }
   }
-  return plan
+
+  const { inserted, errors } = await bulkInsertEsfItems(plan.items)
+
+  // Сопоставляем индексы insertErrors с rowIndex (строка Excel) через
+  // план: каждый item в plan.items соответствует валидной строке allRows.
+  // Без двунаправленного маппинга — отдадим хотя бы порядковый № в plan.items.
+  const insertErrors: ImportProblem[] = errors.map((e) => ({
+    rowIndex: e.index + 1, // 1-based в списке валидных
+    message: e.message,
+  }))
+
+  await log.info(
+    'esf-import',
+    `Импорт завершён: вставлено ${inserted} из ${plan.items.length}, SQL-ошибок ${errors.length}`,
+    { inserted, total: plan.items.length, errorCount: errors.length },
+  )
+  if (errors.length > 0) {
+    // Первые 5 ошибок целиком в лог — чтобы было видно паттерн.
+    await log.error(
+      'esf-import',
+      `SQL-ошибки при импорте (показаны первые 5)`,
+      { samples: errors.slice(0, 5) },
+    )
+  }
+
+  return {
+    ...plan,
+    insertedRows: inserted,
+    insertErrors,
+  }
 }

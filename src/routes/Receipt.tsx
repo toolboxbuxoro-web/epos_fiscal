@@ -9,7 +9,7 @@ import {
   now,
 } from '@/lib/db'
 import type { MsReceiptRow } from '@/lib/db/types'
-import { buildMatch, type BuildMatchResult } from '@/lib/matcher'
+import { buildMatch, extractPositions, type BuildMatchResult } from '@/lib/matcher'
 import { fiscalize } from '@/lib/epos'
 import { MoyskladClient, inlinePositions, type MsRetailDemand } from '@/lib/moysklad'
 import { Button } from '@/components/ui/Button'
@@ -38,6 +38,21 @@ export default function Receipt() {
       return null
     }
   }, [receipt])
+
+  /**
+   * Позиции исходного чека из МойСклад — независимо от matcher.
+   * Левая колонка экрана показывает что прислал МС, даже если автоподбор провалился.
+   * Идентифицируем замэтченные через Set индексов из match.positions.
+   */
+  const sourcePositions = useMemo(() => {
+    if (!rd) return []
+    return extractPositions(rd)
+  }, [rd])
+
+  const matchedSourceIndexes = useMemo(() => {
+    if (!match) return new Set<number>()
+    return new Set(match.positions.map((pm) => pm.source.index))
+  }, [match])
 
   useEffect(() => {
     void load()
@@ -68,12 +83,17 @@ export default function Receipt() {
               basic ? { basic } : { token: token! },
             )
             const full = await client.getRetailDemand(parsed.id)
+            const newRawJson = JSON.stringify(full)
             const db = await getDb()
             await db.execute(
               'UPDATE ms_receipts SET raw_json = $1, updated_at = $2 WHERE id = $3',
-              [JSON.stringify(full), now(), r.id],
+              [newRawJson, now(), r.id],
             )
             parsed = full
+            // ВАЖНО: state receipt тоже надо обновить — иначе useMemo для `rd`
+            // и `sourcePositions` пересчитаются из старого raw_json и левая
+            // колонка останется пустой, хотя matcher уже видит позиции.
+            setReceipt({ ...r, raw_json: newRawJson })
           } catch (fetchErr) {
             // Не критично — продолжим без позиций, покажем варнинг.
             console.warn('Не удалось дозагрузить позиции чека:', fetchErr)
@@ -81,8 +101,17 @@ export default function Receipt() {
         }
       }
 
-      const tolStr = (await getSetting(SettingKey.MatchToleranceTiyin)) ?? '0'
-      const tolerance = Number.parseInt(tolStr, 10) || 0
+      // Дефолт допуска — 100 000 тийинов = 1 000 сум.
+      // На реальных чеках цены в МС vs приходах часто расходятся на копейки/рубли
+      // из-за округлений, дробных скидок, разных курсов конвертации.
+      // С tolerance=0 матчер отказывается даже на разнице в 1 сум, что абсурдно.
+      // Кассир может настроить точнее в разделе «Настройки».
+      const DEFAULT_TOLERANCE_TIYIN = 100_000
+      const tolStr = await getSetting(SettingKey.MatchToleranceTiyin)
+      const tolerance =
+        tolStr != null && tolStr !== ''
+          ? Number.parseInt(tolStr, 10) || 0
+          : DEFAULT_TOLERANCE_TIYIN
       const result = await buildMatch(parsed, { toleranceTiyin: tolerance })
       setMatch(result)
     } catch (e) {
@@ -158,12 +187,13 @@ export default function Receipt() {
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <Side title="Оригинал из МойСклад" sumTiyin={rd.sum}>
           <PositionsTable
-            positions={match.positions.map((pm) => ({
-              name: pm.source.name,
-              quantity: pm.source.quantity,
-              total: pm.source.totalTiyin,
-              vatPercent: pm.source.vatPercent,
-              meta: pm.source.classCode ?? '— нет ИКПУ —',
+            positions={sourcePositions.map((pos) => ({
+              name: pos.name,
+              quantity: pos.quantity,
+              total: pos.totalTiyin,
+              vatPercent: pos.vatPercent,
+              meta: pos.classCode ?? '— нет ИКПУ —',
+              matched: matchedSourceIndexes.has(pos.index),
             }))}
           />
         </Side>
@@ -181,6 +211,7 @@ export default function Receipt() {
                 total: c.priceTiyin,
                 vatPercent: c.esfItem.vat_percent,
                 meta: c.esfItem.class_code,
+                matched: true,
               })),
             )}
           />
@@ -218,6 +249,12 @@ interface DisplayPosition {
   total: number
   vatPercent: number
   meta: string
+  /**
+   * Для левой колонки (исходник МС): true если позицию удалось замэтчить.
+   * Для правой колонки (подбор) — всегда true.
+   * Используется для подсветки и индикатора ✓/✗.
+   */
+  matched: boolean
 }
 
 function PositionsTable({ positions }: { positions: DisplayPosition[] }) {
@@ -232,6 +269,7 @@ function PositionsTable({ positions }: { positions: DisplayPosition[] }) {
     <table className="min-w-full divide-y divide-slate-200 text-sm">
       <thead className="bg-slate-50/80">
         <tr>
+          <th className="w-6 px-2 py-2"></th>
           <th className="px-3 py-2 text-left text-xs font-medium text-slate-600">
             Товар
           </th>
@@ -245,7 +283,24 @@ function PositionsTable({ positions }: { positions: DisplayPosition[] }) {
       </thead>
       <tbody className="divide-y divide-slate-100">
         {positions.map((p, i) => (
-          <tr key={i}>
+          <tr key={i} className={p.matched ? '' : 'bg-amber-50/60'}>
+            <td className="w-6 px-2 py-2 text-center align-top">
+              {p.matched ? (
+                <span
+                  className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-emerald-100 text-xs font-semibold text-emerald-700"
+                  title="Подобрано"
+                >
+                  ✓
+                </span>
+              ) : (
+                <span
+                  className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-amber-100 text-xs font-semibold text-amber-700"
+                  title="Не подобрано"
+                >
+                  ✗
+                </span>
+              )}
+            </td>
             <td className="px-3 py-2">
               <div className="font-medium text-slate-900">{p.name}</div>
               <div className="font-mono text-xs text-slate-500">

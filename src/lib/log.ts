@@ -10,6 +10,7 @@ export type LogSource =
   | 'fiscalize'
   | 'updater'
   | 'ui'
+  | 'esf-import'
 
 export interface LogRow {
   id: number

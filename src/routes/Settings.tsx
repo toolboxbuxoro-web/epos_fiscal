@@ -97,7 +97,7 @@ export default function Settings() {
       companyAddress: all[SettingKey.CompanyAddress] ?? '',
       companyPhone: all[SettingKey.CompanyPhone] ?? '',
       printerSize: all[SettingKey.PrinterSize] ?? '80',
-      matchToleranceTiyin: all[SettingKey.MatchToleranceTiyin] ?? '0',
+      matchToleranceTiyin: all[SettingKey.MatchToleranceTiyin] ?? '100000',
       autoFiscalize: (all[SettingKey.AutoFiscalize] ?? 'false') as 'true' | 'false',
       replacementEnabled: (all[SettingKey.ReplacementEnabled] ?? 'true') as 'true' | 'false',
     }))
@@ -559,7 +559,11 @@ export default function Settings() {
             onChange={(e) => setField('matchToleranceTiyin', e.target.value)}
           />
           <div className="mt-1 text-xs text-slate-500">
-            Например, 5000 = ±50 сум на одну позицию
+            Насколько может расходиться сумма подобранного товара с оригиналом.
+            <br />
+            <strong>100000</strong> = ±1 000 сум (рекомендуется),{' '}
+            <strong>500000</strong> = ±5 000 сум (более либерально),{' '}
+            <strong>0</strong> = строго копейка-в-копейку (почти всегда не сработает).
           </div>
         </Field>
         <Field label="Подмена ИКПУ для товаров без приходов">

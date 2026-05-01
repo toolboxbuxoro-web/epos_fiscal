@@ -36,7 +36,7 @@ export async function tryPassthrough(
   const candidates = await listEsfItems({
     classCode: pos.classCode,
     minAvailable: pos.quantity,
-    vatPercent: opts.vatStrict !== false ? pos.vatPercent : undefined,
+    vatPercent: opts.vatStrict === true ? pos.vatPercent : undefined,
     limit: 50,
   })
 
@@ -72,7 +72,7 @@ export async function tryPriceBucket(
   // Ищем товары с ценой ≈ totalTiyin (за 1 шт, qty_received ≥ 1000).
   const all = await listEsfItems({
     minAvailable: 1000,
-    vatPercent: opts.vatStrict !== false ? pos.vatPercent : undefined,
+    vatPercent: opts.vatStrict === true ? pos.vatPercent : undefined,
     limit: 1000,
   })
 
@@ -116,7 +116,7 @@ export async function tryMultiItem(
 
   const pool = await listEsfItems({
     minAvailable: 1000,
-    vatPercent: opts.vatStrict !== false ? pos.vatPercent : undefined,
+    vatPercent: opts.vatStrict === true ? pos.vatPercent : undefined,
     limit: 2000,
   })
 

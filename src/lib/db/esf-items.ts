@@ -94,15 +94,35 @@ export async function insertEsfItem(item: NewEsfItem): Promise<number> {
   return result.lastInsertId ?? 0
 }
 
-export async function bulkInsertEsfItems(items: NewEsfItem[]): Promise<number> {
-  if (items.length === 0) return 0
+export interface BulkInsertResult {
+  inserted: number
+  errors: Array<{ index: number; message: string }>
+}
+
+/**
+ * Массово вставить приходы.
+ *
+ * Каждая строка в собственном try/catch — одна сломанная не прерывает остальные.
+ * Раньше использовался BEGIN/COMMIT через отдельные db.execute(), но в
+ * tauri-plugin-sql это не работает как настоящая транзакция: каждый execute
+ * берёт свой коннект из пула, BEGIN на нём бесполезен, а ошибка в середине
+ * прерывала цикл и оставляла половину данных в БД.
+ *
+ * Возвращает фактическое количество вставленных и список ошибок с индексами,
+ * чтобы UI мог показать «успешно X из Y, упало Z».
+ */
+export async function bulkInsertEsfItems(
+  items: NewEsfItem[],
+): Promise<BulkInsertResult> {
+  if (items.length === 0) return { inserted: 0, errors: [] }
   const db = await getDb()
   const ts = now()
-  let count = 0
-  // SQLite транзакция через BEGIN / COMMIT
-  await db.execute('BEGIN')
-  try {
-    for (const item of items) {
+  let inserted = 0
+  const errors: Array<{ index: number; message: string }> = []
+
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i]!
+    try {
       await db.execute(
         `INSERT INTO esf_items (
            source, external_id, name, barcode, class_code, package_code,
@@ -125,14 +145,14 @@ export async function bulkInsertEsfItems(items: NewEsfItem[]): Promise<number> {
           item.notes,
         ],
       )
-      count++
+      inserted++
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      errors.push({ index: i, message: `«${item.name}»: ${message}` })
     }
-    await db.execute('COMMIT')
-  } catch (err) {
-    await db.execute('ROLLBACK')
-    throw err
   }
-  return count
+
+  return { inserted, errors }
 }
 
 /** Зарезервировать (списать) количество на esf_item. Возвращает true, если хватило. */
@@ -150,4 +170,19 @@ export async function consumeEsfItem(id: number, quantity: MilliQty): Promise<bo
 export async function deleteEsfItem(id: number): Promise<void> {
   const db = await getDb()
   await db.execute('DELETE FROM esf_items WHERE id = $1', [id])
+}
+
+/**
+ * Удалить ВСЕ записи из esf_items.
+ * Используется при «Импорт с очисткой» в диалоге Excel-импорта,
+ * чтобы повторный импорт того же файла не создавал дубликаты.
+ *
+ * Безопасно вызывать только когда нет фискализаций со ссылками
+ * (но т.к. match_items имеет ON DELETE RESTRICT, попытка удалить
+ * использованный приход упадёт на FK — это и нужное поведение).
+ */
+export async function clearAllEsfItems(): Promise<number> {
+  const db = await getDb()
+  const result = await db.execute('DELETE FROM esf_items')
+  return result.rowsAffected ?? 0
 }

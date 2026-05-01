@@ -42,4 +42,11 @@ export interface ImportResult {
   problems: ImportProblem[]
   /** Готовые к вставке записи. */
   items: NewEsfItem[]
+  /**
+   * Сколько записей реально вставилось в БД.
+   * Может быть меньше successRows если какие-то INSERTы упали.
+   */
+  insertedRows?: number
+  /** Ошибки уровня SQL/БД (отдельно от parse-проблем). */
+  insertErrors?: ImportProblem[]
 }
