@@ -10,6 +10,11 @@ import {
 import { EposClient, JsonRpcEposClient } from '@/lib/epos'
 import { applyUpdate, checkForUpdate } from '@/lib/updater'
 import { log } from '@/lib/log'
+import {
+  listPrinters,
+  printTestQr,
+  type PrinterInfo,
+} from '@/lib/printer'
 import { Button } from '@/components/ui/Button'
 import { Input } from '@/components/ui/Input'
 import { Select } from '@/components/ui/Select'
@@ -35,6 +40,9 @@ interface FormState {
   companyAddress: string
   companyPhone: string
   printerSize: string
+  // Печать чека
+  printerName: string
+  printerAutoPrint: 'true' | 'false'
   // Matcher
   matchToleranceTiyin: string
   autoFiscalize: 'true' | 'false'
@@ -57,6 +65,8 @@ const empty: FormState = {
   companyAddress: '',
   companyPhone: '',
   printerSize: '80',
+  printerName: '',
+  printerAutoPrint: 'false',
   matchToleranceTiyin: '0',
   autoFiscalize: 'false',
   replacementEnabled: 'true',
@@ -73,10 +83,47 @@ export default function Settings() {
   const [employees, setEmployees] = useState<MsEmployee[]>([])
   const [eposTest, setEposTest] = useState<string>('')
   const [updateMsg, setUpdateMsg] = useState<string>('')
+  const [printers, setPrinters] = useState<PrinterInfo[]>([])
+  const [printerLoading, setPrinterLoading] = useState(false)
+  const [printerTestMsg, setPrinterTestMsg] = useState<string>('')
 
   useEffect(() => {
     void load()
+    void refreshPrinters()
   }, [])
+
+  /** Получить список принтеров через Rust-команду list_printers. */
+  async function refreshPrinters() {
+    setPrinterLoading(true)
+    try {
+      const list = await listPrinters()
+      setPrinters(list)
+    } catch (err) {
+      // Команда может упасть на macOS если CUPS не запущен — это нормально,
+      // печать всё равно опциональна.
+      console.warn('Не удалось получить список принтеров:', err)
+      setPrinters([])
+    } finally {
+      setPrinterLoading(false)
+    }
+  }
+
+  /** Тестовая печать на выбранный принтер. */
+  async function doTestPrint() {
+    setPrinterTestMsg('')
+    if (!form.printerName) {
+      setPrinterTestMsg('Сначала выберите принтер из списка.')
+      return
+    }
+    try {
+      const jobId = await printTestQr(form.printerName)
+      setPrinterTestMsg(`✓ Тестовый чек отправлен (job #${jobId})`)
+    } catch (err) {
+      setPrinterTestMsg(
+        `✗ Ошибка печати: ${err instanceof Error ? err.message : String(err)}`,
+      )
+    }
+  }
 
   async function load() {
     const all = await getAllSettings()
@@ -97,6 +144,10 @@ export default function Settings() {
       companyAddress: all[SettingKey.CompanyAddress] ?? '',
       companyPhone: all[SettingKey.CompanyPhone] ?? '',
       printerSize: all[SettingKey.PrinterSize] ?? '80',
+      printerName: all[SettingKey.PrinterName] ?? '',
+      printerAutoPrint: (all[SettingKey.PrinterAutoPrint] ?? 'false') as
+        | 'true'
+        | 'false',
       matchToleranceTiyin: all[SettingKey.MatchToleranceTiyin] ?? '100000',
       autoFiscalize: (all[SettingKey.AutoFiscalize] ?? 'false') as 'true' | 'false',
       replacementEnabled: (all[SettingKey.ReplacementEnabled] ?? 'true') as 'true' | 'false',
@@ -220,6 +271,8 @@ export default function Settings() {
         [SettingKey.CompanyAddress]: form.companyAddress,
         [SettingKey.CompanyPhone]: form.companyPhone,
         [SettingKey.PrinterSize]: form.printerSize,
+        [SettingKey.PrinterName]: form.printerName,
+        [SettingKey.PrinterAutoPrint]: form.printerAutoPrint,
         [SettingKey.MatchToleranceTiyin]: form.matchToleranceTiyin,
         [SettingKey.AutoFiscalize]: form.autoFiscalize,
         [SettingKey.ReplacementEnabled]: form.replacementEnabled,
@@ -587,6 +640,81 @@ export default function Settings() {
             <option value="false">Только по подтверждению оператора</option>
             <option value="true">Автоматически (рискованно)</option>
           </Select>
+        </Field>
+      </Section>
+
+      <Section title="Печать чека">
+        <Field label="Принтер">
+          <div className="flex gap-2">
+            <Select
+              value={form.printerName}
+              onChange={(e) => setField('printerName', e.target.value)}
+              className="flex-1"
+            >
+              <option value="">— не выбран —</option>
+              {printers.map((p) => (
+                <option key={p.system_name} value={p.system_name}>
+                  {p.name}
+                  {p.is_default ? ' (по умолчанию)' : ''}
+                  {p.state !== 'READY' ? ` · ${p.state}` : ''}
+                </option>
+              ))}
+            </Select>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => void refreshPrinters()}
+              disabled={printerLoading}
+            >
+              {printerLoading ? '…' : 'Обновить'}
+            </Button>
+          </div>
+          <div className="mt-1 text-xs text-slate-500">
+            Список берётся из ОС. Если принтера нет — установите драйвер
+            Xprinter (или Generic Text Only ESC/POS) и нажмите «Обновить».
+          </div>
+        </Field>
+
+        <Field label="Авто-печать после фискализации">
+          <Select
+            value={form.printerAutoPrint}
+            onChange={(e) =>
+              setField('printerAutoPrint', e.target.value as 'true' | 'false')
+            }
+          >
+            <option value="false">Не печатать (только электронный чек)</option>
+            <option value="true">
+              Печатать QR-код автоматически после успеха
+            </option>
+          </Select>
+          <div className="mt-1 text-xs text-slate-500">
+            Сейчас печатается только QR-код фискального чека. Покупатель
+            сканирует QR — открывается электронный чек на soliq.uz.
+          </div>
+        </Field>
+
+        <Field label="Тест печати">
+          <div className="flex items-start gap-2">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => void doTestPrint()}
+              disabled={!form.printerName}
+            >
+              Напечатать тестовый QR
+            </Button>
+            {printerTestMsg && (
+              <span
+                className={
+                  printerTestMsg.startsWith('✓')
+                    ? 'text-xs text-emerald-700'
+                    : 'text-xs text-red-700'
+                }
+              >
+                {printerTestMsg}
+              </span>
+            )}
+          </div>
         </Field>
       </Section>
 

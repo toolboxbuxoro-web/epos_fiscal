@@ -972,6 +972,7 @@ dependencies = [
 name = "epos-fiscal"
 version = "0.1.0"
 dependencies = [
+ "printers",
  "serde",
  "serde_json",
  "tauri",
@@ -3036,6 +3037,15 @@ checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "printers"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9973d6bf0ed339da9230a83eccbd7c2564f392bdc80246853645e9a60efb38b0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

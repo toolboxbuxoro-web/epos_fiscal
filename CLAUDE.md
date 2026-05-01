@@ -21,6 +21,7 @@
 | HTTP | `tauri-plugin-http` (reqwest, **с фичей `gzip`**) | client.ts/jsonrpc-client.ts |
 | Excel | SheetJS (`xlsx` from CDN, не из npm) | `src/lib/esf/excel.ts` |
 | Auto-update | `tauri-plugin-updater` + minisign | `src/lib/updater.ts` |
+| Печать чека | crate `printers` + raw ESC/POS байты | `src-tauri/src/printer.rs` + `src/lib/printer/` |
 | CI | GitHub Actions | `.github/workflows/release.yml` |
 
 ## Архитектура (один магазин)
@@ -283,5 +284,8 @@ docs/
 - ✅ Auto-update работает с подписью
 - ✅ Multi-shop архитектура (фильтр по точке продаж)
 - ✅ JSON-RPC поддержка для актуального Communicator
+- ✅ Импорт Excel: per-row try/catch вместо broken-транзакции (819 из 819 строк)
+- ✅ Matcher по дефолту vatStrict=false + tolerance 100k тийинов (без этого 0 матчей на реальных чеках)
+- ✅ Печать QR на термопринтер (Xprinter XP-80 USB) после успешной фискализации
 - ⏳ Реальная фискализация end-to-end ещё не проверена (ждём пробный чек)
 - ⏳ Реверс-инжиниринг точного формата `Receipt` для JSON-RPC API

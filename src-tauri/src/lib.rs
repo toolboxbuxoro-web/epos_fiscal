@@ -1,5 +1,7 @@
 use tauri_plugin_sql::{Migration, MigrationKind};
 
+mod printer;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let migrations = vec![
@@ -26,6 +28,11 @@ pub fn run() {
                 .add_migrations("sqlite:epos_fiscal.db", migrations)
                 .build(),
         )
+        .invoke_handler(tauri::generate_handler![
+            printer::list_printers,
+            printer::print_test_qr,
+            printer::print_fiscal_qr,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

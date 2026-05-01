@@ -52,6 +52,16 @@ export const SettingKey = {
   CompanyPhone: 'company.phone',
   /** Ширина ленты принтера: 58 или 80 */
   PrinterSize: 'printer.size',
+  /**
+   * Имя выбранного термопринтера (точное system_name из ОС).
+   * Если пусто — печать чеков отключена даже при PrinterAutoPrint=true.
+   */
+  PrinterName: 'printer.name',
+  /**
+   * Автоматически печатать чек после успешной фискализации.
+   * 'true' / 'false'. По умолчанию — false (печатать только по кнопке).
+   */
+  PrinterAutoPrint: 'printer.auto_print',
   /** Допуск по сумме при подборе чека (в тийинах) */
   MatchToleranceTiyin: 'matcher.tolerance_tiyin',
   /** Включён ли режим автоматической фискализации */

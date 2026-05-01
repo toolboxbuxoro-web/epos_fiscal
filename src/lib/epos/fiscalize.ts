@@ -9,6 +9,7 @@ import {
 } from '@/lib/db'
 import { log } from '@/lib/log'
 import type { BuildMatchResult } from '@/lib/matcher/types'
+import { printFiscalQr } from '@/lib/printer'
 import { EposClient } from './client'
 import { JsonRpcEposClient, type JsonRpcReceipt } from './jsonrpc-client'
 import type {
@@ -121,7 +122,41 @@ export async function fiscalize(
 
   // 6. Статус.
   await setMsReceiptStatus(msReceiptId, 'fiscalized')
+
+  // 7. Авто-печать QR на термопринтер, если включено в Settings.
+  // Печать НЕ должна валить фискализацию — чек уже в ОФД, лента это
+  // просто удобство для покупателя. Любая ошибка идёт в логи и видна
+  // в разделе «Логи», но возвращаемый результат остаётся успешным.
+  await maybePrintQr(fiscal.QRCodeURL)
+
   return { fiscal, fiscalReceiptDbId, matchDbId }
+}
+
+/**
+ * Если в настройках включена авто-печать и выбран принтер — отправить QR
+ * на термопринтер. Ошибки залогировать, но не пробрасывать наверх.
+ */
+async function maybePrintQr(qrUrl: string): Promise<void> {
+  try {
+    const enabled = (await getSetting(SettingKey.PrinterAutoPrint)) === 'true'
+    if (!enabled) return
+    const printerName = await getSetting(SettingKey.PrinterName)
+    if (!printerName) {
+      await log.warn(
+        'fiscalize',
+        'Авто-печать включена, но принтер не выбран',
+      )
+      return
+    }
+    const jobId = await printFiscalQr(printerName, qrUrl)
+    await log.info('fiscalize', `QR-чек отправлен на печать (job #${jobId})`, {
+      printer: printerName,
+    })
+  } catch (err) {
+    await log.error('fiscalize', 'Ошибка печати QR-чека', {
+      error: err instanceof Error ? err.message : String(err),
+    })
+  }
 }
 
 // ── Реализация для нового JSON-RPC :3448/rpc/api ──────────────────────
