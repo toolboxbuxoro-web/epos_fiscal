@@ -235,38 +235,75 @@ export default function Settings() {
   async function testEpos() {
     setEposTest('Проверяю…')
     const c = new EposClient({ url: form.eposCommunicatorUrl, token: form.eposToken })
-    // Разные сборки Communicator поддерживают разный набор служебных
-    // методов. Пробуем по порядку, останавливаемся на первом работающем.
-    const probes: Array<{ method: string; describe: (r: unknown) => string }> = [
+
+    // Стратегия: probe-методы делятся на два класса.
+    //
+    // 1. «Служебные» (getVersion, checkStatus, getDeviceId, getZReportCount) —
+    //    могут отсутствовать в старых сборках Communicator (NO_SUCH_METHOD_AVAILABLE).
+    // 2. «Базовые» (getReceiptCount, getZreportInfo с zReportId=0, openZreport) —
+    //    есть в любой версии. Возвращают либо успех, либо «Z уже открыт» / «Z не открыт» —
+    //    но не NO_SUCH_METHOD_AVAILABLE.
+    //
+    // Идём служебными → потом базовыми. Базовые ошибки типа «Z уже открыт» считаем
+    // подтверждением что Communicator живой.
+    const probes: Array<{
+      method: string
+      payload?: Record<string, unknown>
+      describe: (r: unknown) => string
+      acceptableErrors?: RegExp[]
+    }> = [
       { method: 'getVersion', describe: (r) => `версия ${String(r)}` },
       { method: 'checkStatus', describe: () => 'checkStatus OK' },
       { method: 'getDeviceId', describe: (r) => `device ${String(r)}` },
       { method: 'getZReportCount', describe: (r) => `Z-отчётов ${String(r)}` },
+      { method: 'getReceiptCount', describe: (r) => `чеков в ФМ: ${String(r)}` },
+      {
+        method: 'getZreportInfo',
+        payload: { printerSize: 80, zReportId: 0 },
+        describe: () => 'getZreportInfo OK',
+        // «Z уже открыт» / «Z не открыт» = метод существует, Communicator живой.
+        acceptableErrors: [/Z\s*отчет/i, /Zreport/i, /not open/i],
+      },
     ]
 
-    let lastError: unknown = null
+    let firstNoMethodError: unknown = null
     for (const probe of probes) {
       try {
-        const result = await c.call({ method: probe.method as never })
-        const desc = probe.describe(result)
-        setEposTest(`OK — Communicator отвечает (${desc})`)
+        const result = await c.call({
+          method: probe.method as never,
+          ...(probe.payload ?? {}),
+        } as never)
+        setEposTest(`OK — ${probe.describe(result)}`)
         await log.info('epos', `Communicator OK через ${probe.method}`, {
           url: form.eposCommunicatorUrl,
           method: probe.method,
-          result,
         })
         return
       } catch (e) {
-        lastError = e
-        // продолжаем со следующим методом
+        const errMsg = e instanceof Error ? e.message : String(e)
+        // Если ошибка соответствует «приемлемой» для probe — Communicator живой.
+        if (probe.acceptableErrors?.some((re) => re.test(errMsg))) {
+          setEposTest(`OK — Communicator отвечает (${errMsg.slice(0, 80)})`)
+          await log.info(
+            'epos',
+            `Communicator живой, ${probe.method} вернул ожидаемую ошибку`,
+            { url: form.eposCommunicatorUrl, method: probe.method, errMsg },
+          )
+          return
+        }
+        // Запомним первую ошибку про неизвестный метод — на случай если все probe упадут.
+        if (!firstNoMethodError && /NO_SUCH_METHOD/i.test(errMsg)) {
+          firstNoMethodError = e
+        }
       }
     }
 
-    const msg = lastError instanceof Error ? lastError.message : String(lastError)
-    setEposTest('Ошибка: ' + msg)
-    await log.error('epos', 'Communicator не отвечает ни на один служебный метод', {
+    const finalMsg = firstNoMethodError
+      ? 'Ни один из служебных методов не распознан Communicator. Проверьте версию.'
+      : 'Communicator не отвечает. Проверьте URL и что служба запущена.'
+    setEposTest('Ошибка: ' + finalMsg)
+    await log.error('epos', finalMsg, {
       url: form.eposCommunicatorUrl,
-      error: msg,
       tried: probes.map((p) => p.method),
     })
   }

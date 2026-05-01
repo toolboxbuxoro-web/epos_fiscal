@@ -10,6 +10,7 @@ export class EposError extends Error {
     message: string,
     public readonly status?: number,
     public readonly body?: unknown,
+    public readonly method?: string,
   ) {
     super(message)
     this.name = 'EposError'
@@ -50,7 +51,9 @@ export class EposClient {
     try {
       res = await f(this.opts.url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        // Точная форма из документации Communicator и реальных интеграций
+        // (GBS Market UzPosDriver.cs, ismatovbotir/RSGposServer).
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
         body: JSON.stringify(body),
         signal: ctrl.signal,
       })
@@ -69,7 +72,7 @@ export class EposClient {
 
     const data = (await res.json()) as CommunicatorResponse<T>
     if (data.error) {
-      throw new EposError(data.message)
+      throw new EposError(data.message, undefined, data, payload.method)
     }
     return data.message
   }
