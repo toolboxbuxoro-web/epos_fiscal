@@ -50,6 +50,8 @@ interface FormState {
   // Ценообразование (применяется к товарам из справочника при подборе)
   markupPercent: string
   roundUpToSum: string
+  // Тестовый режим — фискализация без реальной отправки в Communicator
+  testMode: 'true' | 'false'
 }
 
 const empty: FormState = {
@@ -75,6 +77,7 @@ const empty: FormState = {
   replacementEnabled: 'true',
   markupPercent: '10',
   roundUpToSum: '1000',
+  testMode: 'false',
 }
 
 export default function Settings() {
@@ -156,6 +159,7 @@ export default function Settings() {
       matchToleranceTiyin: all[SettingKey.MatchToleranceTiyin] ?? '100000',
       markupPercent: all[SettingKey.MarkupPercent] ?? '10',
       roundUpToSum: all[SettingKey.RoundUpToSum] ?? '1000',
+      testMode: (all[SettingKey.TestMode] ?? 'false') as 'true' | 'false',
       autoFiscalize: (all[SettingKey.AutoFiscalize] ?? 'false') as 'true' | 'false',
       replacementEnabled: (all[SettingKey.ReplacementEnabled] ?? 'true') as 'true' | 'false',
     }))
@@ -283,6 +287,7 @@ export default function Settings() {
         [SettingKey.MatchToleranceTiyin]: form.matchToleranceTiyin,
         [SettingKey.MarkupPercent]: form.markupPercent,
         [SettingKey.RoundUpToSum]: form.roundUpToSum,
+        [SettingKey.TestMode]: form.testMode,
         [SettingKey.AutoFiscalize]: form.autoFiscalize,
         [SettingKey.ReplacementEnabled]: form.replacementEnabled,
       })
@@ -461,6 +466,35 @@ export default function Settings() {
           Подключения к МойСклад и EPOS Communicator, реквизиты компании.
         </p>
       </div>
+
+      {form.testMode === 'true' && (
+        <div className="rounded-lg border-2 border-amber-400 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          <strong>⚠️ Тестовый режим включён.</strong> При нажатии «Фискализировать»
+          чек НЕ отправляется в ОФД ГНК — только проверяется подбор. Чтобы
+          реально пробивать чеки — выключите ниже и сохраните.
+        </div>
+      )}
+
+      <Section title="Тестовый режим">
+        <Field label="Сухой прогон фискализации">
+          <Select
+            value={form.testMode}
+            onChange={(e) =>
+              setField('testMode', e.target.value as 'true' | 'false')
+            }
+          >
+            <option value="false">Выключен (реальная фискализация в ОФД)</option>
+            <option value="true">Включён (без отправки в Communicator)</option>
+          </Select>
+          <div className="mt-1 text-xs text-slate-500">
+            При включённом режиме UI ведёт себя как обычно (подбор работает,
+            кнопка «Фискализировать» жмётся), но запрос в EPOS Communicator
+            НЕ уходит. Никаких записей в ОФД, остатки не списываются, история
+            чеков не пополняется. Используйте для проверки настройки matcher
+            и ценообразования без мусора в реальной отчётности.
+          </div>
+        </Field>
+      </Section>
 
       <Section title="МойСклад">
         {!isAuthenticated ? (

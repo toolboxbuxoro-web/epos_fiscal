@@ -29,6 +29,7 @@ export default function Receipt() {
   const [busy, setBusy] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [fiscalizing, setFiscalizing] = useState(false)
+  const [testMode, setTestMode] = useState(false)
 
   const rd: MsRetailDemand | null = useMemo(() => {
     if (!receipt) return null
@@ -134,6 +135,10 @@ export default function Receipt() {
         roundUpToSum,
       })
       setMatch(result)
+
+      // Прочитаем тестовый режим — для UI-баннера и текста кнопки.
+      const test = (await getSetting(SettingKey.TestMode)) === 'true'
+      setTestMode(test)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -147,6 +152,23 @@ export default function Receipt() {
     setError(null)
     try {
       const result = await fiscalize(match, { msReceiptId: receipt.id })
+      // Тестовый режим: fiscalize возвращает фейковые TerminalID/FiscalSign
+      // и НЕ создаёт fiscal_receipt в БД. Показываем сухой отчёт + остаёмся
+      // на этом же экране (а не уходим в Историю — там этого чека нет).
+      if (testMode) {
+        const total = match.matchedTotalTiyin / 100
+        const itemsCount = match.positions.reduce(
+          (s, p) => s + p.candidates.length,
+          0,
+        )
+        alert(
+          `ТЕСТОВЫЙ РЕЖИМ\n\n` +
+            `Чек НЕ отправлен в ОФД ГНК.\n` +
+            `Подбор: ${itemsCount} позиций на ${total.toLocaleString('ru-RU')} сум.\n\n` +
+            `Чтобы пробивать реально — выключите тестовый режим в Настройках.`,
+        )
+        return
+      }
       alert(
         `Чек фискализирован\n\nFiscal sign: ${result.fiscal.FiscalSign}\nQR: ${result.fiscal.QRCodeURL}`,
       )
@@ -193,10 +215,22 @@ export default function Receipt() {
             disabled={fiscalizing || match.positions.length === 0}
             onClick={doFiscalize}
           >
-            {fiscalizing ? 'Отправка…' : 'Фискализировать через EPOS'}
+            {fiscalizing
+              ? 'Отправка…'
+              : testMode
+                ? 'Тестовая фискализация (без ОФД)'
+                : 'Фискализировать через EPOS'}
           </Button>
         </div>
       </div>
+
+      {testMode && (
+        <div className="rounded-md border border-amber-400 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+          ⚠️ <strong>Тестовый режим.</strong> Фискализация будет имитирована —
+          в ОФД ничего не уйдёт. Чтобы пробивать реально, выключите режим в
+          Настройках.
+        </div>
+      )}
 
       {error && (
         <div className="rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-800">

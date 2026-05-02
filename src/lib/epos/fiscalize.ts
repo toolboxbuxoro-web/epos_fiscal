@@ -58,9 +58,6 @@ export async function fiscalize(
   const eposToken =
     (await getSetting(SettingKey.EposToken)) ?? 'DXJFX32CN1296678504F2'
 
-  // 1-2. Сохранить ms_receipt и match.
-  const { msReceiptId, matchDbId } = await persistMatch(build, opts)
-
   if (build.positions.length === 0) {
     throw new Error('Нечего отправлять в Communicator: пустой план')
   }
@@ -68,6 +65,37 @@ export async function fiscalize(
     (s, pm) => s + pm.candidates.reduce((cs, c) => cs + c.priceTiyin, 0),
     0,
   )
+
+  // ── Тестовый режим (сухой прогон) ────────────────────────────
+  // Если включён — UI отрабатывает «как будто» фискализация прошла,
+  // но никаких побочных эффектов нет: ни записи в БД, ни запроса в
+  // Communicator, ни списания остатков. Полезно для отладки matcher,
+  // ценообразования и UI без мусора в ОФД ГНК.
+  const testMode = (await getSetting(SettingKey.TestMode)) === 'true'
+  if (testMode) {
+    await log.info(
+      'fiscalize',
+      'ТЕСТОВЫЙ РЕЖИМ: пропускаю отправку в EPOS Communicator',
+      {
+        receipt: build.receipt.name,
+        items: build.positions.length,
+        matchedTotalTiyin: matchedTotal,
+      },
+    )
+    const fakeFiscal: FiscalReceiptInfo = {
+      TerminalID: 'TEST-MODE',
+      ReceiptSeq: 'TEST',
+      FiscalSign: `TEST-${Date.now()}`,
+      QRCodeURL: 'тестовый режим: чек НЕ отправлен в ОФД',
+      DateTime: formatTestDateTime(new Date()),
+      AppletVersion: 'TEST',
+    }
+    return { fiscal: fakeFiscal, fiscalReceiptDbId: 0, matchDbId: null }
+  }
+
+  // 1-2. Сохранить ms_receipt и match.
+  const { msReceiptId, matchDbId } = await persistMatch(build, opts)
+
   const receivedCash = opts.receivedCash ?? matchedTotal
   const receivedCard = opts.receivedCard ?? 0
 
@@ -130,6 +158,19 @@ export async function fiscalize(
   await maybePrintQr(fiscal.QRCodeURL)
 
   return { fiscal, fiscalReceiptDbId, matchDbId }
+}
+
+/**
+ * Формат DateTime в стиле YYYYMMDDHHMMSS — как у реальных фискальных ответов.
+ * Используется только в тестовом режиме, чтобы UI History корректно
+ * парсил «фейковый» чек (если он туда попадёт).
+ */
+function formatTestDateTime(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return (
+    `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}` +
+    `${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`
+  )
 }
 
 /**
