@@ -1,14 +1,22 @@
 import { useEffect, useState } from 'react'
 import {
+  getSetting,
   listFiscalReceipts,
+  SettingKey,
   type FiscalReceiptRow,
 } from '@/lib/db'
 import { formatDateTime } from '@/lib/format'
+import { printFiscalQr } from '@/lib/printer'
+import { Button } from '@/components/ui/Button'
 
 export default function History() {
   const [rows, setRows] = useState<FiscalReceiptRow[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  /** id чека → сообщение результата перепечати (для inline-фидбека). */
+  const [printMsg, setPrintMsg] = useState<Record<number, string>>({})
+  /** id чека → busy-флаг (чтобы не дёргать дважды). */
+  const [printing, setPrinting] = useState<Record<number, boolean>>({})
 
   useEffect(() => {
     void load()
@@ -24,6 +32,39 @@ export default function History() {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
       setLoading(false)
+    }
+  }
+
+  /**
+   * Перепечатать QR ранее фискализированного чека.
+   * Берём сохранённый qr_code_url из БД и шлём на принтер из Settings.
+   * Полезно: тестировать настройку принтера без новой фискализации, или
+   * выдать копию покупателю если первая лента закончилась.
+   */
+  async function reprintQr(receipt: FiscalReceiptRow) {
+    setPrintMsg((m) => ({ ...m, [receipt.id]: '' }))
+    setPrinting((p) => ({ ...p, [receipt.id]: true }))
+    try {
+      const printerName = await getSetting(SettingKey.PrinterName)
+      if (!printerName) {
+        setPrintMsg((m) => ({
+          ...m,
+          [receipt.id]: '✗ Принтер не выбран в Настройках → Печать чека',
+        }))
+        return
+      }
+      const jobId = await printFiscalQr(printerName, receipt.qr_code_url)
+      setPrintMsg((m) => ({
+        ...m,
+        [receipt.id]: `✓ Отправлено (job #${jobId})`,
+      }))
+    } catch (e) {
+      setPrintMsg((m) => ({
+        ...m,
+        [receipt.id]: `✗ ${e instanceof Error ? e.message : String(e)}`,
+      }))
+    } finally {
+      setPrinting((p) => ({ ...p, [receipt.id]: false }))
     }
   }
 
@@ -63,18 +104,19 @@ export default function History() {
               <Th>№ чека</Th>
               <Th>Фискальный признак</Th>
               <Th>QR</Th>
+              <Th>Печать</Th>
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
             {loading && rows.length === 0 ? (
               <tr>
-                <td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={5}>
+                <td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={6}>
                   Загрузка…
                 </td>
               </tr>
             ) : rows.length === 0 ? (
               <tr>
-                <td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={5}>
+                <td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={6}>
                   Пока нет ни одного фискализированного чека.
                 </td>
               </tr>
@@ -94,6 +136,29 @@ export default function History() {
                     >
                       открыть
                     </a>
+                  </Td>
+                  <Td>
+                    <div className="flex items-center gap-2">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => void reprintQr(r)}
+                        disabled={!!printing[r.id]}
+                      >
+                        {printing[r.id] ? '…' : 'Печать QR'}
+                      </Button>
+                      {printMsg[r.id] && (
+                        <span
+                          className={
+                            printMsg[r.id]?.startsWith('✓')
+                              ? 'text-xs text-emerald-700'
+                              : 'text-xs text-red-700'
+                          }
+                        >
+                          {printMsg[r.id]}
+                        </span>
+                      )}
+                    </div>
                   </Td>
                 </tr>
               ))

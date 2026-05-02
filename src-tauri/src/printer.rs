@@ -61,12 +61,24 @@ fn print_raw(printer_name: &str, bytes: &[u8]) -> Result<u64, String> {
     let printer = printers::get_printer_by_name(printer_name)
         .ok_or_else(|| format!("Принтер «{}» не найден в системе", printer_name))?;
 
-    // На Linux/macOS нужно явно сказать CUPS что данные сырые ESC/POS,
-    // иначе он попытается интерпретировать их как PostScript/PDF и сломает.
-    // На Windows raw_properties игнорируется — winspool по умолчанию RAW.
+    // `document-format` платформо-зависим:
+    //   - Windows winspool ожидает константы "RAW" / "TEXT" / "XPS_PASS"
+    //     (значение идёт прямо в DOCINFO1.pDatatype для StartDocPrinterW).
+    //     CUPS-mime-тайпы он не понимает — StartDocPrinterW падает.
+    //   - CUPS (Linux/macOS) ожидает MIME `application/vnd.cups-raw`,
+    //     иначе spooler попытается отрендерить наш ESC/POS как PostScript.
+    //
+    // На Windows raw_properties оставляем пустыми — крейт `printers`
+    // подставит дефолт "RAW".
+    #[cfg(target_os = "windows")]
+    let raw_properties: &[(&str, &str)] = &[];
+    #[cfg(not(target_os = "windows"))]
+    let raw_properties: &[(&str, &str)] =
+        &[("document-format", "application/vnd.cups-raw")];
+
     let options = PrinterJobOptions {
         name: Some("EPOS Fiscal — чек"),
-        raw_properties: &[("document-format", "application/vnd.cups-raw")],
+        raw_properties,
         converter: printers::common::converters::Converter::None,
     };
 

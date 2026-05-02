@@ -135,16 +135,26 @@ export async function fiscalize(
 /**
  * Если в настройках включена авто-печать и выбран принтер — отправить QR
  * на термопринтер. Ошибки залогировать, но не пробрасывать наверх.
+ *
+ * ВСЕГДА пишет в логи что произошло — раньше тихий return при выключенной
+ * авто-печати создавал впечатление что код печати вообще не вызывается
+ * (запрос «почему не печатается» в логах ничего не находил).
  */
 async function maybePrintQr(qrUrl: string): Promise<void> {
   try {
     const enabled = (await getSetting(SettingKey.PrinterAutoPrint)) === 'true'
-    if (!enabled) return
+    if (!enabled) {
+      await log.info(
+        'fiscalize',
+        'Печать пропущена: авто-печать выключена в Настройках → Печать чека',
+      )
+      return
+    }
     const printerName = await getSetting(SettingKey.PrinterName)
     if (!printerName) {
       await log.warn(
         'fiscalize',
-        'Авто-печать включена, но принтер не выбран',
+        'Печать пропущена: авто-печать включена, но принтер не выбран в Настройках',
       )
       return
     }
