@@ -44,6 +44,7 @@ pub fn list_printers() -> Vec<PrinterInfo> {
 pub fn print_test_qr(printer_name: String) -> Result<u64, String> {
     let test_data = ReceiptData {
         is_copy: false,
+        is_test: true,
         company: CompanyInfo {
             name: "ТЕСТОВЫЙ МАГАЗИН".to_string(),
             address: "Бухара".to_string(),
@@ -92,6 +93,10 @@ pub fn print_fiscal_receipt(
 pub struct ReceiptData {
     /// `false` — оригинал ("Asli"), `true` — копия ("Chek nusxasi").
     pub is_copy: bool,
+    /// `true` — это тестовый прогон, в шапке печатается «ТЕСТ — НЕ ФИСКАЛЬНЫЙ ЧЕК»
+    /// и QR не читается. Никаких реальных побочных эффектов.
+    #[serde(default)]
+    pub is_test: bool,
     pub company: CompanyInfo,
     pub receipt_seq: String,
     pub date_str: String,
@@ -177,7 +182,18 @@ fn build_receipt(d: &ReceiptData) -> Vec<u8> {
 
     // 3. ── Шапка ────────────────────────────────────────────
     center(&mut buf);
-    if d.is_copy {
+    if d.is_test {
+        // Жирная двойной высоты надпись «ТЕСТ» — кассир не должен спутать
+        // тестовый чек с реальным фискальным.
+        bold_on(&mut buf);
+        // ESC ! n — задаёт стили: 0x10 = двойная высота, 0x20 = двойная ширина.
+        buf.extend_from_slice(&[0x1B, 0x21, 0x30]);
+        write_line(&mut buf, "ТЕСТ");
+        buf.extend_from_slice(&[0x1B, 0x21, 0x00]);
+        bold_off(&mut buf);
+        write_line(&mut buf, "НЕ ФИСКАЛЬНЫЙ ЧЕК");
+        write_line(&mut buf, "");
+    } else if d.is_copy {
         write_line(&mut buf, "Chek nusxasi");
     } else {
         write_line(&mut buf, "Asli");
@@ -253,9 +269,15 @@ fn build_receipt(d: &ReceiptData) -> Vec<u8> {
     buf.push(0x0A);
 
     // 10. ── Подвал ─────────────────────────────────────────
-    write_line(&mut buf, "Siz xaridning 1% miqdorida");
-    write_line(&mut buf, "\"Keshbek\" olish huquqiga ega");
-    write_line(&mut buf, "bo'ldingiz!");
+    if d.is_test {
+        write_line(&mut buf, "Это тестовый прогон.");
+        write_line(&mut buf, "В ОФД ГНК ничего не отправлено.");
+        write_line(&mut buf, "QR-код не сканируется.");
+    } else {
+        write_line(&mut buf, "Siz xaridning 1% miqdorida");
+        write_line(&mut buf, "\"Keshbek\" olish huquqiga ega");
+        write_line(&mut buf, "bo'ldingiz!");
+    }
 
     // 11. ── Хвост и обрезка ────────────────────────────────
     buf.extend_from_slice(&[0x0A, 0x0A, 0x0A, 0x0A]);

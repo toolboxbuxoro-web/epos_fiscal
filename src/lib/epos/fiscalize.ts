@@ -71,12 +71,16 @@ export async function fiscalize(
     (s, pm) => s + pm.candidates.reduce((cs, c) => cs + c.priceTiyin, 0),
     0,
   )
+  const receivedCash = opts.receivedCash ?? matchedTotal
+  const receivedCard = opts.receivedCard ?? 0
 
   // ── Тестовый режим (сухой прогон) ────────────────────────────
-  // Если включён — UI отрабатывает «как будто» фискализация прошла,
-  // но никаких побочных эффектов нет: ни записи в БД, ни запроса в
-  // Communicator, ни списания остатков. Полезно для отладки matcher,
-  // ценообразования и UI без мусора в ОФД ГНК.
+  // UI отрабатывает «как будто» фискализация прошла, но в Communicator
+  // ничего не уходит, остатки не списываются, fiscal_receipt не создаётся.
+  // ПЕЧАТЬ всё равно идёт (если включена авто-печать) — иначе тестовый
+  // режим бесполезен для проверки шаблона чека и реквизитов. На ленте
+  // вместо «Asli» будет «ТЕСТ — НЕ ФИСКАЛЬНЫЙ ЧЕК», подвал тоже
+  // переключается на пометку «ничего не отправлено в ОФД».
   const testMode = (await getSetting(SettingKey.TestMode)) === 'true'
   if (testMode) {
     await log.info(
@@ -96,14 +100,13 @@ export async function fiscalize(
       DateTime: formatTestDateTime(new Date()),
       AppletVersion: 'TEST',
     }
+    // Печать всё равно отправляем — она не имеет побочных эффектов в ОФД.
+    await maybePrintReceipt(build, fakeFiscal, receivedCash, receivedCard, false, true)
     return { fiscal: fakeFiscal, fiscalReceiptDbId: 0, matchDbId: null }
   }
 
   // 1-2. Сохранить ms_receipt и match.
   const { msReceiptId, matchDbId } = await persistMatch(build, opts)
-
-  const receivedCash = opts.receivedCash ?? matchedTotal
-  const receivedCard = opts.receivedCard ?? 0
 
   await log.info('fiscalize', `Отправляю чек ${build.receipt.name} в EPOS`, {
     eposUrl,
@@ -160,7 +163,7 @@ export async function fiscalize(
   // 7. Авто-печать на термопринтер, если включено в Settings.
   // Печать НЕ должна валить фискализацию — чек уже в ОФД, лента это
   // просто удобство для покупателя. Любая ошибка идёт в логи.
-  await maybePrintReceipt(build, fiscal, receivedCash, receivedCard, false)
+  await maybePrintReceipt(build, fiscal, receivedCash, receivedCard, false, false)
 
   return { fiscal, fiscalReceiptDbId, matchDbId }
 }
@@ -192,6 +195,7 @@ export async function maybePrintReceipt(
   receivedCash: number,
   receivedCard: number,
   isCopy: boolean,
+  isTest: boolean = false,
 ): Promise<void> {
   try {
     const enabled = (await getSetting(SettingKey.PrinterAutoPrint)) === 'true'
@@ -211,11 +215,19 @@ export async function maybePrintReceipt(
       return
     }
 
-    const data = await buildReceiptData(build, fiscal, receivedCash, receivedCard, isCopy)
+    const data = await buildReceiptData(
+      build,
+      fiscal,
+      receivedCash,
+      receivedCard,
+      isCopy,
+      isTest,
+    )
     const jobId = await printFiscalReceipt(printerName, data)
     await log.info('fiscalize', `Чек отправлен на печать (job #${jobId})`, {
       printer: printerName,
       isCopy,
+      isTest,
     })
   } catch (err) {
     await log.error('fiscalize', 'Ошибка печати чека', {
@@ -234,6 +246,7 @@ async function buildReceiptData(
   receivedCash: number,
   receivedCard: number,
   isCopy: boolean,
+  isTest: boolean,
 ): Promise<ReceiptData> {
   const company = await readCompanySettings()
   const cashier = (await getSetting(SettingKey.MoyskladEmployeeName)) ?? ''
@@ -261,6 +274,7 @@ async function buildReceiptData(
 
   return {
     is_copy: isCopy,
+    is_test: isTest,
     company: {
       name: company.name || '',
       address: company.address || '',

@@ -61,6 +61,12 @@ export interface ReceiptItem {
 export interface ReceiptData {
   /** Оригинал ("Asli") или копия ("Chek nusxasi"). */
   is_copy: boolean
+  /**
+   * Если `true`, в шапке печатается «ТЕСТ — НЕ ФИСКАЛЬНЫЙ ЧЕК»,
+   * подвал тоже меняется. Используется для проверки настройки
+   * принтера/реквизитов без реальной фискализации.
+   */
+  is_test?: boolean
   company: ReceiptCompany
   receipt_seq: string
   /** Дата для печати: "02.05.2026 11:32". */

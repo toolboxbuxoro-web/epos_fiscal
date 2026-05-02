@@ -61,11 +61,20 @@ export interface JsonRpcItem {
 }
 
 export interface JsonRpcReceipt {
-  /** ISO datetime: "2026-05-01T15:30:00". */
+  /** Go-style "2026-05-01 15:30:00" (с пробелом, без T). */
   Time: string
   Items: JsonRpcItem[]
   ReceivedCash: number
   ReceivedCard: number
+  /**
+   * Опционально: имя кассира. В декомпиле API GBS Market 6 этого поля нет,
+   * но мы шлём «на всякий случай» — если актуальная версия Communicator
+   * умеет его, оно попадёт в ОФД ГНК и в кабинет soliq.uz. Если не умеет —
+   * сервер тихо проигнорирует. Реквизиты компании (название/ИНН/адрес/
+   * телефон) НЕ шлём вообще — Communicator берёт их с ФМ-карты при
+   * регистрации в ГНК, передавать их повторно нельзя.
+   */
+  Cashier?: string
 }
 
 export interface JsonRpcFiscalAnswer {
