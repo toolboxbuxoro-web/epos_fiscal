@@ -11,7 +11,7 @@
 //!   - Кириллица кодируется в WCP1251 (codepage 46 на Xprinter).
 //!   - QR-код печатает САМ принтер по команде GS ( k.
 
-use encoding_rs::WINDOWS_1251;
+use encoding_rs::IBM866;
 use printers::common::base::job::PrinterJobOptions;
 use serde::{Deserialize, Serialize};
 
@@ -161,11 +161,15 @@ fn print_raw(printer_name: &str, bytes: &[u8]) -> Result<u64, String> {
 /// Ширина строки на 80мм ленте в шрифте Font A (стандарт). 48 символов.
 const LINE_WIDTH: usize = 48;
 
-/// Конвертировать UTF-8 → WCP1251.
-/// Для Xprinter codepage 46 (WCP1251) — единственная стабильная
-/// поддержка кириллицы из доступных на серии XP-80.
+/// Конвертировать UTF-8 → CP866 (DOS Cyrillic).
+///
+/// Историческая причина: Xprinter XP-80 (как и большинство ESC/POS
+/// термопринтеров) поддерживает кириллицу через codepage 17 = PC866.
+/// Код 46 у Xprinter — это НЕ WCP1251 как у некоторых производителей,
+/// а другая страница. Поэтому сначала пробовали WCP1251 — получили
+/// греко-математическую кашу. Откатились на проверенный CP866.
 fn cyr(s: &str) -> Vec<u8> {
-    let (cow, _, _) = WINDOWS_1251.encode(s);
+    let (cow, _, _) = IBM866.encode(s);
     cow.into_owned()
 }
 
@@ -176,9 +180,12 @@ fn build_receipt(d: &ReceiptData) -> Vec<u8> {
     // 1. Init принтер.
     buf.extend_from_slice(&[0x1B, 0x40]); // ESC @
 
-    // 2. Установить кодовую страницу WCP1251 (для кириллицы).
-    //    Xprinter XP-80: 46 = WCP1251.
-    buf.extend_from_slice(&[0x1B, 0x74, 46]);
+    // 2. Установить кодовую страницу PC866 (DOS Cyrillic).
+    //    Команда: ESC t n, где n=17 — PC866 на Xprinter.
+    //    Это стандарт для всех ESC/POS принтеров с поддержкой кириллицы,
+    //    в отличие от WCP1251 (который у разных производителей под разными
+    //    номерами или вообще отсутствует).
+    buf.extend_from_slice(&[0x1B, 0x74, 17]);
 
     // 3. ── Шапка ────────────────────────────────────────────
     center(&mut buf);
