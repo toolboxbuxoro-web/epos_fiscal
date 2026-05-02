@@ -972,7 +972,6 @@ dependencies = [
 name = "epos-fiscal"
 version = "0.1.0"
 dependencies = [
- "encoding_rs",
  "printers",
  "serde",
  "serde_json",
