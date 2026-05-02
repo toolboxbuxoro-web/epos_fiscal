@@ -25,9 +25,10 @@ serde_json = "1"
 # Печать чека через системный print spooler (Windows/macOS/Linux).
 # Используется для отправки сырых ESC/POS байтов на термопринтер,
 # зарегистрированный в ОС (Xprinter XP-80 и совместимые 80мм USB).
-# Кириллица не нужна — мы транслитерируем её в латиницу перед печатью
-# (в printer.rs::transliterate), поэтому никакого crate'а encoding_rs.
 printers = "2"
+# UTF-8 → CP866 (DOS Cyrillic) для печати русских букв на Xprinter.
+# CP866 = codepage 17 у Xprinter, проверенный стандарт.
+encoding_rs = "0.8"
 
 [profile.dev]
 incremental = true

@@ -11,6 +11,7 @@
 //!   - Кириллица кодируется в WCP1251 (codepage 46 на Xprinter).
 //!   - QR-код печатает САМ принтер по команде GS ( k.
 
+use encoding_rs::IBM866;
 use printers::common::base::job::PrinterJobOptions;
 use serde::{Deserialize, Serialize};
 
@@ -160,77 +161,20 @@ fn print_raw(printer_name: &str, bytes: &[u8]) -> Result<u64, String> {
 /// Ширина строки на 80мм ленте в шрифте Font A (стандарт). 48 символов.
 const LINE_WIDTH: usize = 48;
 
-/// Подготовить строку к печати: транслитерация всей кириллицы в латиницу,
-/// результат — ASCII-байты которые гарантированно отрендерятся в дефолтной
-/// codepage любого ESC/POS принтера.
+/// UTF-8 → CP866 (PC866 / IBM866) — DOS Cyrillic.
 ///
-/// Почему так:
-///   1. Codepages у Xprinter маркированы хаотично — код 46 у одной модели
-///      это WCP1251, у другой Latin/Greek (мы наступили на эти грабли).
-///   2. Нет обратной связи: принтер не отвечает «у меня сейчас CP X»,
-///      есть только односторонний канал данных. Авто-определение
-///      кодировки невозможно.
-///   3. Узбекская латиница уже официальный алфавит, так что транслит
-///      не выглядит чужеродно для покупателя. Русские названия товаров
-///      из МойСклад тоже читаемы (Алмазный → Almaznyy).
+/// Принтер ждёт байты в текущей кодовой странице, которую мы установили
+/// командой `ESC t 17` в начале чека. Кириллические символы кодируются
+/// в один байт по таблице CP866. Латиница, цифры, пробелы — совпадают
+/// с ASCII, идут как есть.
 ///
-/// Для тестового печати мы все равно делаем то же самое — конкретный байт-
-/// в-байт результат не зависит от codepage принтера, всегда читаем.
+/// Почему именно CP866: это исторический стандарт DOS, поддерживается
+/// всеми ESC/POS принтерами с кириллицей без исключения. WCP1251 у
+/// разных производителей под разными номерами codepage (или вообще
+/// отсутствует) — нашли это эмпирически.
 fn cyr(s: &str) -> Vec<u8> {
-    transliterate(s).into_bytes()
-}
-
-/// Транслит русской и узбекской кириллицы в латиницу.
-/// За основу — узбекский латинский алфавит (1995) для узбекских букв,
-/// для остальной кириллицы — практическая транскрипция (близко к ISO 9).
-fn transliterate(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            // Русский алфавит
-            'А' => out.push_str("A"),  'а' => out.push_str("a"),
-            'Б' => out.push_str("B"),  'б' => out.push_str("b"),
-            'В' => out.push_str("V"),  'в' => out.push_str("v"),
-            'Г' => out.push_str("G"),  'г' => out.push_str("g"),
-            'Д' => out.push_str("D"),  'д' => out.push_str("d"),
-            'Е' => out.push_str("E"),  'е' => out.push_str("e"),
-            'Ё' => out.push_str("Yo"), 'ё' => out.push_str("yo"),
-            'Ж' => out.push_str("Zh"), 'ж' => out.push_str("zh"),
-            'З' => out.push_str("Z"),  'з' => out.push_str("z"),
-            'И' => out.push_str("I"),  'и' => out.push_str("i"),
-            'Й' => out.push_str("Y"),  'й' => out.push_str("y"),
-            'К' => out.push_str("K"),  'к' => out.push_str("k"),
-            'Л' => out.push_str("L"),  'л' => out.push_str("l"),
-            'М' => out.push_str("M"),  'м' => out.push_str("m"),
-            'Н' => out.push_str("N"),  'н' => out.push_str("n"),
-            'О' => out.push_str("O"),  'о' => out.push_str("o"),
-            'П' => out.push_str("P"),  'п' => out.push_str("p"),
-            'Р' => out.push_str("R"),  'р' => out.push_str("r"),
-            'С' => out.push_str("S"),  'с' => out.push_str("s"),
-            'Т' => out.push_str("T"),  'т' => out.push_str("t"),
-            'У' => out.push_str("U"),  'у' => out.push_str("u"),
-            'Ф' => out.push_str("F"),  'ф' => out.push_str("f"),
-            'Х' => out.push_str("X"),  'х' => out.push_str("x"),
-            'Ц' => out.push_str("Ts"), 'ц' => out.push_str("ts"),
-            'Ч' => out.push_str("Ch"), 'ч' => out.push_str("ch"),
-            'Ш' => out.push_str("Sh"), 'ш' => out.push_str("sh"),
-            'Щ' => out.push_str("Sch"),'щ' => out.push_str("sch"),
-            'Ъ' => out.push_str("\""),'ъ' => out.push_str("\""),
-            'Ы' => out.push_str("Y"),  'ы' => out.push_str("y"),
-            'Ь' => out.push_str("'"),  'ь' => out.push_str("'"),
-            'Э' => out.push_str("E"),  'э' => out.push_str("e"),
-            'Ю' => out.push_str("Yu"), 'ю' => out.push_str("yu"),
-            'Я' => out.push_str("Ya"), 'я' => out.push_str("ya"),
-            // Узбекская кириллица (специфические буквы)
-            'Қ' => out.push_str("Q"),  'қ' => out.push_str("q"),
-            'Ў' => out.push_str("O'"), 'ў' => out.push_str("o'"),
-            'Ҳ' => out.push_str("H"),  'ҳ' => out.push_str("h"),
-            'Ғ' => out.push_str("G'"), 'ғ' => out.push_str("g'"),
-            // Всё остальное (латиница, цифры, пробелы, пунктуация) — как есть.
-            other => out.push(other),
-        }
-    }
-    out
+    let (cow, _, _) = IBM866.encode(s);
+    cow.into_owned()
 }
 
 /// Собрать ESC/POS байты для полного чека.
@@ -238,9 +182,13 @@ fn build_receipt(d: &ReceiptData) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::with_capacity(2048);
 
     // 1. Init принтер.
-    //    Никаких ESC t (codepage) — все байты у нас ASCII благодаря транслиту.
-    //    Так чек одинаково печатается на любом принтере без настроек.
     buf.extend_from_slice(&[0x1B, 0x40]); // ESC @
+
+    // 2. Установить кодовую страницу PC866 (DOS Cyrillic) — code 17 у Xprinter.
+    //    Это исторический стандарт для русской термопечати, поддерживается
+    //    всеми Xprinter / Star / Epson с поддержкой кириллицы. WCP1251 (code 46
+    //    у некоторых моделей) — не работает на нашем XP-80, давал иероглифы.
+    buf.extend_from_slice(&[0x1B, 0x74, 17]);
 
     // 3. ── Шапка ────────────────────────────────────────────
     center(&mut buf);
@@ -444,12 +392,10 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 
 /// Сколько ячеек строка займёт на ленте.
 ///
-/// Так как мы транслитерируем кириллицу в латиницу перед записью в буфер,
-/// итоговая ширина = длина транслитерированной строки (Ш→Sh, ё→yo и т.д.).
-/// Учитываем это при расчёте two_cols / wrap_text, чтобы выравнивание
-/// колонок не съезжало.
+/// В CP866 каждый кириллический символ — это 1 байт = 1 знакоместо принтера,
+/// как и латиница/цифры. Поэтому для ширины колонок считаем просто chars().
 fn display_width(s: &str) -> usize {
-    transliterate(s).chars().count()
+    s.chars().count()
 }
 
 // ── QR-код ────────────────────────────────────────────────────────
