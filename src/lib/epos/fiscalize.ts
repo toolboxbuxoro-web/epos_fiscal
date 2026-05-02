@@ -199,16 +199,36 @@ async function fiscalizeJsonRpc(
     params: { Receipt: receipt },
   })
 
+  // Полный дамп ЗАПРОСА в логи — без этого ошибки от Communicator
+  // («illegal argument» и т.п.) непонятно к какому полю относятся.
+  await log.info('fiscalize', 'Отправляю Api.SendSaleReceipt в Communicator', {
+    url,
+    request: receipt,
+    itemsCount: receipt.Items.length,
+  })
+
   let answer
   try {
     answer = await client.sendSaleReceipt(receipt)
   } catch (e) {
+    // При ошибке тоже дампим всё — request + текст ошибки + любой data из JSON-RPC.
+    const eposError = e as { code?: number; data?: unknown; message?: string }
     await log.error('fiscalize', 'JSON-RPC EPOS вернул ошибку', {
       error: e instanceof Error ? e.message : String(e),
       url,
+      jsonRpcCode: eposError.code,
+      jsonRpcData: eposError.data,
+      request: receipt,
+      requestJson,
     })
     throw e
   }
+
+  // Успех — полный ответ тоже в логи на уровне info, чтобы потом
+  // можно было сравнить с тем что уехало в ОФД.
+  await log.info('fiscalize', 'JSON-RPC EPOS успешно ответил', {
+    response: answer,
+  })
 
   const fiscal: FiscalReceiptInfo = {
     TerminalID: answer.TerminalID,
@@ -282,17 +302,30 @@ async function fiscalizeLegacy(
   }
 
   const client = new EposClient({ url: eposUrl, token: eposToken })
+
+  // Полный дамп запроса перед отправкой, чтобы можно было отладить ошибки
+  // Communicator (NO_SUCH_METHOD_AVAILABLE / illegal argument) по полям.
+  await log.info('fiscalize', 'Отправляю sale в EPOS (legacy /uzpos)', {
+    eposUrl,
+    request,
+    itemsCount: items.length,
+  })
+
   try {
     await client.call(request)
   } catch (e) {
     await log.error('fiscalize', 'EPOS Communicator (legacy) вернул ошибку', {
       error: e instanceof Error ? e.message : String(e),
       eposUrl,
+      request,
     })
     throw e
   }
 
   const fiscal = await client.getLastRegisteredReceipt()
+  await log.info('fiscalize', 'Legacy EPOS успешно ответил', {
+    fiscal,
+  })
   return { fiscal, requestJson: JSON.stringify(request) }
 }
 
