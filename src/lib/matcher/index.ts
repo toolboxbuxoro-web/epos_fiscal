@@ -1,6 +1,11 @@
 import type { MsRetailDemand } from '@/lib/moysklad/types'
 import { extractPositions } from './extract'
-import { tryMultiItem, tryPassthrough, tryPriceBucket } from './strategies'
+import {
+  calculateSellingPrice,
+  tryMultiItem,
+  tryPassthrough,
+  tryPriceBucket,
+} from './strategies'
 import type {
   BuildMatchResult,
   MatcherOptions,
@@ -155,44 +160,67 @@ async function explainNoMatch(
     return 'в справочнике нет товаров с доступными остатками'
   }
 
-  // Найдём ближайшую цену.
-  const closest = pool.reduce(
-    (acc, item) => {
-      const diff = Math.abs(item.unit_price_tiyin - pos.totalTiyin)
-      return diff < acc.diff ? { item, diff } : acc
+  // Считаем ПРОДАЖНЫЕ цены (с наценкой+НДС+округлением) — matcher теперь
+  // именно их сравнивает с суммой чека.
+  const markup = opts.markupPercent ?? 10
+  const roundUp = opts.roundUpToSum ?? 1000
+  const withSelling = pool.map((item) => ({
+    item,
+    sellingPrice: calculateSellingPrice(
+      item.unit_price_tiyin,
+      item.vat_percent,
+      markup,
+      roundUp,
+    ),
+  }))
+
+  // Найдём ближайшую продажную цену.
+  type Closest = {
+    item: typeof withSelling[number]['item']
+    sellingPrice: number
+    diff: number
+  }
+  const closest = withSelling.reduce<Closest>(
+    (acc, x) => {
+      const diff = Math.abs(x.sellingPrice - pos.totalTiyin)
+      return diff < acc.diff ? { item: x.item, diff, sellingPrice: x.sellingPrice } : acc
     },
-    { item: pool[0]!, diff: Infinity },
+    {
+      item: withSelling[0]!.item,
+      diff: Infinity,
+      sellingPrice: withSelling[0]!.sellingPrice,
+    },
   )
 
-  // Минимальная цена в пуле — для подсказки про multi-item.
-  const minPrice = pool.reduce(
-    (m, i) => (i.unit_price_tiyin < m ? i.unit_price_tiyin : m),
-    pool[0]!.unit_price_tiyin,
+  // Минимальная продажная цена в пуле.
+  const minPrice = withSelling.reduce(
+    (m, x) => (x.sellingPrice > 0 && x.sellingPrice < m ? x.sellingPrice : m),
+    Infinity,
   )
 
   const vatHint = strictVat ? ` с НДС ${pos.vatPercent}%` : ''
+  const priceCtx = `(наценка ${markup}%, округление до ${roundUp} сум)`
+
   if (closest.diff <= tolerance) {
-    // Должно было сработать, но не сработало — что-то странное (race?).
     return (
-      `найден товар${vatHint} с подходящей ценой ` +
-      `(${tiyinToSumDisplay(closest.item.unit_price_tiyin)} сум), ` +
+      `найден товар${vatHint} с подходящей продажной ценой ` +
+      `${tiyinToSumDisplay(closest.sellingPrice)} сум ${priceCtx}, ` +
       `но автоподбор отказался — возможна гонка остатков`
     )
   }
 
-  // Если позиция меньше minPrice — multi-item не наберёт ничего.
   if (pos.totalTiyin < minPrice) {
     return (
-      `сумма позиции ${tiyinToSumDisplay(pos.totalTiyin)} меньше самого ` +
-      `дешёвого товара в справочнике${vatHint} (${tiyinToSumDisplay(minPrice)} сум) — ` +
-      `нечем набрать по multi-item`
+      `сумма позиции ${tiyinToSumDisplay(pos.totalTiyin)} меньше самой ` +
+      `дешёвой продажной цены в справочнике${vatHint} ` +
+      `(${tiyinToSumDisplay(minPrice)} сум ${priceCtx}) — нечем набрать по multi-item`
     )
   }
 
   return (
     `в справочнике${vatHint} ${pool.length} товаров с остатками, ` +
-    `но ближайшая цена ${tiyinToSumDisplay(closest.item.unit_price_tiyin)} сум ` +
-    `(разница ${tiyinToSumDisplay(closest.diff)} сум, tolerance ${tiyinToSumDisplay(tolerance)}); ` +
-    `multi-item не смог собрать сумму с допуском`
+    `но ближайшая продажная цена ${tiyinToSumDisplay(closest.sellingPrice)} сум ${priceCtx} ` +
+    `(разница ${tiyinToSumDisplay(closest.diff)}, tolerance ${tiyinToSumDisplay(tolerance)}); ` +
+    `multi-item не собрал`
   )
 }

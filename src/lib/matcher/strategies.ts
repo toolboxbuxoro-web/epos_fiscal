@@ -20,12 +20,54 @@ export function vatAddedOn(netTiyin: Tiyin, vatPercent: number): Tiyin {
 }
 
 /**
+ * Рассчитать продажную цену из приходной.
+ *
+ * Формула: round_up( unit_price × (1 + markup/100) × (1 + vat/100), step ).
+ *
+ *   1. К приходной цене добавляется наценка (markupPercent, по умолчанию 10%).
+ *   2. К результату начисляется НДС товара (item.vat_percent — обычно 12%).
+ *   3. Сумма округляется ВВЕРХ до шага roundUpToSum (в сумах, по умолчанию 1000).
+ *
+ * Пример: приход 595 928 тийинов (5 959.28 сум), наценка 10%, НДС 12%, шаг 1000:
+ *   5959.28 × 1.10 × 1.12 = 7 341.63 сум  →  округление вверх до 1000  →  8000 сум
+ *
+ * Все вычисления в тийинах, чтобы не потерять копейки на промежутках.
+ */
+export function calculateSellingPrice(
+  unitPriceTiyin: Tiyin,
+  vatPercent: number,
+  markupPercent: number,
+  roundUpToSum: number,
+): Tiyin {
+  if (unitPriceTiyin <= 0) return 0
+  const withMarkup = (unitPriceTiyin * (100 + markupPercent)) / 100
+  const withVat = (withMarkup * (100 + Math.max(0, vatPercent))) / 100
+  const stepTiyin = Math.max(1, roundUpToSum) * 100 // шаг в тийинах
+  return Math.ceil(withVat / stepTiyin) * stepTiyin
+}
+
+/** Общие дефолты ценообразования (синхронны с SettingKey defaults). */
+const DEFAULT_MARKUP = 10
+const DEFAULT_ROUND_UP_SUM = 1000
+
+function effectivePrice(
+  item: EsfItemWithAvailable,
+  opts: MatcherOptions,
+): Tiyin {
+  return calculateSellingPrice(
+    item.unit_price_tiyin,
+    item.vat_percent,
+    opts.markupPercent ?? DEFAULT_MARKUP,
+    opts.roundUpToSum ?? DEFAULT_ROUND_UP_SUM,
+  )
+}
+
+/**
  * Стратегия 1: passthrough.
  *
  * Если позиция содержит валидный ИКПУ, который есть в нашем справочнике
  * с достаточными остатками — фискализируем «как есть» через найденный esf_item.
- *
- * Возвращает PositionMatch или null, если стратегия не применима.
+ * Цена в фискальном чеке — продажная (с наценкой и НДС).
  */
 export async function tryPassthrough(
   pos: NormalizedPosition,
@@ -47,13 +89,16 @@ export async function tryPassthrough(
   const chosen = sorted[0]
   if (!chosen) return null
 
-  const candidate = makeCandidate(chosen, pos.quantity, pos.totalTiyin, pos.vatPercent)
+  // Продажная цена за 1 шт × количество = totalSelling.
+  const unitSelling = effectivePrice(chosen, opts)
+  const totalSelling = unitSelling * (pos.quantity / 1000)
+  const candidate = makeCandidate(chosen, pos.quantity, totalSelling)
 
   return {
     source: pos,
     candidates: [candidate],
     strategy: 'passthrough',
-    diffTiyin: 0,
+    diffTiyin: totalSelling - pos.totalTiyin,
     warnings: [],
   }
 }
@@ -61,40 +106,44 @@ export async function tryPassthrough(
 /**
  * Стратегия 2: price-bucket.
  *
- * Найти один товар с подходящей суммой (с учётом допуска),
- * совпадающей ставкой НДС и достаточным остатком. Берём 1 шт.
+ * Найти один товар, у которого ПРОДАЖНАЯ цена (с наценкой+НДС, округлённая)
+ * близка к сумме позиции из чека МойСклад. Берём 1 шт.
  */
 export async function tryPriceBucket(
   pos: NormalizedPosition,
   opts: MatcherOptions = {},
 ): Promise<PositionMatch | null> {
   const tolerance = opts.toleranceTiyin ?? 0
-  // Ищем товары с ценой ≈ totalTiyin (за 1 шт, qty_received ≥ 1000).
+
   const all = await listEsfItems({
     minAvailable: 1000,
     vatPercent: opts.vatStrict === true ? pos.vatPercent : undefined,
-    limit: 1000,
+    limit: 5000,
   })
 
-  // Сортировка по близости цены.
+  // Считаем продажную цену для каждого, фильтруем по tolerance, ранжируем.
   const ranked = all
-    .map((item) => ({
-      item,
-      diff: Math.abs(item.unit_price_tiyin - pos.totalTiyin),
-    }))
+    .map((item) => {
+      const sellingPrice = effectivePrice(item, opts)
+      return {
+        item,
+        sellingPrice,
+        diff: Math.abs(sellingPrice - pos.totalTiyin),
+      }
+    })
     .filter((r) => r.diff <= tolerance)
     .sort((a, b) => a.diff - b.diff)
 
   const best = ranked[0]
   if (!best) return null
 
-  const candidate = makeCandidate(best.item, 1000, best.item.unit_price_tiyin, pos.vatPercent)
+  const candidate = makeCandidate(best.item, 1000, best.sellingPrice)
 
   return {
     source: pos,
     candidates: [candidate],
     strategy: 'price-bucket',
-    diffTiyin: candidate.priceTiyin - pos.totalTiyin,
+    diffTiyin: best.sellingPrice - pos.totalTiyin,
     warnings: pos.classCode
       ? [`ИКПУ заменён: ${pos.classCode} → ${best.item.class_code}`]
       : [`Без ИКПУ в исходной позиции, заменён на ${best.item.class_code}`],
@@ -105,7 +154,7 @@ export async function tryPriceBucket(
  * Стратегия 3: multi-item (greedy knapsack).
  *
  * Набираем несколько товаров суммарно на нужную сумму (с допуском).
- * Greedy: берём по убыванию цены, пока не достигнем целевой суммы.
+ * Жадный алгоритм по убыванию ПРОДАЖНОЙ цены.
  */
 export async function tryMultiItem(
   pos: NormalizedPosition,
@@ -117,39 +166,47 @@ export async function tryMultiItem(
   const pool = await listEsfItems({
     minAvailable: 1000,
     vatPercent: opts.vatStrict === true ? pos.vatPercent : undefined,
-    limit: 2000,
+    limit: 5000,
   })
 
   if (pool.length === 0) return null
 
-  // Сортируем по убыванию цены.
-  const sorted = [...pool].sort((a, b) => b.unit_price_tiyin - a.unit_price_tiyin)
+  // Подмешиваем расчётную продажную цену сразу, чтобы дальше не пересчитывать.
+  const enriched = pool.map((item) => ({
+    item,
+    sellingPrice: effectivePrice(item, opts),
+  }))
 
-  const picks: { item: EsfItemWithAvailable; quantity: number }[] = []
+  // Сортируем по убыванию ПРОДАЖНОЙ цены.
+  enriched.sort((a, b) => b.sellingPrice - a.sellingPrice)
+
+  const picks: { item: EsfItemWithAvailable; quantity: number; sellingPrice: Tiyin }[] = []
   let remaining = pos.totalTiyin
 
-  for (const item of sorted) {
+  for (const { item, sellingPrice } of enriched) {
     if (picks.length >= maxItems) break
     if (remaining <= 0) break
-    if (item.unit_price_tiyin > remaining + tolerance) continue
+    if (sellingPrice <= 0) continue
+    if (sellingPrice > remaining + tolerance) continue
 
-    // Сколько штук влезает (но не больше остатков).
-    const fitsByPrice = Math.floor(remaining / item.unit_price_tiyin)
+    const fitsByPrice = Math.floor(remaining / sellingPrice)
     const fitsByStock = Math.floor(item.available / 1000)
     const qty = Math.min(fitsByPrice, fitsByStock)
     if (qty <= 0) continue
 
-    picks.push({ item, quantity: qty })
-    remaining -= qty * item.unit_price_tiyin
+    picks.push({ item, quantity: qty, sellingPrice })
+    remaining -= qty * sellingPrice
   }
 
   if (picks.length === 0) return null
   if (Math.abs(remaining) > tolerance) return null
 
-  const candidates: MatchCandidate[] = picks.map(({ item, quantity }) => {
-    const totalTiyin = item.unit_price_tiyin * quantity
-    return makeCandidate(item, quantity * 1000, totalTiyin, pos.vatPercent)
-  })
+  const candidates: MatchCandidate[] = picks.map(
+    ({ item, quantity, sellingPrice }) => {
+      const totalSelling = sellingPrice * quantity
+      return makeCandidate(item, quantity * 1000, totalSelling)
+    },
+  )
 
   const matchedSum = candidates.reduce((s, c) => s + c.priceTiyin, 0)
   const diffTiyin = matchedSum - pos.totalTiyin
@@ -163,18 +220,25 @@ export async function tryMultiItem(
   }
 }
 
+/**
+ * Собрать MatchCandidate.
+ *
+ * `priceTiyin` — это ПРОДАЖНАЯ сумма (с наценкой+НДС, округлённая) за весь
+ * объём позиции. Именно она пойдёт в фискальный чек EPOS как `Price`.
+ *
+ * `vatTiyin` рассчитывается как НДС, включённый в продажную цену (вычленяется
+ * из общей суммы по ставке) — это формат ОФД ГНК для UZ.
+ */
 function makeCandidate(
   item: EsfItemWithAvailable,
   quantity: number,
-  totalTiyin: Tiyin,
-  vatPercent: number,
+  sellingTotalTiyin: Tiyin,
 ): MatchCandidate {
-  // Ставка НДС берётся из приходной записи, но округляем НДС от суммы покупки.
-  const vat = vatIncluded(totalTiyin, item.vat_percent || vatPercent)
+  const vat = vatIncluded(sellingTotalTiyin, item.vat_percent)
   return {
     esfItem: item,
     quantity,
-    priceTiyin: totalTiyin,
+    priceTiyin: sellingTotalTiyin,
     vatTiyin: vat,
   }
 }

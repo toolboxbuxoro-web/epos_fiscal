@@ -47,6 +47,9 @@ interface FormState {
   matchToleranceTiyin: string
   autoFiscalize: 'true' | 'false'
   replacementEnabled: 'true' | 'false'
+  // Ценообразование (применяется к товарам из справочника при подборе)
+  markupPercent: string
+  roundUpToSum: string
 }
 
 const empty: FormState = {
@@ -70,6 +73,8 @@ const empty: FormState = {
   matchToleranceTiyin: '0',
   autoFiscalize: 'false',
   replacementEnabled: 'true',
+  markupPercent: '10',
+  roundUpToSum: '1000',
 }
 
 export default function Settings() {
@@ -149,6 +154,8 @@ export default function Settings() {
         | 'true'
         | 'false',
       matchToleranceTiyin: all[SettingKey.MatchToleranceTiyin] ?? '100000',
+      markupPercent: all[SettingKey.MarkupPercent] ?? '10',
+      roundUpToSum: all[SettingKey.RoundUpToSum] ?? '1000',
       autoFiscalize: (all[SettingKey.AutoFiscalize] ?? 'false') as 'true' | 'false',
       replacementEnabled: (all[SettingKey.ReplacementEnabled] ?? 'true') as 'true' | 'false',
     }))
@@ -274,6 +281,8 @@ export default function Settings() {
         [SettingKey.PrinterName]: form.printerName,
         [SettingKey.PrinterAutoPrint]: form.printerAutoPrint,
         [SettingKey.MatchToleranceTiyin]: form.matchToleranceTiyin,
+        [SettingKey.MarkupPercent]: form.markupPercent,
+        [SettingKey.RoundUpToSum]: form.roundUpToSum,
         [SettingKey.AutoFiscalize]: form.autoFiscalize,
         [SettingKey.ReplacementEnabled]: form.replacementEnabled,
       })
@@ -641,6 +650,42 @@ export default function Settings() {
             <option value="true">Автоматически (рискованно)</option>
           </Select>
         </Field>
+      </Section>
+
+      <Section title="Ценообразование">
+        <Field label="Наценка на приходную цену, %">
+          <Input
+            type="number"
+            min={0}
+            max={500}
+            value={form.markupPercent}
+            onChange={(e) => setField('markupPercent', e.target.value)}
+          />
+          <div className="mt-1 text-xs text-slate-500">
+            К приходной цене из справочника добавляется эта наценка, потом
+            начисляется НДС товара. По умолчанию <strong>10</strong>.
+          </div>
+        </Field>
+        <Field label="Округление продажной цены до, сум">
+          <Input
+            type="number"
+            min={1}
+            value={form.roundUpToSum}
+            onChange={(e) => setField('roundUpToSum', e.target.value)}
+          />
+          <div className="mt-1 text-xs text-slate-500">
+            Продажная цена округляется ВВЕРХ до этого шага.{' '}
+            <strong>1000</strong> = 15 500 → 16 000, 667 450 → 668 000.{' '}
+            <strong>100</strong> = до сотен. <strong>1</strong> = без округления.
+          </div>
+        </Field>
+        <div className="md:col-span-2 rounded-md bg-slate-50 p-3 text-xs text-slate-600">
+          <strong>Формула:</strong> продажная_цена = round_up( приход × (1 +
+          наценка/100) × (1 + НДС/100), шаг ).
+          <br />
+          Пример: приход 5 959 сум, наценка 10%, НДС 12%, шаг 1000 →{' '}
+          5 959 × 1.10 × 1.12 = 7 341.63 → <strong>8 000 сум</strong>.
+        </div>
       </Section>
 
       <Section title="Печать чека">

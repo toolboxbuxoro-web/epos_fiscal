@@ -72,4 +72,15 @@ export interface MatcherOptions {
   vatStrict?: boolean
   /** Максимум кандидатов для multi-item стратегии. */
   maxMultiItem?: number
+  /**
+   * Процент наценки на приходную цену (по умолчанию 10).
+   * Применяется ДО НДС: selling = round_up(price * (1+markup/100) * (1+vat/100)).
+   */
+  markupPercent?: number
+  /**
+   * Шаг округления продажной цены ВВЕРХ, в сумах.
+   * По умолчанию 1000 — продажная цена всегда кратна 1000 сум.
+   * 1 = без округления, 100 = до сотен.
+   */
+  roundUpToSum?: number
 }

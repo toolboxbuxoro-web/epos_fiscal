@@ -112,7 +112,27 @@ export default function Receipt() {
         tolStr != null && tolStr !== ''
           ? Number.parseInt(tolStr, 10) || 0
           : DEFAULT_TOLERANCE_TIYIN
-      const result = await buildMatch(parsed, { toleranceTiyin: tolerance })
+
+      // Параметры ценообразования: наценка (по умолчанию 10%) + округление
+      // продажной цены вверх до шага (по умолчанию 1000 сум).
+      // Matcher применяет их к каждому товару из справочника, чтобы сравнить
+      // с суммой чека МС по продажной (а не приходной) цене.
+      const markupStr = await getSetting(SettingKey.MarkupPercent)
+      const markupPercent =
+        markupStr != null && markupStr !== ''
+          ? Number.parseInt(markupStr, 10) || 0
+          : 10
+      const roundStr = await getSetting(SettingKey.RoundUpToSum)
+      const roundUpToSum =
+        roundStr != null && roundStr !== ''
+          ? Number.parseInt(roundStr, 10) || 0
+          : 1000
+
+      const result = await buildMatch(parsed, {
+        toleranceTiyin: tolerance,
+        markupPercent,
+        roundUpToSum,
+      })
       setMatch(result)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))

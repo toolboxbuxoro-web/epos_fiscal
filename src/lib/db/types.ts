@@ -64,6 +64,18 @@ export const SettingKey = {
   PrinterAutoPrint: 'printer.auto_print',
   /** Допуск по сумме при подборе чека (в тийинах) */
   MatchToleranceTiyin: 'matcher.tolerance_tiyin',
+  /**
+   * Процент наценки на приходную цену (целое число).
+   * Применяется ДО НДС. По умолчанию 10.
+   * Формула продажной цены: round_up(price * (1+markup/100) * (1+vat/100), step).
+   */
+  MarkupPercent: 'pricing.markup_percent',
+  /**
+   * Шаг округления продажной цены вверх, в сумах.
+   * По умолчанию 1000 — то есть 15500 → 16000, 667450 → 668000.
+   * 1 = без округления, 100 = до сотен сум, 1000 = до тысяч сум.
+   */
+  RoundUpToSum: 'pricing.round_up_to_sum',
   /** Включён ли режим автоматической фискализации */
   AutoFiscalize: 'matcher.auto_fiscalize',
   /** Включён ли режим подмены ИКПУ для товаров без приходов */
