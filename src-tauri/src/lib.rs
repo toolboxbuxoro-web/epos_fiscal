@@ -31,7 +31,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             printer::list_printers,
             printer::print_test_qr,
-            printer::print_fiscal_qr,
+            printer::print_fiscal_receipt,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

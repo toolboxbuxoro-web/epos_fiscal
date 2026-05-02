@@ -9,7 +9,13 @@ import {
 } from '@/lib/db'
 import { log } from '@/lib/log'
 import type { BuildMatchResult } from '@/lib/matcher/types'
-import { printFiscalQr } from '@/lib/printer'
+import {
+  formatPrintDate,
+  formatQtyForPrint,
+  formatTiyinForPrint,
+  printFiscalReceipt,
+  type ReceiptData,
+} from '@/lib/printer'
 import { EposClient } from './client'
 import { JsonRpcEposClient, formatGoTime, type JsonRpcReceipt } from './jsonrpc-client'
 import type {
@@ -151,11 +157,10 @@ export async function fiscalize(
   // 6. Статус.
   await setMsReceiptStatus(msReceiptId, 'fiscalized')
 
-  // 7. Авто-печать QR на термопринтер, если включено в Settings.
+  // 7. Авто-печать на термопринтер, если включено в Settings.
   // Печать НЕ должна валить фискализацию — чек уже в ОФД, лента это
-  // просто удобство для покупателя. Любая ошибка идёт в логи и видна
-  // в разделе «Логи», но возвращаемый результат остаётся успешным.
-  await maybePrintQr(fiscal.QRCodeURL)
+  // просто удобство для покупателя. Любая ошибка идёт в логи.
+  await maybePrintReceipt(build, fiscal, receivedCash, receivedCard, false)
 
   return { fiscal, fiscalReceiptDbId, matchDbId }
 }
@@ -174,14 +179,20 @@ function formatTestDateTime(d: Date): string {
 }
 
 /**
- * Если в настройках включена авто-печать и выбран принтер — отправить QR
- * на термопринтер. Ошибки залогировать, но не пробрасывать наверх.
+ * Если в настройках включена авто-печать и выбран принтер — собрать
+ * полные данные чека (реквизиты компании, позиции, итоги, фискальные
+ * данные) и отправить на термопринтер. Ошибки логируются, но наверх
+ * не пробрасываются: чек уже в ОФД, лента — это удобство для покупателя.
  *
- * ВСЕГДА пишет в логи что произошло — раньше тихий return при выключенной
- * авто-печати создавал впечатление что код печати вообще не вызывается
- * (запрос «почему не печатается» в логах ничего не находил).
+ * Используется и при первой фискализации, и при перепечати из Истории.
  */
-async function maybePrintQr(qrUrl: string): Promise<void> {
+export async function maybePrintReceipt(
+  build: BuildMatchResult,
+  fiscal: FiscalReceiptInfo,
+  receivedCash: number,
+  receivedCard: number,
+  isCopy: boolean,
+): Promise<void> {
   try {
     const enabled = (await getSetting(SettingKey.PrinterAutoPrint)) === 'true'
     if (!enabled) {
@@ -195,20 +206,82 @@ async function maybePrintQr(qrUrl: string): Promise<void> {
     if (!printerName) {
       await log.warn(
         'fiscalize',
-        'Печать пропущена: авто-печать включена, но принтер не выбран в Настройках',
+        'Печать пропущена: авто-печать включена, но принтер не выбран',
       )
       return
     }
-    const jobId = await printFiscalQr(printerName, qrUrl)
-    await log.info('fiscalize', `QR-чек отправлен на печать (job #${jobId})`, {
+
+    const data = await buildReceiptData(build, fiscal, receivedCash, receivedCard, isCopy)
+    const jobId = await printFiscalReceipt(printerName, data)
+    await log.info('fiscalize', `Чек отправлен на печать (job #${jobId})`, {
       printer: printerName,
+      isCopy,
     })
   } catch (err) {
-    await log.error('fiscalize', 'Ошибка печати QR-чека', {
+    await log.error('fiscalize', 'Ошибка печати чека', {
       error: err instanceof Error ? err.message : String(err),
     })
   }
 }
+
+/**
+ * Собрать ReceiptData для термопринтера из match + ответа Communicator + Settings.
+ * Все денежные значения форматируются в строки «1 234.56» под печать.
+ */
+async function buildReceiptData(
+  build: BuildMatchResult,
+  fiscal: FiscalReceiptInfo,
+  receivedCash: number,
+  receivedCard: number,
+  isCopy: boolean,
+): Promise<ReceiptData> {
+  const company = await readCompanySettings()
+  const cashier = (await getSetting(SettingKey.MoyskladEmployeeName)) ?? ''
+
+  // Все позиции — после подмены, по продажным ценам.
+  const items = build.positions.flatMap((pm) =>
+    pm.candidates.map((c) => ({
+      name: c.esfItem.name,
+      class_code: c.esfItem.class_code,
+      qty_str: formatQtyForPrint(c.quantity),
+      price_str: formatTiyinForPrint(c.priceTiyin),
+      vat_str: formatTiyinForPrint(c.vatTiyin),
+      vat_percent: c.esfItem.vat_percent,
+    })),
+  )
+
+  const totalTiyin = build.positions.reduce(
+    (s, pm) => s + pm.candidates.reduce((cs, c) => cs + c.priceTiyin, 0),
+    0,
+  )
+  const totalVatTiyin = build.positions.reduce(
+    (s, pm) => s + pm.candidates.reduce((cs, c) => cs + c.vatTiyin, 0),
+    0,
+  )
+
+  return {
+    is_copy: isCopy,
+    company: {
+      name: company.name || '',
+      address: company.address || '',
+      phone: company.phone || '',
+      inn: company.inn || '',
+    },
+    receipt_seq: fiscal.ReceiptSeq,
+    date_str: formatPrintDate(fiscal.DateTime),
+    items,
+    total_str: formatTiyinForPrint(totalTiyin),
+    total_vat_str: formatTiyinForPrint(totalVatTiyin),
+    cash_str: formatTiyinForPrint(receivedCash),
+    card_str: formatTiyinForPrint(receivedCard),
+    cashier,
+    terminal_id: fiscal.TerminalID,
+    fiscal_sign: fiscal.FiscalSign,
+    virtual_kassa: fiscal.DateTime,
+    qr_url: fiscal.QRCodeURL,
+  }
+}
+
 
 // ── Реализация для нового JSON-RPC :3448/rpc/api ──────────────────────
 

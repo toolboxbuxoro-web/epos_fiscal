@@ -20,31 +20,100 @@ export interface PrinterInfo {
  *
  * На Windows — через winspool, на macOS/Linux — через CUPS.
  * Включает все типы принтеров (термо, лазерные, виртуальные PDF).
- * UI должен дать пользователю выбрать какой именно использовать.
  */
 export async function listPrinters(): Promise<PrinterInfo[]> {
   return invoke<PrinterInfo[]>('list_printers')
 }
 
 /**
- * Напечатать тестовый QR-чек на указанный принтер.
- * Используется в Settings для проверки настроек до реальной фискализации.
+ * Напечатать тестовый чек на указанный принтер.
+ * Использует тот же шаблон что и реальный, чтобы заодно проверить
+ * рендер кириллицы, выравнивание колонок и QR.
  */
 export async function printTestQr(printerName: string): Promise<number> {
   return invoke<number>('print_test_qr', { printerName })
 }
 
+// ── Структуры данных для полного фискального чека ──────────────
+
+export interface ReceiptCompany {
+  name: string
+  address: string
+  phone: string
+  inn: string
+}
+
+export interface ReceiptItem {
+  /** Полное название товара (как пойдёт на ленту). */
+  name: string
+  /** ИКПУ — 17 цифр. */
+  class_code: string
+  /** Кол-во в виде строки: "1", "2", "1.5". */
+  qty_str: string
+  /** Сумма за позицию готовая для печати: "14 375.00". */
+  price_str: string
+  /** Сумма НДС готовая для печати: "1 540.18". */
+  vat_str: string
+  /** Ставка НДС в процентах (12 / 0 / 15). */
+  vat_percent: number
+}
+
+export interface ReceiptData {
+  /** Оригинал ("Asli") или копия ("Chek nusxasi"). */
+  is_copy: boolean
+  company: ReceiptCompany
+  receipt_seq: string
+  /** Дата для печати: "02.05.2026 11:32". */
+  date_str: string
+  items: ReceiptItem[]
+  total_str: string
+  total_vat_str: string
+  cash_str: string
+  card_str: string
+  cashier: string
+  terminal_id: string
+  fiscal_sign: string
+  /** Формат YYYYMMDDHHMMSS. */
+  virtual_kassa: string
+  qr_url: string
+}
+
 /**
- * Напечатать чек с QR-кодом фискального чека ОФД.
- *
- * Вызывается автоматически после успешной фискализации, если в Settings
- * включена опция авто-печати и выбран принтер. На принтере распечатается
- * только QR (по согласованию с пользователем), по которому покупатель
- * откроет электронный чек на soliq.uz.
+ * Распечатать полный фискальный чек с QR-кодом.
+ * Шаблон повторяет формат EPOS Cashdesk — реквизиты, позиции,
+ * итоги, способ оплаты, фискальные данные, QR, подвал про кешбек.
  */
-export async function printFiscalQr(
+export async function printFiscalReceipt(
   printerName: string,
-  qrUrl: string,
+  data: ReceiptData,
 ): Promise<number> {
-  return invoke<number>('print_fiscal_qr', { printerName, qrUrl })
+  return invoke<number>('print_fiscal_receipt', { printerName, data })
+}
+
+// ── Хелперы форматирования (общие для fiscalize и History) ─────
+
+/** Тийины → "1 234.56" с пробелами как разделителями тысяч. */
+export function formatTiyinForPrint(tiyin: number): string {
+  const sum = tiyin / 100
+  const fixed = sum.toFixed(2)
+  const [intPart, fracPart] = fixed.split('.')
+  const withThousands = intPart!.replace(/\B(?=(\d{3})+(?!\d))/g, ' ')
+  return `${withThousands}.${fracPart}`
+}
+
+/** Миллидоли → "1" / "1.5" (без trailing нулей). */
+export function formatQtyForPrint(milli: number): string {
+  if (milli % 1000 === 0) return String(milli / 1000)
+  return (milli / 1000).toFixed(3).replace(/\.?0+$/, '')
+}
+
+/** YYYYMMDDHHMMSS → "DD.MM.YYYY HH:MM" для печати в шапке. */
+export function formatPrintDate(s: string): string {
+  if (!/^\d{14}$/.test(s)) return s
+  const y = s.slice(0, 4)
+  const m = s.slice(4, 6)
+  const d = s.slice(6, 8)
+  const h = s.slice(8, 10)
+  const mi = s.slice(10, 12)
+  return `${d}.${m}.${y} ${h}:${mi}`
 }

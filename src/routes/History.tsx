@@ -1,12 +1,18 @@
 import { useEffect, useState } from 'react'
 import {
-  getSetting,
+  getAllSettings,
   listFiscalReceipts,
   SettingKey,
   type FiscalReceiptRow,
 } from '@/lib/db'
 import { formatDateTime } from '@/lib/format'
-import { printFiscalQr } from '@/lib/printer'
+import {
+  formatPrintDate,
+  formatQtyForPrint,
+  formatTiyinForPrint,
+  printFiscalReceipt,
+  type ReceiptData,
+} from '@/lib/printer'
 import { Button } from '@/components/ui/Button'
 
 export default function History() {
@@ -36,16 +42,19 @@ export default function History() {
   }
 
   /**
-   * Перепечатать QR ранее фискализированного чека.
-   * Берём сохранённый qr_code_url из БД и шлём на принтер из Settings.
-   * Полезно: тестировать настройку принтера без новой фискализации, или
-   * выдать копию покупателю если первая лента закончилась.
+   * Перепечатать ранее фискализированный чек как копию ("Chek nusxasi").
+   *
+   * Реконструирует данные чека из request_json (это то что мы отправили
+   * в Communicator — Items, ReceivedCash, ReceivedCard) + Settings
+   * (реквизиты компании). Данные идентичны попавшим в ОФД, печатается
+   * точная копия с QR.
    */
   async function reprintQr(receipt: FiscalReceiptRow) {
     setPrintMsg((m) => ({ ...m, [receipt.id]: '' }))
     setPrinting((p) => ({ ...p, [receipt.id]: true }))
     try {
-      const printerName = await getSetting(SettingKey.PrinterName)
+      const settings = await getAllSettings()
+      const printerName = settings[SettingKey.PrinterName]
       if (!printerName) {
         setPrintMsg((m) => ({
           ...m,
@@ -53,10 +62,12 @@ export default function History() {
         }))
         return
       }
-      const jobId = await printFiscalQr(printerName, receipt.qr_code_url)
+
+      const data = buildReceiptDataFromHistory(receipt, settings)
+      const jobId = await printFiscalReceipt(printerName, data)
       setPrintMsg((m) => ({
         ...m,
-        [receipt.id]: `✓ Отправлено (job #${jobId})`,
+        [receipt.id]: `✓ Копия отправлена (job #${jobId})`,
       }))
     } catch (e) {
       setPrintMsg((m) => ({
@@ -168,6 +179,120 @@ export default function History() {
       </div>
     </div>
   )
+}
+
+/**
+ * Реконструировать данные чека для повторной печати из БД.
+ *
+ * Источник позиций — это `request_json`, тот самый JSON, который мы
+ * отправили в EPOS Communicator. То есть распечатается ТОЧНАЯ копия
+ * того, что попало в ОФД.
+ *
+ * Поддерживаются два формата request_json:
+ *   - JSON-RPC (Api.SendSaleReceipt) — params.Receipt с PascalCase полями
+ *   - Legacy /uzpos — на верхнем уровне `params.items` с camelCase полями
+ */
+function buildReceiptDataFromHistory(
+  receipt: FiscalReceiptRow,
+  settings: Record<string, string>,
+): ReceiptData {
+  // Парсим request_json с двумя возможными форматами.
+  type RpcItem = {
+    Price?: number
+    VAT?: number
+    Name?: string
+    ClassCode?: string
+    Amount?: number
+    VATPercent?: number
+  }
+  type LegacyItem = {
+    price?: number
+    vat?: number
+    name?: string
+    classCode?: string
+    amount?: number
+    vatPercent?: number
+  }
+
+  let items: ReceiptData['items'] = []
+  let receivedCash = 0
+  let receivedCard = 0
+  try {
+    const parsed = JSON.parse(receipt.request_json) as Record<string, unknown>
+
+    // JSON-RPC: { params: { Receipt: { Items: [...], ReceivedCash, ReceivedCard } } }
+    const rpcReceipt = (
+      parsed?.params as { Receipt?: unknown } | undefined
+    )?.Receipt as
+      | { Items?: RpcItem[]; ReceivedCash?: number; ReceivedCard?: number }
+      | undefined
+    if (rpcReceipt?.Items) {
+      items = rpcReceipt.Items.map((it) => ({
+        name: it.Name ?? '',
+        class_code: it.ClassCode ?? '',
+        qty_str: formatQtyForPrint(it.Amount ?? 1000),
+        price_str: formatTiyinForPrint(it.Price ?? 0),
+        vat_str: formatTiyinForPrint(it.VAT ?? 0),
+        vat_percent: it.VATPercent ?? 12,
+      }))
+      receivedCash = rpcReceipt.ReceivedCash ?? 0
+      receivedCard = rpcReceipt.ReceivedCard ?? 0
+    } else {
+      // Legacy /uzpos: { params: { items: [...], receivedCash, receivedCard } }
+      const legacyParams = parsed?.params as
+        | {
+            items?: LegacyItem[]
+            receivedCash?: number
+            receivedCard?: number
+          }
+        | undefined
+      if (legacyParams?.items) {
+        items = legacyParams.items.map((it) => ({
+          name: it.name ?? '',
+          class_code: it.classCode ?? '',
+          qty_str: formatQtyForPrint(it.amount ?? 1000),
+          price_str: formatTiyinForPrint(it.price ?? 0),
+          vat_str: formatTiyinForPrint(it.vat ?? 0),
+          vat_percent: it.vatPercent ?? 12,
+        }))
+        receivedCash = legacyParams.receivedCash ?? 0
+        receivedCard = legacyParams.receivedCard ?? 0
+      }
+    }
+  } catch {
+    // request_json повреждён — печатаем хотя бы шапку и QR.
+  }
+
+  const totalTiyin = receivedCash + receivedCard
+  // Сумма НДС оригинальная — берём из items, чтобы не делать отдельных пересчётов.
+  // VAT там уже посчитан под продажную цену.
+  const totalVatTiyin = items.reduce((s, it) => {
+    // it.vat_str — строка типа "1 234.56"; парсим обратно.
+    const num = Number.parseFloat(it.vat_str.replace(/\s/g, '')) * 100
+    return s + (Number.isFinite(num) ? Math.round(num) : 0)
+  }, 0)
+
+  return {
+    is_copy: true,
+    company: {
+      name: settings[SettingKey.CompanyName] ?? '',
+      address: settings[SettingKey.CompanyAddress] ?? '',
+      phone: settings[SettingKey.CompanyPhone] ?? '',
+      inn: settings[SettingKey.CompanyInn] ?? '',
+    },
+    receipt_seq: receipt.receipt_seq,
+    date_str: formatPrintDate(receipt.fiscal_datetime),
+    items,
+    total_str: formatTiyinForPrint(totalTiyin),
+    total_vat_str: formatTiyinForPrint(totalVatTiyin),
+    cash_str: formatTiyinForPrint(receivedCash),
+    card_str: formatTiyinForPrint(receivedCard),
+    cashier: settings[SettingKey.MoyskladEmployeeName] ?? '',
+    terminal_id: receipt.terminal_id,
+    fiscal_sign: receipt.fiscal_sign,
+    virtual_kassa: receipt.fiscal_datetime,
+    qr_url: receipt.qr_code_url,
+  }
 }
 
 function Th({ children }: { children: React.ReactNode }) {
