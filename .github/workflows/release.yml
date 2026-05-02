@@ -1,16 +1,16 @@
 name: Release
 
-# Триггер: push тега вида v0.1.0 → автоматическая сборка для всех платформ
-# и публикация в GitHub Releases.
+# Триггер: push тега вида v0.1.0 → автоматическая сборка для Windows и
+# публикация в GitHub Releases. Время сборки ~5-7 минут.
 #
 # Чтобы выпустить релиз:
 #   1. Поправить version в package.json и src-tauri/tauri.conf.json
 #   2. git commit + git tag v0.1.0 + git push --tags
-#   3. Через ~10–15 минут в Releases появятся артефакты:
-#        - EPOS_Fiscal_0.1.0_x64.dmg     (macOS Intel)
-#        - EPOS_Fiscal_0.1.0_aarch64.dmg (macOS Apple Silicon)
-#        - EPOS_Fiscal_0.1.0_x64-setup.exe (Windows installer)
-#        - EPOS_Fiscal_0.1.0_amd64.AppImage (Linux)
+#   3. Через ~5-7 минут в Releases появится артефакт:
+#        - EPOS_Fiscal_0.1.0_x64-setup.exe (Windows NSIS installer)
+#
+# Mac/Linux отключены ради скорости — продакшен только Windows. Если
+# нужно собрать под другую платформу, см. комментарий в matrix ниже.
 
 on:
   push:
@@ -25,13 +25,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Только Windows — это единственная целевая платформа в проде (4
+        # магазина в УЗ, все на Win). Раньше билдили ещё Mac ARM, Mac
+        # Intel и Ubuntu — суммарно ~12 мин CI на каждый push тега.
+        # Без них релиз готов за ~5-7 мин, что сильно ускоряет цикл
+        # «правка → видеть на Win-кассе через autoupdate».
+        # Если понадобится Mac/Linux — добавь обратно строки:
+        #   - platform: macos-latest
+        #     args: '--target aarch64-apple-darwin'
+        #   - platform: macos-latest
+        #     args: '--target x86_64-apple-darwin'
+        #   - platform: ubuntu-22.04
+        #     args: ''
         include:
-          - platform: macos-latest
-            args: '--target aarch64-apple-darwin'
-          - platform: macos-latest
-            args: '--target x86_64-apple-darwin'
-          - platform: ubuntu-22.04
-            args: ''
           - platform: windows-latest
             args: ''
 
@@ -49,25 +55,11 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-
-      - name: Install Linux deps
-        if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
-            librsvg2-dev \
-            patchelf \
-            libssl-dev \
-            libcups2-dev
 
       - name: Install npm deps
         run: npm ci
