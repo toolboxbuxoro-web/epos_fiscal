@@ -188,14 +188,28 @@ export class JsonRpcEposClient {
   // ── Helpers ─────────────────────────────────────────────────────
 
   /**
-   * Формат даты для Communicator: "2026-05-01T15:30:00" (ISO без миллисекунд и TZ).
-   * Так делает CustomDateTimeConverter в Market 6.
+   * Формат даты для Communicator: "2026-05-01 15:30:00" (Go reference time).
+   *
+   * ВАЖНО: пробел между датой и временем, НЕ `T`. Communicator написан на Go
+   * и парсит парсером `time.Parse("2006-01-02 15:04:05", ...)`. Если послать
+   * ISO с `T` — получаем `cannot parse "T..." as " "` (illegal argument).
+   *
+   * Время — локальное (а не UTC), потому что Communicator работает в local TZ
+   * терминала (Asia/Tashkent в нашем случае).
    */
   private formatTime(d: Date): string {
-    const pad = (n: number) => String(n).padStart(2, '0')
-    return (
-      `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
-      `T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
-    )
+    return formatGoTime(d)
   }
+}
+
+/**
+ * Форматировать дату в Go-style "2006-01-02 15:04:05" (локальное время).
+ * Экспортируется чтобы fiscalize.ts использовал тот же формат.
+ */
+export function formatGoTime(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return (
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
+    ` ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+  )
 }

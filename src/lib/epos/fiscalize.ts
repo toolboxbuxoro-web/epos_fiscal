@@ -11,7 +11,7 @@ import { log } from '@/lib/log'
 import type { BuildMatchResult } from '@/lib/matcher/types'
 import { printFiscalQr } from '@/lib/printer'
 import { EposClient } from './client'
-import { JsonRpcEposClient, type JsonRpcReceipt } from './jsonrpc-client'
+import { JsonRpcEposClient, formatGoTime, type JsonRpcReceipt } from './jsonrpc-client'
 import type {
   CommunicatorItem,
   CommunicatorParams,
@@ -186,7 +186,10 @@ async function fiscalizeJsonRpc(
   )
 
   const receipt: JsonRpcReceipt = {
-    Time: new Date().toISOString().slice(0, 19), // 2026-05-01T15:30:00
+    // Go-style "2026-05-01 15:30:00" с ПРОБЕЛОМ. ISO с T парсер
+    // Communicator не понимает: "cannot parse \"T05:47:34\" as \" \"".
+    // Локальное время (а не UTC) — Communicator работает в TZ терминала.
+    Time: formatGoTime(new Date()),
     Items: items,
     ReceivedCash: receivedCash,
     ReceivedCard: receivedCard,
