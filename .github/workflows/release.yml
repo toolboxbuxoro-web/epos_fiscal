@@ -1,16 +1,18 @@
 name: Release
 
-# Триггер: push тега вида v0.1.0 → автоматическая сборка для Windows и
-# публикация в GitHub Releases. Время сборки ~5-7 минут.
+# Триггер: push тега вида v0.1.0 → параллельная сборка под Windows и Mac
+# (ARM + Intel) и публикация в GitHub Releases. Время сборки ~7-10 минут.
 #
 # Чтобы выпустить релиз:
 #   1. Поправить version в package.json и src-tauri/tauri.conf.json
 #   2. git commit + git tag v0.1.0 + git push --tags
-#   3. Через ~5-7 минут в Releases появится артефакт:
+#   3. Через ~7-10 минут в Releases появятся артефакты:
 #        - EPOS_Fiscal_0.1.0_x64-setup.exe (Windows NSIS installer)
+#        - EPOS_Fiscal_0.1.0_aarch64.dmg   (macOS Apple Silicon)
+#        - EPOS_Fiscal_0.1.0_x64.dmg       (macOS Intel)
 #
-# Mac/Linux отключены ради скорости — продакшен только Windows. Если
-# нужно собрать под другую платформу, см. комментарий в matrix ниже.
+# Linux отключён (нет таргетов в проде, никто не запускает). Если
+# нужно — добавь обратно: { platform: ubuntu-22.04, args: '' } + Linux deps.
 
 on:
   push:
@@ -25,21 +27,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Только Windows — это единственная целевая платформа в проде (4
-        # магазина в УЗ, все на Win). Раньше билдили ещё Mac ARM, Mac
-        # Intel и Ubuntu — суммарно ~12 мин CI на каждый push тега.
-        # Без них релиз готов за ~5-7 мин, что сильно ускоряет цикл
-        # «правка → видеть на Win-кассе через autoupdate».
-        # Если понадобится Mac/Linux — добавь обратно строки:
-        #   - platform: macos-latest
-        #     args: '--target aarch64-apple-darwin'
-        #   - platform: macos-latest
-        #     args: '--target x86_64-apple-darwin'
-        #   - platform: ubuntu-22.04
-        #     args: ''
+        # Windows — продакшен (4 магазина в УЗ).
+        # macOS ARM/Intel — для разработки и dev-билдов на Mac разработчика
+        # (плюс tauri-plugin-updater на Mac ищет darwin-aarch64 в latest.json
+        # и без этого падает на каждом старте dev-окружения).
+        # Linux отключён — нет целевых пользователей.
         include:
           - platform: windows-latest
             args: ''
+          - platform: macos-latest
+            args: '--target aarch64-apple-darwin'
+          - platform: macos-latest
+            args: '--target x86_64-apple-darwin'
 
     runs-on: ${{ matrix.platform }}
 
@@ -55,6 +54,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
