@@ -58,6 +58,7 @@ pub fn print_test_qr(printer_name: String) -> Result<u64, String> {
             class_code: "00000000000000000".to_string(),
             qty_str: "1".to_string(),
             price_str: "1 000.00".to_string(),
+            discount_str: String::new(),
             vat_str: "107.14".to_string(),
             vat_percent: 12,
         }],
@@ -126,7 +127,12 @@ pub struct ReceiptItem {
     pub name: String,
     pub class_code: String,
     pub qty_str: String,
+    /// Цена за позицию ДО скидки. На ленте всегда печатается.
     pub price_str: String,
+    /// Размер скидки, готовый к печати. Пустая строка = скидки нет
+    /// (тогда строка «Skidka» не выводится).
+    #[serde(default)]
+    pub discount_str: String,
     pub vat_str: String,
     pub vat_percent: u8,
 }
@@ -228,12 +234,18 @@ fn build_receipt(d: &ReceiptData) -> Vec<u8> {
         for line in wrap_text(&item.name, LINE_WIDTH) {
             write_line(&mut buf, &line);
         }
-        // Кол-во + сумма.
+        // Кол-во + сумма (ДО скидки если она есть).
         let qty_left = format!("Miqdori:  {}", item.qty_str);
         let qty_right = format!("{} so'm", item.price_str);
         write_line(&mut buf, &two_cols(&qty_left, &qty_right));
 
-        // НДС.
+        // Скидка — если применена. discount_str пустой = скидки нет.
+        if !item.discount_str.is_empty() {
+            let disc_value = format!("-{} so'm", item.discount_str);
+            write_line(&mut buf, &two_cols("Skidka:", &disc_value));
+        }
+
+        // НДС (рассчитан от price - discount).
         let vat_label = format!("Sh.J. QQS {}%:", item.vat_percent);
         let vat_value = format!("{} so'm", item.vat_str);
         write_line(&mut buf, &two_cols(&vat_label, &vat_value));

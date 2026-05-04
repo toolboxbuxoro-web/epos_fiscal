@@ -133,7 +133,7 @@ Tauri/reqwest). Поэтому в каждом запросе шлём `Authoriz
 | Время в БД | **epoch секунды** | now() helper |
 | Дата для МС filter | `YYYY-MM-DD HH:MM:SS.SSS` UTC | `formatMsMoment` |
 | Дата для EPOS sale | `YYYYMMDDHHMMSS` без разделителей | `refundInfo.dateTime` |
-| Дата для JSON-RPC | ISO без миллисекунд | `2026-05-01T15:30:00` |
+| Дата для JSON-RPC | **Go-style с пробелом**, локальное время | `2026-05-04 15:30:00` |
 
 Любой числовой расчёт с деньгами — в тийинах. Конвертация только на
 вход (Excel) и UI-форматирование (`format.ts`).
@@ -154,6 +154,127 @@ Matcher выбирает товары так, чтобы суммарно сов
 **Юридический нюанс:** подмена ИКПУ — серая зона. Юзер взял на себя
 ответственность. Журнал замен — `replacement_log` для аудита.
 
+## Matcher: цена и три стратегии
+
+### Формула продажной цены
+
+`selling = round_up(unit_price × (1 + markup/100) × (1 + vat/100), step)` —
+**последовательно**, не суммой 22%. Дефолты: markup 10%, step 1000 сум.
+
+Пример: приход 5959.28 сум, markup 10%, НДС 12%, шаг 1000 →
+`5959.28 × 1.10 × 1.12 = 7341.63` → округление вверх → **8000 сум**.
+
+Себестоимость с НДС (пол скидки): `unit_price × (1 + vat/100)` × quantity —
+**без** наценки. Это нижняя граница для `distributeDiscount`.
+
+### Стратегии (по очереди для каждой позиции)
+
+1. **passthrough** — есть приход с тем же ИКПУ и достаточным остатком →
+   фискализируем «как есть». Цена = расчётная продажная.
+2. **price-bucket** — нет ИКПУ или нет остатка → ищем товар, у которого
+   расчётная цена близка к `pos.totalTiyin` в пределах `toleranceTiyin`.
+   **В чек пишем `pos.totalTiyin` (не calculated)** — клиент заплатил
+   эту сумму, фискализируем именно её. Calc цена использовалась только
+   для матчинга. Это убирает систематический микро-минус -1000.
+3. **multi-item** — greedy knapsack по убыванию цены, набираем N товаров
+   на сумму ± tolerance. Лимит N — `maxMultiItem` (default 5).
+
+### Финальное выравнивание суммы
+
+После основного цикла (если флаг `discountForExactSum=true`):
+
+- `distributeDiscount` — matched > target → срезаем скидкой. Cap
+  `maxDiscountPerItemTiyin` (default 200_000 = 2000 сум). Floor — себестоимость
+  с НДС (нельзя продавать в убыток).
+- `distributeBump` — matched < target → надбавка к цене. Cap тот же.
+  Floor не нужен (повышение наценки всегда легально).
+
+Один флаг → точное совпадение в обе стороны. По дефолту флаг **включён**
+(в Receipt.tsx fallback `null → true`).
+
+### Пул товаров — один запрос на чек
+
+`loadMatcherPool` грузит все `esf_items` с `available >= 1000` ОДИН раз
+и предрасчитывает `sellingPrice` для каждого. Все 3 стратегии работают
+по этому пулу in-memory. Раньше каждая стратегия делала свой
+`listEsfItems(limit:5000)` × N позиций — UI лагал на чеках 5+ позиций.
+
+### Услуги (`assortment.meta.type === 'service'`)
+
+В МС магазины используют тип service для нетоварных позиций: имя
+кассира («Турсуной кушмуродова»), доставка, монтаж, гарантия.
+**В фискальный чек УЗ услуги не идут** — кассовый аппарат пробивает
+только товары с ИКПУ. `extractPositions` фильтрует их по
+`assortment.meta.type === 'service'` ещё до matcher.
+
+### Бонусы / частичная оплата
+
+В МС `rd.sum` — что покупатель РЕАЛЬНО заплатил (после вычета бонусов).
+Сумма позиций может быть **больше** — например покупка на 1 000 000,
+100 000 закрыто баллами, к оплате 900 000.
+
+- `rd.sum <= 0` → возврат пустого результата + warning (фискализация
+  не нужна, ОФД не примет нулевой чек).
+- `rd.sum < positionsSum` → **скейлим позиции пропорционально** до подбора:
+  `pos.totalTiyin × (rd.sum / positionsSum)`. Matcher работает уже со
+  скейленными позициями.
+
+### Авто-определение оплаты (cash/card/QR/mixed)
+
+Поля МС: `cashSum`, `noCashSum`, `qrSum`. В fiscalize.ts функция
+`determinePaymentFromMs` смотрит соотношение и заполняет
+`receivedCash` / `receivedCard` пропорционально matchedTotal:
+
+- только cash → `receivedCash = matchedTotal`
+- только card/qr → `receivedCard = matchedTotal`
+- mixed → пропорциональный split от `cash:(card+qr)`.
+
+В UI Receipt.tsx — бейдж типа оплаты с суммами.
+
+## Тестовый режим (`SettingKey.TestMode`)
+
+Флаг в Настройках. Если включён — fiscalize.ts:
+- НЕ дёргает Communicator
+- НЕ пишет в `fiscal_receipts` реальный TerminalID/FiscalSign
+- Печатает чек на термопринтер с шапкой **«ТЕСТ — НЕ ФИСКАЛЬНЫЙ ЧЕК»**
+
+Цель — проверить подбор + раскладку по позициям без реальной отправки
+в ОФД (карта USB в этот момент может ещё не быть подключена). По
+дефолту флаг сбрасывается в false при чистой установке.
+
+## Печать чека (Xprinter XP-80 USB)
+
+Подсистема в `src-tauri/src/printer.rs` + JS-обёртка `src/lib/printer/`.
+
+### Технические детали
+
+- **Crate `printers`** — обёртка над winspool на Win, CUPS на Mac/Linux.
+- **На Win — raw_properties = `{}` (пустой)**. winspool ожидает «RAW»
+  сам по себе и валится с `StartDocPrinterW failed` если передать ему
+  `application/vnd.cups-raw`. Поэтому `cfg(windows)` ветка пустая.
+- **Кодировка кириллицы — CP866 (DOS Cyrillic)**. На Xprinter код 17.
+  Конвертация через `encoding_rs::IBM866`. Пробовали WCP1251 (код 46) —
+  на этой модели маппится на греческий/математические символы.
+- **ESC/POS** — посылаем raw байты: cut, размер шрифта, выравнивание,
+  и **native QR через `GS ( k`** (без рендера PNG).
+
+### Когда печатается
+
+После успешной фискализации (или сразу в тестовом режиме). Печать
+«fire-and-forget» — ошибка принтера не ломает фискализацию (в логах).
+
+### Что показывает
+
+- Реквизиты компании / магазина / кассира (из Settings)
+- Дата+время фискализации
+- Список позиций: имя, ИКПУ, qty, цена, **скидка отдельной строкой
+  («Skidka:»)** если distributeDiscount/Bump применили, итого позиции
+- ИТОГО, тип оплаты, сумма НДС
+- TerminalID / ReceiptSeq / FiscalSign
+- QR-код на ОФД-сайт (https://ofd.soliq.uz/...)
+
+В тестовом режиме вместо TerminalID/FiscalSign — заглушка.
+
 ## Релизы и Auto-update
 
 ```
@@ -161,8 +282,8 @@ git push origin main
 git tag v0.X.Y
 git push origin v0.X.Y
    │
-   ▼ ~10–15 мин
-GitHub Actions (4 платформы параллельно)
+   ▼ ~7–10 мин
+GitHub Actions (Win + Mac параллельно; Linux отключён ради скорости)
    │
    ▼
 Подписанный релиз в Releases (releaseDraft: false)
@@ -223,28 +344,35 @@ irm https://raw.githubusercontent.com/toolboxbuxoro-web/epos_fiscal/main/scripts
 
 ```
 src-tauri/
-  Cargo.toml              ← features: tauri-plugin-http["gzip"]
+  Cargo.toml              ← features: tauri-plugin-http["gzip"], printers
   tauri.conf.json         ← bundle.createUpdaterArtifacts: true (для подписи)
   capabilities/default.json ← НЕ сужать allow-list
+  src/
+    printer.rs            ← raw ESC/POS + CP866 + native QR (GS ( k)
   migrations/
     001_initial.sql       ← 7 таблиц (settings, esf_items, ms_receipts, ...)
     002_logs.sql          ← логи диагностики
 src/
   lib/
-    db/                   ← SQLite, типы и DAO
+    db/                   ← SQLite, типы и DAO (SettingKey enum)
     moysklad/             ← клиент + поллер с фильтром по retailStore
     esf/                  ← Excel импорт с автомаппингом колонок
-    matcher/              ← 3 стратегии подбора
+    matcher/
+      extract.ts          ← service-фильтр + нормализация
+      strategies.ts       ← 3 стратегии + pricing + cost-with-VAT
+      index.ts            ← buildMatch + distributeDiscount + distributeBump
+      types.ts            ← MatchCandidate (price/discount/vat) + MatcherOptions
     epos/
       client.ts           ← LEGACY /uzpos
-      jsonrpc-client.ts   ← НОВЫЙ /rpc/api  ← фискализация идёт через него
-      fiscalize.ts        ← главный flow + auto-detect протокола
+      jsonrpc-client.ts   ← НОВЫЙ /rpc/api + formatGoTime  ← фискализация идёт через него
+      fiscalize.ts        ← главный flow + auto-detect протокола + payment split
+    printer/              ← JS-обёртка над Tauri-командой print_receipt
     log.ts                ← запись в logs таблицу
     updater.ts            ← autoApplyOnStartup
-  routes/                 ← 5 экранов: Dashboard / Receipt / Catalog / History / Logs / Settings
+  routes/                 ← 6 экранов: Dashboard / Receipt / Catalog / History / Logs / Settings
 docs/
   external-apis/universal-communicator.md  ← API legacy /uzpos (Postman)
-.github/workflows/release.yml  ← CI: 4 платформы, releaseDraft:false
+.github/workflows/release.yml  ← CI: Win+Mac (без Linux), releaseDraft:false
 ```
 
 ## Чек-лист первого запуска у магазина
@@ -257,8 +385,13 @@ docs/
    - Кассир: выбрать ФИО (для печати)
    - EPOS URL: `http://localhost:3448/rpc/api`
    - Реквизиты компании
+   - Принтер чеков (опционально, default — системный)
+   - Markup % / округление (default 10% / 1000 сум)
+   - Скидка для точной суммы (default ВКЛ, max 2000 сум)
+   - **Тестовый режим: ВКЛ** на первое время — чтобы проверить подбор без отправки в ОФД
 4. Справочник → Импорт Excel с приходами от бухгалтерии.
 5. Очередь — приходят чеки из МС. Открыть чек → проверить подбор → Фискализировать.
+6. Когда тест прошёл успешно (печать корректна, суммы совпадают) — выключить тестовый режим в Настройках. Дальше всё уходит в ОФД реально.
 
 ## Известные подводные камни
 
@@ -271,6 +404,14 @@ docs/
 | Communicator не отвечает в Tauri, но curl работает | Capability blocking порта | Не сужать `http:default` allow |
 | Receipt позиции пустые | МС в list-запросе не возвращает inline rows | Lazy-load в Receipt.tsx через GET одиночный |
 | Auto-update «Could not fetch latest.json» | Репо приватный или нет `latest.json` | Сделать репо public + `bundle.createUpdaterArtifacts: true` |
+| `StartDocPrinterW failed` на Win | Передавали `vnd.cups-raw` mime в winspool | `raw_properties = {}` через `cfg(windows)` |
+| Кириллица иероглифами на Xprinter | Кодировка WCP1251 (код 46) → греческий/мат | CP866 (код 17) + `encoding_rs::IBM866` |
+| Communicator-сервер на Go отвергает `T` в дате | Парсит `time.Parse("2006-01-02 15:04:05", ...)` | `formatGoTime(d)` — пробел вместо T |
+| `BEGIN`/`COMMIT` через `db.execute` не работает | tauri-plugin-sql использует разные коннекшены | Manual cleanup в catch-блоке |
+| matched < target = -1000 на чеке | price-bucket писал `best.sellingPrice` вместо `pos.totalTiyin` | Фикс в strategies.ts + `distributeBump` для остатка |
+| Тестовый режим выключал печать | Возврат до `maybePrintReceipt` | Печатать с `is_test=true`, шапка «ТЕСТ — НЕ ФИСКАЛЬНЫЙ ЧЕК» |
+| `discountForExactSum` дефолт не применялся | `null === 'true'` = false для never-saved setting | `discRaw == null ? true : discRaw === 'true'` |
+| matched=789, rd.sum=790, услуги=0 | МС-позиция «service» (имя кассира) ломала подбор | Фильтр `assortment.meta.type === 'service'` в `extractPositions` |
 
 ## Открытые вопросы
 
@@ -278,14 +419,23 @@ docs/
 - **VAT-формула**: по умолчанию `vat = total * percent / (100 + percent)` (НДС включён в цену). Если у магазина НДС начисляется сверху — нужно поменять `vatIncluded` → `vatAddedOn` в `matcher/strategies.ts`.
 - **Ключи подписи**: `~/.tauri/epos-fiscal.key` живёт только на одной машине разработчика. Если потеряем — нужно перевыпустить и заново публиковать клиентам (auto-update сломается). Бэкап ключа — обязательно.
 
-## Текущее состояние (на 2026-05-01)
+## Текущее состояние (на 2026-05-04)
 
 - ✅ MVP функционально полный
-- ✅ Auto-update работает с подписью
+- ✅ Auto-update работает с подписью (Win + Mac)
 - ✅ Multi-shop архитектура (фильтр по точке продаж)
-- ✅ JSON-RPC поддержка для актуального Communicator
+- ✅ JSON-RPC поддержка для актуального Communicator + Go-style date format
 - ✅ Импорт Excel: per-row try/catch вместо broken-транзакции (819 из 819 строк)
 - ✅ Matcher по дефолту vatStrict=false + tolerance 100k тийинов (без этого 0 матчей на реальных чеках)
-- ✅ Печать QR на термопринтер (Xprinter XP-80 USB) после успешной фискализации
+- ✅ Pricing-формула markup×VAT (последовательно, не суммой 22%)
+- ✅ `distributeDiscount` (matched > target) + `distributeBump` (matched < target) → точное совпадение суммы в обе стороны
+- ✅ price-bucket пишет `pos.totalTiyin` (что заплатил клиент), не расчётную цену
+- ✅ Скейл позиций при частичной оплате бонусами + skip фискализации при `rd.sum=0`
+- ✅ Фильтр услуг (`assortment.meta.type === 'service'`)
+- ✅ Авто-определение оплаты cash/card/QR/mixed из МС
+- ✅ Печать QR на термопринтер Xprinter XP-80 (CP866, ESC/POS native QR)
+- ✅ Тестовый режим без отправки в ОФД (но с печатью «ТЕСТ»)
+- ✅ Перформанс matcher: один пул на чек вместо N×5000 запросов
+- ✅ CI 7–10 мин (Win + Mac, без Linux)
 - ⏳ Реальная фискализация end-to-end ещё не проверена (ждём пробный чек)
 - ⏳ Реверс-инжиниринг точного формата `Receipt` для JSON-RPC API

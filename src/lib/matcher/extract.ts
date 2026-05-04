@@ -72,9 +72,27 @@ export function normalizePosition(
   }
 }
 
-/** Извлечь все нормализованные позиции из retaildemand. */
+/**
+ * Услуга в МС — это `assortment.meta.type === 'service'`. Магазины используют
+ * этот тип для нетоварных позиций: имя продавца («Турсуной кушмуродова»),
+ * доставка курьером, монтажные работы, гарантия и т.п.
+ *
+ * В фискальный чек УЗ услуги не идут — кассовый аппарат пробивает только
+ * товары с ИКПУ. Услуги МС обычно идут с нулевой суммой и без ИКПУ — их
+ * нужно полностью исключить из подбора.
+ */
+function isService(pos: MsRetailDemandPosition): boolean {
+  const a = pos.assortment as { meta?: { type?: string } }
+  return a?.meta?.type === 'service'
+}
+
+/** Извлечь все нормализованные позиции из retaildemand.
+ * Услуги (service) полностью отфильтровываются — они не товар и не идут в чек.
+ */
 export function extractPositions(rd: MsRetailDemand): NormalizedPosition[] {
   const positions = inlinePositions(rd)
   if (!positions) return []
-  return positions.map((p, i) => normalizePosition(p, i))
+  return positions
+    .filter((p) => !isService(p))
+    .map((p, i) => normalizePosition(p, i))
 }

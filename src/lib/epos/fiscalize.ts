@@ -24,7 +24,6 @@ import type {
   CommunicatorSaleRequest,
   FiscalReceiptInfo,
 } from './types'
-import { vatIncluded } from '@/lib/matcher/strategies'
 
 export interface FiscalizeOptions {
   /** Использовать `fastSale` (без печати чека) — только для legacy /uzpos. */
@@ -67,12 +66,23 @@ export async function fiscalize(
   if (build.positions.length === 0) {
     throw new Error('Нечего отправлять в Communicator: пустой план')
   }
+  // matchedTotal — сумма к оплате (с учётом скидок если они применены).
+  // = sum(priceTiyin - discountTiyin). Совпадает с rd.sum если включена
+  // discountForExactSum и хватает запаса по себестоимости.
   const matchedTotal = build.positions.reduce(
-    (s, pm) => s + pm.candidates.reduce((cs, c) => cs + c.priceTiyin, 0),
+    (s, pm) =>
+      s + pm.candidates.reduce((cs, c) => cs + c.priceTiyin - c.discountTiyin, 0),
     0,
   )
-  const receivedCash = opts.receivedCash ?? matchedTotal
-  const receivedCard = opts.receivedCard ?? 0
+
+  // Тип оплаты — берём из МойСклад (cashSum / noCashSum / qrSum), сумму —
+  // из подбора (matchedTotal, после наценки+НДС+округления). Так чек
+  // в EPOS/ОФД сходится: сумма items = сумма оплат. Если кассир хочет
+  // переопределить (через FiscalizeOptions) — opts.receivedCash/Card
+  // выигрывают.
+  const auto = determinePaymentFromMs(build.receipt, matchedTotal)
+  const receivedCash = opts.receivedCash ?? auto.receivedCash
+  const receivedCard = opts.receivedCard ?? auto.receivedCard
 
   // ── Тестовый режим (сухой прогон) ────────────────────────────
   // UI отрабатывает «как будто» фискализация прошла, но в Communicator
@@ -169,6 +179,57 @@ export async function fiscalize(
 }
 
 /**
+ * Определить тип оплаты по чеку МС.
+ *
+ * Логика:
+ *   - Только `cashSum > 0` → всё в `ReceivedCash`
+ *   - Только `noCashSum`/`qrSum` > 0 → всё в `ReceivedCard`
+ *   - Смешанная (есть и нал, и безнал) → пропорция от matchedTotal:
+ *       cashShare = cashSum / (cashSum + noCashSum + qrSum)
+ *       receivedCash = round(matchedTotal × cashShare)
+ *       receivedCard = matchedTotal - receivedCash  (остаток, чтобы суммы
+ *                                                   совпадали тийин-в-тийин)
+ *   - Все три = 0 (странный случай) → fallback на нал
+ *
+ * Сумму берём именно из подбора (после наценки+НДС+округления), а не
+ * `rd.sum` — иначе сумма items не равна сумме оплат и Communicator/ОФД
+ * могут отвергнуть чек как несбалансированный.
+ *
+ * Пример (смешанная):
+ *   МС: cashSum=10000, noCashSum=5000 (15000 = 10к нал + 5к карта)
+ *   matchedTotal=1800000 (18к сум продажной цены)
+ *   cashShare = 10000/15000 = 0.667
+ *   receivedCash = round(1800000 × 0.667) = 1200600
+ *   receivedCard = 1800000 - 1200600 = 599400
+ */
+function determinePaymentFromMs(
+  rd: import('@/lib/moysklad/types').MsRetailDemand,
+  matchedTotal: number,
+): { receivedCash: number; receivedCard: number } {
+  const cash = rd.cashSum ?? 0
+  const card = (rd.noCashSum ?? 0) + (rd.qrSum ?? 0)
+  const total = cash + card
+
+  // Все нули — fallback на нал.
+  if (total <= 0) {
+    return { receivedCash: matchedTotal, receivedCard: 0 }
+  }
+  // Только нал.
+  if (card === 0) {
+    return { receivedCash: matchedTotal, receivedCard: 0 }
+  }
+  // Только безнал (карта/QR).
+  if (cash === 0) {
+    return { receivedCash: 0, receivedCard: matchedTotal }
+  }
+  // Смешанная — пропорционально, остаток уходит в карту чтобы copecks
+  // не потерялись при округлении.
+  const receivedCash = Math.round((matchedTotal * cash) / total)
+  const receivedCard = matchedTotal - receivedCash
+  return { receivedCash, receivedCard }
+}
+
+/**
  * Формат DateTime в стиле YYYYMMDDHHMMSS — как у реальных фискальных ответов.
  * Используется только в тестовом режиме, чтобы UI History корректно
  * парсил «фейковый» чек (если он туда попадёт).
@@ -251,20 +312,28 @@ async function buildReceiptData(
   const company = await readCompanySettings()
   const cashier = (await getSetting(SettingKey.MoyskladEmployeeName)) ?? ''
 
-  // Все позиции — после подмены, по продажным ценам.
+  // Все позиции — после подмены, по продажным ценам, со скидкой если есть.
+  // На ленте: Price = до скидки, Discount = размер скидки (показывается
+  // отдельной строкой на принтере если > 0).
   const items = build.positions.flatMap((pm) =>
     pm.candidates.map((c) => ({
       name: c.esfItem.name,
       class_code: c.esfItem.class_code,
       qty_str: formatQtyForPrint(c.quantity),
       price_str: formatTiyinForPrint(c.priceTiyin),
+      // Пустая строка если скидки нет — Rust пропустит строку «Skidka».
+      discount_str:
+        c.discountTiyin > 0 ? formatTiyinForPrint(c.discountTiyin) : '',
       vat_str: formatTiyinForPrint(c.vatTiyin),
       vat_percent: c.esfItem.vat_percent,
     })),
   )
 
+  // Итог = сумма (price - discount) по всем кандидатам — то что покупатель
+  // реально платит и что должно совпасть с receivedCash + receivedCard.
   const totalTiyin = build.positions.reduce(
-    (s, pm) => s + pm.candidates.reduce((cs, c) => cs + c.priceTiyin, 0),
+    (s, pm) =>
+      s + pm.candidates.reduce((cs, c) => cs + c.priceTiyin - c.discountTiyin, 0),
     0,
   )
   const totalVatTiyin = build.positions.reduce(
@@ -307,15 +376,14 @@ async function fiscalizeJsonRpc(
 ): Promise<{ fiscal: FiscalReceiptInfo; requestJson: string }> {
   const items = build.positions.flatMap((pm) =>
     pm.candidates.map((c) => ({
-      Price: c.priceTiyin,
-      Discount: 0,
+      Price: c.priceTiyin,           // продажная сумма ДО скидки за всё quantity
+      Discount: c.discountTiyin,     // размер скидки в тийинах (0 если без скидки)
       Barcode: c.esfItem.barcode ?? '0',
       Amount: c.quantity,
-      VAT: vatIncluded(c.priceTiyin, c.esfItem.vat_percent),
+      // VAT уже пересчитан в matcher с учётом скидки = (price-discount) × % / (100+%)
+      VAT: c.vatTiyin,
       Name: c.esfItem.name,
       Other: 0,
-      // Опциональные поля. Если сервер не знает — игнорирует;
-      // если знает (актуальная версия Communicator) — использует.
       ClassCode: c.esfItem.class_code,
       PackageCode: c.esfItem.package_code,
       VATPercent: c.esfItem.vat_percent,
@@ -401,12 +469,12 @@ async function fiscalizeLegacy(
 
   const items: CommunicatorItem[] = build.positions.flatMap((pm) =>
     pm.candidates.map((c) => ({
-      price: c.priceTiyin,
-      discount: 0,
+      price: c.priceTiyin,           // до скидки
+      discount: c.discountTiyin,     // размер скидки
       barcode: c.esfItem.barcode ?? '0',
       amount: c.quantity,
       vatPercent: c.esfItem.vat_percent,
-      vat: vatIncluded(c.priceTiyin, c.esfItem.vat_percent),
+      vat: c.vatTiyin,               // уже пересчитан от (price - discount)
       name: c.esfItem.name,
       classCode: c.esfItem.class_code,
       packageCode: c.esfItem.package_code,
@@ -490,11 +558,14 @@ async function persistMatch(
     })
   }
 
+  // В match_items сохраняем сумму К ОПЛАТЕ (price - discount) — то что
+  // покупатель реально заплатил по этой позиции. discount как отдельное
+  // поле в схеме БД сейчас нет, но это фиксируется в request_json.
   const matchItems = build.positions.flatMap((pm) =>
     pm.candidates.map((c) => ({
       esf_item_id: c.esfItem.id,
       quantity: c.quantity,
-      price_tiyin: c.priceTiyin,
+      price_tiyin: c.priceTiyin - c.discountTiyin,
       vat_tiyin: c.vatTiyin,
     })),
   )

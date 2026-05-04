@@ -199,6 +199,7 @@ function buildReceiptDataFromHistory(
   // Парсим request_json с двумя возможными форматами.
   type RpcItem = {
     Price?: number
+    Discount?: number
     VAT?: number
     Name?: string
     ClassCode?: string
@@ -207,6 +208,7 @@ function buildReceiptDataFromHistory(
   }
   type LegacyItem = {
     price?: number
+    discount?: number
     vat?: number
     name?: string
     classCode?: string
@@ -232,6 +234,8 @@ function buildReceiptDataFromHistory(
         class_code: it.ClassCode ?? '',
         qty_str: formatQtyForPrint(it.Amount ?? 1000),
         price_str: formatTiyinForPrint(it.Price ?? 0),
+        discount_str:
+          (it.Discount ?? 0) > 0 ? formatTiyinForPrint(it.Discount ?? 0) : '',
         vat_str: formatTiyinForPrint(it.VAT ?? 0),
         vat_percent: it.VATPercent ?? 12,
       }))
@@ -252,6 +256,10 @@ function buildReceiptDataFromHistory(
           class_code: it.classCode ?? '',
           qty_str: formatQtyForPrint(it.amount ?? 1000),
           price_str: formatTiyinForPrint(it.price ?? 0),
+          discount_str:
+            (it.discount ?? 0) > 0
+              ? formatTiyinForPrint(it.discount ?? 0)
+              : '',
           vat_str: formatTiyinForPrint(it.vat ?? 0),
           vat_percent: it.vatPercent ?? 12,
         }))

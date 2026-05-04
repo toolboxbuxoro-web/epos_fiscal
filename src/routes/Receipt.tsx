@@ -55,6 +55,32 @@ export default function Receipt() {
     return new Set(match.positions.map((pm) => pm.source.index))
   }, [match])
 
+  /**
+   * Тип оплаты из МойСклад. Бейдж показывает кассиру что МС прислал ДО
+   * нажатия «Фискализировать». Логика выбора:
+   *   - все три (cash/noCash/qr) > 0 — таких в природе не бывает, но если
+   *     случайно: считаем смешанной
+   *   - cash > 0 И (noCash > 0 ИЛИ qr > 0) → mixed
+   *   - только qr → 'qr'
+   *   - только noCash → 'card'
+   *   - только cash → 'cash'
+   *   - все нули → null (странный чек, fiscalize fallback на нал)
+   */
+  const paymentKind = useMemo<
+    null | 'cash' | 'card' | 'qr' | 'mixed'
+  >(() => {
+    if (!rd) return null
+    const cash = rd.cashSum ?? 0
+    const card = rd.noCashSum ?? 0
+    const qr = rd.qrSum ?? 0
+    const hasCard = card > 0 || qr > 0
+    if (cash > 0 && hasCard) return 'mixed'
+    if (qr > 0) return 'qr'
+    if (card > 0) return 'card'
+    if (cash > 0) return 'cash'
+    return null
+  }, [rd])
+
   useEffect(() => {
     void load()
   }, [id])
@@ -129,10 +155,27 @@ export default function Receipt() {
           ? Number.parseInt(roundStr, 10) || 0
           : 1000
 
+      // Опции скидки для точной суммы — distributeDiscount применит после
+      // основного цикла стратегий, чтобы Jami совпал с rd.sum.
+      // ВАЖНО: дефолт = true (включено) если в БД ничего не сохранено.
+      // Если по getSetting вернётся null (новая Win-машина или новый параметр) —
+      // считаем включённым, иначе скидка не работала бы пока кассир не зашёл
+      // в Settings и не нажал «Сохранить».
+      const discRaw = await getSetting(SettingKey.DiscountForExactSum)
+      const discountEnabled = discRaw == null ? true : discRaw === 'true'
+      const maxDiscStr = await getSetting(SettingKey.MaxDiscountPerItemSum)
+      const maxDiscountSum =
+        maxDiscStr != null && maxDiscStr !== ''
+          ? Number.parseInt(maxDiscStr, 10) || 0
+          : 2000
+      const maxDiscountPerItemTiyin = maxDiscountSum * 100
+
       const result = await buildMatch(parsed, {
         toleranceTiyin: tolerance,
         markupPercent,
         roundUpToSum,
+        discountForExactSum: discountEnabled,
+        maxDiscountPerItemTiyin,
       })
       setMatch(result)
 
@@ -199,9 +242,19 @@ export default function Receipt() {
     <div className="space-y-4">
       <div className="flex items-end justify-between">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">
-            Сборка чека {receipt.ms_name ?? `#${receipt.id}`}
-          </h1>
+          <div className="flex items-center gap-3">
+            <h1 className="text-2xl font-semibold tracking-tight">
+              Сборка чека {receipt.ms_name ?? `#${receipt.id}`}
+            </h1>
+            {paymentKind && (
+              <PaymentBadge
+                kind={paymentKind}
+                cashSum={rd.cashSum ?? 0}
+                cardSum={rd.noCashSum ?? 0}
+                qrSum={rd.qrSum ?? 0}
+              />
+            )}
+          </div>
           <p className="mt-1 text-sm text-slate-500">
             {formatDateTime(receipt.ms_moment)} · оригинал из МойСклад
           </p>
@@ -262,7 +315,11 @@ export default function Receipt() {
               pm.candidates.map((c) => ({
                 name: c.esfItem.name,
                 quantity: c.quantity,
-                total: c.priceTiyin,
+                // К оплате — с учётом скидки (Selling - Discount).
+                total: c.priceTiyin - c.discountTiyin,
+                // Если скидка > 0, передаём её в таблицу для отдельной строки.
+                discount: c.discountTiyin > 0 ? c.discountTiyin : undefined,
+                originalPrice: c.discountTiyin > 0 ? c.priceTiyin : undefined,
                 vatPercent: c.esfItem.vat_percent,
                 meta: c.esfItem.class_code,
                 matched: true,
@@ -300,7 +357,12 @@ function strategyLabel(s: string): string {
 interface DisplayPosition {
   name: string
   quantity: number
+  /** Итоговая сумма за позицию (К ОПЛАТЕ, после скидки если была). */
   total: number
+  /** Размер скидки в тийинах, если была применена. undefined если нет. */
+  discount?: number
+  /** Цена ДО скидки, чтобы показать «было/стало». undefined если скидки нет. */
+  originalPrice?: number
   vatPercent: number
   meta: string
   /**
@@ -365,7 +427,21 @@ function PositionsTable({ positions }: { positions: DisplayPosition[] }) {
               {milliQtyToDisplay(p.quantity)}
             </td>
             <td className="px-3 py-2 text-right tabular-nums">
-              {tiyinToSumDisplayPrecise(p.total)}
+              {p.discount && p.originalPrice ? (
+                <div className="space-y-0.5">
+                  <div className="text-xs text-slate-400 line-through">
+                    {tiyinToSumDisplayPrecise(p.originalPrice)}
+                  </div>
+                  <div className="text-xs text-rose-600">
+                    −{tiyinToSumDisplayPrecise(p.discount)} скидка
+                  </div>
+                  <div className="font-medium">
+                    {tiyinToSumDisplayPrecise(p.total)}
+                  </div>
+                </div>
+              ) : (
+                tiyinToSumDisplayPrecise(p.total)
+              )}
             </td>
           </tr>
         ))}
@@ -405,5 +481,70 @@ function Side({ title, sumTiyin, sumDiff, children }: SideProps) {
       </header>
       {children}
     </section>
+  )
+}
+
+/**
+ * Бейдж типа оплаты — показывается рядом с заголовком чека.
+ *
+ * Показывает кассиру что МС прислал ДО клика «Фискализировать» вместе
+ * с конкретными суммами в каждом канале оплаты. Для смешанной видны
+ * все три суммы (нал/карта/QR), кассир сразу видит сколько чем заплатили
+ * и в каких пропорциях это уйдёт в ReceivedCash/ReceivedCard.
+ */
+function PaymentBadge({
+  kind,
+  cashSum,
+  cardSum,
+  qrSum,
+}: {
+  kind: 'cash' | 'card' | 'qr' | 'mixed'
+  cashSum: number
+  cardSum: number
+  qrSum: number
+}) {
+  const styles = {
+    cash: {
+      icon: '💵',
+      cls: 'bg-emerald-100 text-emerald-800 border-emerald-300',
+    },
+    card: {
+      icon: '💳',
+      cls: 'bg-blue-100 text-blue-800 border-blue-300',
+    },
+    qr: {
+      icon: '📱',
+      cls: 'bg-violet-100 text-violet-800 border-violet-300',
+    },
+    mixed: {
+      icon: '🔀',
+      cls: 'bg-orange-100 text-orange-800 border-orange-300',
+    },
+  }[kind]
+
+  // Собираем строку «Нал X + Карта Y + QR Z» для смешанной;
+  // для одиночных — только сумму этого канала.
+  const parts: string[] = []
+  if (kind === 'mixed') {
+    if (cashSum > 0) parts.push(`нал ${tiyinToSumDisplay(cashSum)}`)
+    if (cardSum > 0) parts.push(`карта ${tiyinToSumDisplay(cardSum)}`)
+    if (qrSum > 0) parts.push(`QR ${tiyinToSumDisplay(qrSum)}`)
+  } else if (kind === 'cash') {
+    parts.push(`Наличные ${tiyinToSumDisplay(cashSum)} сум`)
+  } else if (kind === 'card') {
+    parts.push(`Карта ${tiyinToSumDisplay(cardSum)} сум`)
+  } else if (kind === 'qr') {
+    parts.push(`QR ${tiyinToSumDisplay(qrSum)} сум`)
+  }
+  const label = parts.join(' + ') + (kind === 'mixed' ? ' сум' : '')
+
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-0.5 text-xs font-medium ${styles.cls}`}
+      title="Тип оплаты из МойСклад"
+    >
+      <span>{styles.icon}</span>
+      <span className="tabular-nums">{label}</span>
+    </span>
   )
 }

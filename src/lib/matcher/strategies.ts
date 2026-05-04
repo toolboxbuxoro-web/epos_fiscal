@@ -30,8 +30,6 @@ export function vatAddedOn(netTiyin: Tiyin, vatPercent: number): Tiyin {
  *
  * Пример: приход 595 928 тийинов (5 959.28 сум), наценка 10%, НДС 12%, шаг 1000:
  *   5959.28 × 1.10 × 1.12 = 7 341.63 сум  →  округление вверх до 1000  →  8000 сум
- *
- * Все вычисления в тийинах, чтобы не потерять копейки на промежутках.
  */
 export function calculateSellingPrice(
   unitPriceTiyin: Tiyin,
@@ -42,24 +40,60 @@ export function calculateSellingPrice(
   if (unitPriceTiyin <= 0) return 0
   const withMarkup = (unitPriceTiyin * (100 + markupPercent)) / 100
   const withVat = (withMarkup * (100 + Math.max(0, vatPercent))) / 100
-  const stepTiyin = Math.max(1, roundUpToSum) * 100 // шаг в тийинах
+  const stepTiyin = Math.max(1, roundUpToSum) * 100
   return Math.ceil(withVat / stepTiyin) * stepTiyin
 }
 
-/** Общие дефолты ценообразования (синхронны с SettingKey defaults). */
+/** Общие дефолты ценообразования. */
 const DEFAULT_MARKUP = 10
 const DEFAULT_ROUND_UP_SUM = 1000
 
-function effectivePrice(
-  item: EsfItemWithAvailable,
-  opts: MatcherOptions,
-): Tiyin {
-  return calculateSellingPrice(
-    item.unit_price_tiyin,
-    item.vat_percent,
-    opts.markupPercent ?? DEFAULT_MARKUP,
-    opts.roundUpToSum ?? DEFAULT_ROUND_UP_SUM,
-  )
+/**
+ * Пул товаров с предрасчитанными продажными ценами.
+ *
+ * Загружается ОДИН РАЗ на чек в buildMatch и передаётся во все стратегии.
+ * Раньше каждая стратегия для каждой позиции делала свой listEsfItems
+ * с лимитом 5000 — на чеке из 5 позиций это 50000 строк через TS↔SQLite
+ * мост, что давало заметные лаги UI.
+ */
+export interface MatcherPool {
+  /** Все доступные товары (qty_received - qty_consumed >= 1000) с кэшем sellingPrice. */
+  items: PoolItem[]
+  /** Минимальная цена в пуле — для подсказок «нечем набрать по multi-item». */
+  minSellingPrice: Tiyin
+}
+
+export interface PoolItem {
+  item: EsfItemWithAvailable
+  sellingPrice: Tiyin
+}
+
+/**
+ * Загрузить пул и предрасчитать продажные цены. Один запрос в БД,
+ * один проход для расчёта sellingPrice. Результат переиспользуется
+ * во всех трёх стратегиях для всех позиций чека.
+ */
+export async function loadMatcherPool(opts: MatcherOptions = {}): Promise<MatcherPool> {
+  const raw = await listEsfItems({ minAvailable: 1000, limit: 5000 })
+  const markup = opts.markupPercent ?? DEFAULT_MARKUP
+  const roundUp = opts.roundUpToSum ?? DEFAULT_ROUND_UP_SUM
+  let minSellingPrice = Number.POSITIVE_INFINITY
+  const items: PoolItem[] = raw.map((item) => {
+    const sellingPrice = calculateSellingPrice(
+      item.unit_price_tiyin,
+      item.vat_percent,
+      markup,
+      roundUp,
+    )
+    if (sellingPrice > 0 && sellingPrice < minSellingPrice) {
+      minSellingPrice = sellingPrice
+    }
+    return { item, sellingPrice }
+  })
+  return {
+    items,
+    minSellingPrice: Number.isFinite(minSellingPrice) ? minSellingPrice : 0,
+  }
 }
 
 /**
@@ -69,30 +103,35 @@ function effectivePrice(
  * с достаточными остатками — фискализируем «как есть» через найденный esf_item.
  * Цена в фискальном чеке — продажная (с наценкой и НДС).
  */
-export async function tryPassthrough(
+export function tryPassthrough(
   pos: NormalizedPosition,
+  pool: MatcherPool,
   opts: MatcherOptions = {},
-): Promise<PositionMatch | null> {
+): PositionMatch | null {
+  // Нулевая позиция (бесплатный товар по акции / бонусами) — не подбираем.
+  // Иначе для pos.totalTiyin=0 matcher может подобрать дешёвые товары через
+  // tolerance — это неправильно, нулевая позиция не должна занимать место в чеке.
+  if (pos.totalTiyin <= 0) return null
   if (!pos.classCode) return null
 
-  const candidates = await listEsfItems({
-    classCode: pos.classCode,
-    minAvailable: pos.quantity,
-    vatPercent: opts.vatStrict === true ? pos.vatPercent : undefined,
-    limit: 50,
-  })
+  const strictVat = opts.vatStrict === true
+  const candidates = pool.items.filter(
+    (p) =>
+      p.item.class_code === pos.classCode &&
+      p.item.qty_received - p.item.qty_consumed >= pos.quantity &&
+      (!strictVat || p.item.vat_percent === pos.vatPercent),
+  )
 
   if (candidates.length === 0) return null
 
-  // Берём самый старый приход (FIFO).
-  const sorted = [...candidates].sort((a, b) => a.received_at - b.received_at)
-  const chosen = sorted[0]
+  // FIFO — самый старый приход.
+  const chosen = [...candidates].sort(
+    (a, b) => a.item.received_at - b.item.received_at,
+  )[0]
   if (!chosen) return null
 
-  // Продажная цена за 1 шт × количество = totalSelling.
-  const unitSelling = effectivePrice(chosen, opts)
-  const totalSelling = unitSelling * (pos.quantity / 1000)
-  const candidate = makeCandidate(chosen, pos.quantity, totalSelling)
+  const totalSelling = chosen.sellingPrice * (pos.quantity / 1000)
+  const candidate = makeCandidate(chosen.item, pos.quantity, totalSelling)
 
   return {
     source: pos,
@@ -106,44 +145,50 @@ export async function tryPassthrough(
 /**
  * Стратегия 2: price-bucket.
  *
- * Найти один товар, у которого ПРОДАЖНАЯ цена (с наценкой+НДС, округлённая)
- * близка к сумме позиции из чека МойСклад. Берём 1 шт.
+ * Найти один товар, у которого РАСЧЁТНАЯ продажная цена близка к сумме
+ * позиции из чека МойСклад (в пределах `toleranceTiyin`). Берём 1 шт.
+ *
+ * **Записываем в чек `pos.totalTiyin`, а не `best.sellingPrice`** — потому что
+ * покупатель реально заплатил за эту позицию `pos.totalTiyin`, и фискальный
+ * чек должен отразить именно эту сумму. Расчётная цена `sellingPrice`
+ * (вычисленная из приходной с наценкой и НДС) использовалась ТОЛЬКО для
+ * проверки «адекватности» замены. Если `pos.totalTiyin` чуть выше
+ * `sellingPrice` — это просто означает чуть бо́льшую наценку на эту продажу
+ * (что нормально и допустимо).
+ *
+ * Это убирает систематический микро-минус по сумме чека, когда замена
+ * нашлась с ценой на 500–1000 сум ниже позиции.
  */
-export async function tryPriceBucket(
+export function tryPriceBucket(
   pos: NormalizedPosition,
+  pool: MatcherPool,
   opts: MatcherOptions = {},
-): Promise<PositionMatch | null> {
+): PositionMatch | null {
+  // Нулевая позиция — не подбираем, см. tryPassthrough.
+  if (pos.totalTiyin <= 0) return null
   const tolerance = opts.toleranceTiyin ?? 0
+  const strictVat = opts.vatStrict === true
 
-  const all = await listEsfItems({
-    minAvailable: 1000,
-    vatPercent: opts.vatStrict === true ? pos.vatPercent : undefined,
-    limit: 5000,
-  })
-
-  // Считаем продажную цену для каждого, фильтруем по tolerance, ранжируем.
-  const ranked = all
-    .map((item) => {
-      const sellingPrice = effectivePrice(item, opts)
-      return {
-        item,
-        sellingPrice,
-        diff: Math.abs(sellingPrice - pos.totalTiyin),
-      }
-    })
-    .filter((r) => r.diff <= tolerance)
-    .sort((a, b) => a.diff - b.diff)
-
-  const best = ranked[0]
+  let best: { item: EsfItemWithAvailable; sellingPrice: Tiyin; diff: number } | null = null
+  for (const p of pool.items) {
+    if (strictVat && p.item.vat_percent !== pos.vatPercent) continue
+    const diff = Math.abs(p.sellingPrice - pos.totalTiyin)
+    if (diff > tolerance) continue
+    if (!best || diff < best.diff) {
+      best = { item: p.item, sellingPrice: p.sellingPrice, diff }
+    }
+  }
   if (!best) return null
 
-  const candidate = makeCandidate(best.item, 1000, best.sellingPrice)
+  // Цена в чеке = pos.totalTiyin (что покупатель заплатил).
+  // best.sellingPrice (расчётная) использовалась только для матчинга.
+  const candidate = makeCandidate(best.item, 1000, pos.totalTiyin)
 
   return {
     source: pos,
     candidates: [candidate],
     strategy: 'price-bucket',
-    diffTiyin: best.sellingPrice - pos.totalTiyin,
+    diffTiyin: 0,
     warnings: pos.classCode
       ? [`ИКПУ заменён: ${pos.classCode} → ${best.item.class_code}`]
       : [`Без ИКПУ в исходной позиции, заменён на ${best.item.class_code}`],
@@ -156,34 +201,29 @@ export async function tryPriceBucket(
  * Набираем несколько товаров суммарно на нужную сумму (с допуском).
  * Жадный алгоритм по убыванию ПРОДАЖНОЙ цены.
  */
-export async function tryMultiItem(
+export function tryMultiItem(
   pos: NormalizedPosition,
+  pool: MatcherPool,
   opts: MatcherOptions = {},
-): Promise<PositionMatch | null> {
+): PositionMatch | null {
+  // Нулевая позиция — не подбираем, см. tryPassthrough.
+  if (pos.totalTiyin <= 0) return null
   const tolerance = opts.toleranceTiyin ?? 0
   const maxItems = opts.maxMultiItem ?? 5
+  const strictVat = opts.vatStrict === true
 
-  const pool = await listEsfItems({
-    minAvailable: 1000,
-    vatPercent: opts.vatStrict === true ? pos.vatPercent : undefined,
-    limit: 5000,
-  })
+  const filtered = strictVat
+    ? pool.items.filter((p) => p.item.vat_percent === pos.vatPercent)
+    : pool.items
+  if (filtered.length === 0) return null
 
-  if (pool.length === 0) return null
-
-  // Подмешиваем расчётную продажную цену сразу, чтобы дальше не пересчитывать.
-  const enriched = pool.map((item) => ({
-    item,
-    sellingPrice: effectivePrice(item, opts),
-  }))
-
-  // Сортируем по убыванию ПРОДАЖНОЙ цены.
-  enriched.sort((a, b) => b.sellingPrice - a.sellingPrice)
+  // Сортируем по убыванию ПРОДАЖНОЙ цены (без копирования если можно).
+  const sorted = [...filtered].sort((a, b) => b.sellingPrice - a.sellingPrice)
 
   const picks: { item: EsfItemWithAvailable; quantity: number; sellingPrice: Tiyin }[] = []
   let remaining = pos.totalTiyin
 
-  for (const { item, sellingPrice } of enriched) {
+  for (const { item, sellingPrice } of sorted) {
     if (picks.length >= maxItems) break
     if (remaining <= 0) break
     if (sellingPrice <= 0) continue
@@ -201,12 +241,10 @@ export async function tryMultiItem(
   if (picks.length === 0) return null
   if (Math.abs(remaining) > tolerance) return null
 
-  const candidates: MatchCandidate[] = picks.map(
-    ({ item, quantity, sellingPrice }) => {
-      const totalSelling = sellingPrice * quantity
-      return makeCandidate(item, quantity * 1000, totalSelling)
-    },
-  )
+  const candidates: MatchCandidate[] = picks.map(({ item, quantity, sellingPrice }) => {
+    const totalSelling = sellingPrice * quantity
+    return makeCandidate(item, quantity * 1000, totalSelling)
+  })
 
   const matchedSum = candidates.reduce((s, c) => s + c.priceTiyin, 0)
   const diffTiyin = matchedSum - pos.totalTiyin
@@ -223,11 +261,11 @@ export async function tryMultiItem(
 /**
  * Собрать MatchCandidate.
  *
- * `priceTiyin` — это ПРОДАЖНАЯ сумма (с наценкой+НДС, округлённая) за весь
- * объём позиции. Именно она пойдёт в фискальный чек EPOS как `Price`.
- *
- * `vatTiyin` рассчитывается как НДС, включённый в продажную цену (вычленяется
- * из общей суммы по ставке) — это формат ОФД ГНК для UZ.
+ * `priceTiyin` — продажная сумма за всё quantity (без скидки).
+ * `discountTiyin = 0` по умолчанию — скидка распределяется потом
+ * в distributeDiscount() если включено.
+ * `vatTiyin` — НДС, рассчитанный от priceTiyin (т.е. без учёта скидки;
+ * после распределения скидок vatTiyin будет пересчитан).
  */
 function makeCandidate(
   item: EsfItemWithAvailable,
@@ -239,6 +277,25 @@ function makeCandidate(
     esfItem: item,
     quantity,
     priceTiyin: sellingTotalTiyin,
+    discountTiyin: 0,
     vatTiyin: vat,
   }
+}
+
+/**
+ * Себестоимость с НДС для всей позиции (за `quantity` единиц).
+ * Это пол скидки: `discount` не может опустить (price - discount) ниже этой
+ * суммы — иначе продажа в убыток. НДС применяется ПРАВИЛЬНО (последовательно,
+ * не суммой 22%): unit_price × (1 + vat/100).
+ *
+ * Используется в distributeDiscount.
+ */
+export function costWithVat(
+  unitPriceTiyin: Tiyin,
+  vatPercent: number,
+  quantityMilli: number,
+): Tiyin {
+  if (unitPriceTiyin <= 0) return 0
+  const unitWithVat = (unitPriceTiyin * (100 + Math.max(0, vatPercent))) / 100
+  return Math.round((unitWithVat * quantityMilli) / 1000)
 }

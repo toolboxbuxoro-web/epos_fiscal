@@ -50,6 +50,9 @@ interface FormState {
   // Ценообразование (применяется к товарам из справочника при подборе)
   markupPercent: string
   roundUpToSum: string
+  // Скидка для точной суммы (распределяется чтобы Jami = чек МС)
+  discountForExactSum: 'true' | 'false'
+  maxDiscountPerItemSum: string
   // Тестовый режим — фискализация без реальной отправки в Communicator
   testMode: 'true' | 'false'
 }
@@ -77,6 +80,8 @@ const empty: FormState = {
   replacementEnabled: 'true',
   markupPercent: '10',
   roundUpToSum: '1000',
+  discountForExactSum: 'true',
+  maxDiscountPerItemSum: '2000',
   testMode: 'false',
 }
 
@@ -159,6 +164,11 @@ export default function Settings() {
       matchToleranceTiyin: all[SettingKey.MatchToleranceTiyin] ?? '100000',
       markupPercent: all[SettingKey.MarkupPercent] ?? '10',
       roundUpToSum: all[SettingKey.RoundUpToSum] ?? '1000',
+      discountForExactSum: (all[SettingKey.DiscountForExactSum] ?? 'true') as
+        | 'true'
+        | 'false',
+      maxDiscountPerItemSum:
+        all[SettingKey.MaxDiscountPerItemSum] ?? '2000',
       testMode: (all[SettingKey.TestMode] ?? 'false') as 'true' | 'false',
       autoFiscalize: (all[SettingKey.AutoFiscalize] ?? 'false') as 'true' | 'false',
       replacementEnabled: (all[SettingKey.ReplacementEnabled] ?? 'true') as 'true' | 'false',
@@ -287,6 +297,8 @@ export default function Settings() {
         [SettingKey.MatchToleranceTiyin]: form.matchToleranceTiyin,
         [SettingKey.MarkupPercent]: form.markupPercent,
         [SettingKey.RoundUpToSum]: form.roundUpToSum,
+        [SettingKey.DiscountForExactSum]: form.discountForExactSum,
+        [SettingKey.MaxDiscountPerItemSum]: form.maxDiscountPerItemSum,
         [SettingKey.TestMode]: form.testMode,
         [SettingKey.AutoFiscalize]: form.autoFiscalize,
         [SettingKey.ReplacementEnabled]: form.replacementEnabled,
@@ -720,6 +732,47 @@ export default function Settings() {
           Пример: приход 5 959 сум, наценка 10%, НДС 12%, шаг 1000 →{' '}
           5 959 × 1.10 × 1.12 = 7 341.63 → <strong>8 000 сум</strong>.
         </div>
+
+        <Field label="Скидка для точной суммы">
+          <Select
+            value={form.discountForExactSum}
+            onChange={(e) =>
+              setField(
+                'discountForExactSum',
+                e.target.value as 'true' | 'false',
+              )
+            }
+          >
+            <option value="true">
+              Включена — итог совпадёт с чеком МойСклад
+            </option>
+            <option value="false">
+              Выключена — итог может быть выше чека МС
+            </option>
+          </Select>
+          <div className="mt-1 text-xs text-slate-500">
+            Из-за округления вверх продажная цена систематически выше
+            оригинальной. Если включить — программа применит скидку на
+            позиции чтобы итог совпал 1-в-1. Скидка не опускает цену
+            ниже себестоимости с НДС (приход × 1.12).
+          </div>
+        </Field>
+
+        <Field label="Максимум скидки на позицию, сум">
+          <Input
+            type="number"
+            min={0}
+            value={form.maxDiscountPerItemSum}
+            onChange={(e) =>
+              setField('maxDiscountPerItemSum', e.target.value)
+            }
+            disabled={form.discountForExactSum === 'false'}
+          />
+          <div className="mt-1 text-xs text-slate-500">
+            Сколько максимум разрешено скинуть на одну позицию (даже если
+            себестоимость позволяет больше). По умолчанию <strong>2000</strong>.
+          </div>
+        </Field>
       </Section>
 
       <Section title="Печать чека">

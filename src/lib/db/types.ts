@@ -77,6 +77,16 @@ export const SettingKey = {
    */
   RoundUpToSum: 'pricing.round_up_to_sum',
   /**
+   * Включить ли распределение скидок чтобы итоговая сумма подбора совпала
+   * 1-в-1 с суммой чека МойСклад. 'true' / 'false'. По умолчанию 'true'.
+   */
+  DiscountForExactSum: 'pricing.discount_for_exact_sum',
+  /**
+   * Максимум скидки на одну позицию, в сумах. По умолчанию 2000.
+   * Дополнительный лимит к ограничению по себестоимости (нельзя ниже).
+   */
+  MaxDiscountPerItemSum: 'pricing.max_discount_per_item_sum',
+  /**
    * Тестовый режим («сухой прогон»). Если 'true' — фискализация работает
    * как обычно по UI (подбор виден, кнопка работает), но запрос в EPOS
    * Communicator НЕ уходит, остатки НЕ списываются, fiscal_receipt НЕ
