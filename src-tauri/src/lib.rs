@@ -17,6 +17,12 @@ pub fn run() {
             sql: include_str!("../migrations/002_logs.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 3,
+            description: "inventory_sync_pending_confirms",
+            sql: include_str!("../migrations/003_inventory_sync.sql"),
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()

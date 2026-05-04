@@ -11,6 +11,12 @@ import { EposClient, JsonRpcEposClient } from '@/lib/epos'
 import { applyUpdate, checkForUpdate } from '@/lib/updater'
 import { log } from '@/lib/log'
 import {
+  getInventorySseStatus,
+  InventoryServerClient,
+  syncFromServer,
+  syncShopConfig,
+} from '@/lib/inventory'
+import {
   listPrinters,
   printTestQr,
   type PrinterInfo,
@@ -55,6 +61,11 @@ interface FormState {
   maxDiscountPerItemSum: string
   // Тестовый режим — фискализация без реальной отправки в Communicator
   testMode: 'true' | 'false'
+  // Inventory Server (общий пул приходов через mytoolbox)
+  invRemoteEnabled: 'true' | 'false'
+  invServerUrl: string
+  invShopSlug: string
+  invShopApiKey: string
 }
 
 const empty: FormState = {
@@ -83,6 +94,10 @@ const empty: FormState = {
   discountForExactSum: 'true',
   maxDiscountPerItemSum: '2000',
   testMode: 'false',
+  invRemoteEnabled: 'false',
+  invServerUrl: '',
+  invShopSlug: '',
+  invShopApiKey: '',
 }
 
 export default function Settings() {
@@ -99,10 +114,22 @@ export default function Settings() {
   const [printers, setPrinters] = useState<PrinterInfo[]>([])
   const [printerLoading, setPrinterLoading] = useState(false)
   const [printerTestMsg, setPrinterTestMsg] = useState<string>('')
+  // Inventory подключение
+  const [invTestMsg, setInvTestMsg] = useState<string>('')
+  const [invConnecting, setInvConnecting] = useState(false)
+  const [invSseStatus, setInvSseStatus] = useState<
+    'connected' | 'disconnected' | 'connecting' | 'idle'
+  >('idle')
 
   useEffect(() => {
     void load()
     void refreshPrinters()
+    // Polling SSE-status — runtime обновляет статус через колбэк onStatusChange,
+    // но для UI проще раз в секунду спросить getter. Дешёво.
+    const t = setInterval(() => {
+      setInvSseStatus(getInventorySseStatus())
+    }, 1000)
+    return () => clearInterval(t)
   }, [])
 
   /** Получить список принтеров через Rust-команду list_printers. */
@@ -172,6 +199,12 @@ export default function Settings() {
       testMode: (all[SettingKey.TestMode] ?? 'false') as 'true' | 'false',
       autoFiscalize: (all[SettingKey.AutoFiscalize] ?? 'false') as 'true' | 'false',
       replacementEnabled: (all[SettingKey.ReplacementEnabled] ?? 'true') as 'true' | 'false',
+      invRemoteEnabled: (all[SettingKey.InventoryRemoteEnabled] ?? 'false') as
+        | 'true'
+        | 'false',
+      invServerUrl: all[SettingKey.InventoryServerUrl] ?? '',
+      invShopSlug: all[SettingKey.InventoryShopSlug] ?? '',
+      invShopApiKey: all[SettingKey.InventoryShopApiKey] ?? '',
     }))
     // если уже есть credentials — подгрузим списки
     const creds = all[SettingKey.MoyskladCredentials]
@@ -302,12 +335,104 @@ export default function Settings() {
         [SettingKey.TestMode]: form.testMode,
         [SettingKey.AutoFiscalize]: form.autoFiscalize,
         [SettingKey.ReplacementEnabled]: form.replacementEnabled,
+        [SettingKey.InventoryRemoteEnabled]: form.invRemoteEnabled,
+        [SettingKey.InventoryServerUrl]: form.invServerUrl.replace(/\/$/, ''),
+        [SettingKey.InventoryShopSlug]: form.invShopSlug.trim(),
+        [SettingKey.InventoryShopApiKey]: form.invShopApiKey.trim(),
       })
       setSaved(true)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(false)
+    }
+  }
+
+  /**
+   * Подключиться к inventory server: ping → если форма заполнена и НЕ
+   * совпадает с уже сохранёнными настройками, сначала их save (потому что
+   * клиент берёт конфиг из настроек, не из form). Затем syncShopConfig
+   * (подтянуть МС-creds от админа) + syncFromServer (подтянуть приходы).
+   */
+  async function connectInventory() {
+    setInvTestMsg('')
+    setInvConnecting(true)
+    try {
+      if (!form.invServerUrl || !form.invShopApiKey) {
+        setInvTestMsg('Заполни URL и API key — без них не подключусь.')
+        setInvConnecting(false)
+        return
+      }
+      // Сначала сохраняем — служебные функции читают из БД, не из form.
+      await setSettings({
+        [SettingKey.InventoryRemoteEnabled]: form.invRemoteEnabled,
+        [SettingKey.InventoryServerUrl]: form.invServerUrl.replace(/\/$/, ''),
+        [SettingKey.InventoryShopSlug]: form.invShopSlug.trim(),
+        [SettingKey.InventoryShopApiKey]: form.invShopApiKey.trim(),
+      })
+
+      // Smoke-check: ping (GET /items?limit=1) — самый дешёвый способ
+      // проверить URL+авторизацию+связь с БД на сервере.
+      const client = new InventoryServerClient({
+        serverUrl: form.invServerUrl.replace(/\/$/, ''),
+        apiKey: form.invShopApiKey.trim(),
+        shopSlug: form.invShopSlug.trim(),
+      })
+      setInvTestMsg('Проверяю связь…')
+      await client.ping()
+
+      // Если remote включён — подтягиваем МС-creds от админа и приходы.
+      if (form.invRemoteEnabled === 'true') {
+        setInvTestMsg('Подтягиваю МС-настройки от админа…')
+        const cfg = await syncShopConfig()
+        if (cfg.applied) {
+          // Перезагружаем форму чтобы юзер увидел подтянутые поля МС.
+          await load()
+        }
+
+        setInvTestMsg('Загружаю приходы из общего пула…')
+        const sync = await syncFromServer({ forceFull: true })
+
+        const cfgPart = cfg.applied
+          ? '+ МС-настройки подтянуты от админа'
+          : `(МС-привязки на сервере нет: ${cfg.reason ?? '?'})`
+        setInvTestMsg(
+          `✓ Подключено. Приходов: ${sync.synced}${
+            sync.errors > 0 ? `, ошибок ${sync.errors}` : ''
+          }. ${cfgPart}`,
+        )
+      } else {
+        setInvTestMsg('✓ Связь есть. Включи "Общий пул" чтобы начать использовать.')
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setInvTestMsg(`✗ Ошибка: ${msg}`)
+    } finally {
+      setInvConnecting(false)
+    }
+  }
+
+  /**
+   * Применить настройки от админа без полного reconnect — только syncShopConfig.
+   * Используется когда remote уже включён и админ обновил МС-привязку
+   * (поменял пароль / точку продаж / кассира).
+   */
+  async function refreshFromAdmin() {
+    setInvTestMsg('Перечитываю настройки от админа…')
+    setInvConnecting(true)
+    try {
+      const res = await syncShopConfig()
+      if (res.applied) {
+        await load()
+        setInvTestMsg('✓ Настройки обновлены от админа.')
+      } else {
+        setInvTestMsg(`Без изменений: ${res.reason ?? 'неизвестно'}`)
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setInvTestMsg(`✗ ${msg}`)
+    } finally {
+      setInvConnecting(false)
     }
   }
 
@@ -508,7 +633,100 @@ export default function Settings() {
         </Field>
       </Section>
 
+      <Section title="Общий пул приходов (Inventory Server)">
+        <div className="col-span-1 md:col-span-2 flex items-center justify-between gap-3 text-xs">
+          <div className="text-slate-600">
+            Если все магазины твоей сети используют общий пул приходов через
+            mytoolbox-сервер — включи здесь и подключись. Тогда:
+            <ul className="mt-1 ml-5 list-disc">
+              <li>Приходы загружает бухгалтер централизованно через админку — не нужно импортить Excel в каждый магазин</li>
+              <li>2 магазина не смогут списать одну штуку — атомарная резервация на сервере</li>
+              <li>МС-логин/пароль/точка продаж тянутся от админа — нечего настраивать вручную</li>
+            </ul>
+            Магазин и его API key создаёт админ в mytoolbox.
+          </div>
+          {form.invRemoteEnabled === 'true' && (
+            <SseStatusBadge status={invSseStatus} />
+          )}
+        </div>
+
+        <Field label="Использовать общий пул">
+          <Select
+            value={form.invRemoteEnabled}
+            onChange={(e) =>
+              setField('invRemoteEnabled', e.target.value as 'true' | 'false')
+            }
+          >
+            <option value="false">Выключено (локальный SQLite каждый магазин сам по себе)</option>
+            <option value="true">Включено (общий пул через сервер)</option>
+          </Select>
+        </Field>
+
+        <Field label="Inventory Server URL">
+          <Input
+            value={form.invServerUrl}
+            onChange={(e) => setField('invServerUrl', e.target.value)}
+            placeholder="https://mytoolbox-backend.up.railway.app"
+          />
+          <div className="mt-1 text-xs text-slate-500">
+            Базовый URL mytoolbox backend. Без хвостового слэша.
+          </div>
+        </Field>
+
+        <Field label="Slug магазина">
+          <Input
+            value={form.invShopSlug}
+            onChange={(e) => setField('invShopSlug', e.target.value)}
+            placeholder="toolbox-honabod"
+          />
+          <div className="mt-1 text-xs text-slate-500">
+            Идентификатор магазина из админки (для логов; auth по API key).
+          </div>
+        </Field>
+
+        <Field label="API key">
+          <Input
+            type="password"
+            value={form.invShopApiKey}
+            onChange={(e) => setField('invShopApiKey', e.target.value)}
+            placeholder="epf_..."
+          />
+          <div className="mt-1 text-xs text-slate-500">
+            Выдаётся админом в mytoolbox при создании магазина (показывается один раз).
+          </div>
+        </Field>
+
+        <div className="col-span-1 md:col-span-2 flex flex-wrap items-center gap-3">
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={connectInventory}
+            disabled={invConnecting}
+          >
+            {invConnecting ? 'Подключаюсь…' : 'Подключиться'}
+          </Button>
+          {form.invRemoteEnabled === 'true' && (
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={refreshFromAdmin}
+              disabled={invConnecting}
+            >
+              Перечитать настройки от админа
+            </Button>
+          )}
+          <span className="text-xs text-slate-700">{invTestMsg}</span>
+        </div>
+      </Section>
+
       <Section title="МойСклад">
+        {form.invRemoteEnabled === 'true' && (
+          <div className="col-span-1 md:col-span-2 rounded-md bg-slate-50 border border-slate-200 p-3 text-xs text-slate-700">
+            🔒 Настройки управляются админом mytoolbox (поля только для чтения).
+            Чтобы изменить — попроси админа обновить привязку магазина к МС-аккаунту,
+            затем нажми <strong>«Перечитать настройки от админа»</strong> в секции выше.
+          </div>
+        )}
         {!isAuthenticated ? (
           <>
             <Field label="Email или логин">
@@ -517,6 +735,7 @@ export default function Settings() {
                 onChange={(e) => setField('moyskladLogin', e.target.value)}
                 placeholder="user@example.com"
                 autoComplete="username"
+                disabled={form.invRemoteEnabled === 'true'}
               />
             </Field>
             <Field label="Пароль">
@@ -526,12 +745,18 @@ export default function Settings() {
                 onChange={(e) => setField('moyskladPassword', e.target.value)}
                 placeholder="••••••••"
                 autoComplete="current-password"
+                disabled={form.invRemoteEnabled === 'true'}
               />
             </Field>
             <div className="col-span-1 md:col-span-2 flex items-center gap-3">
               <Button
                 variant="primary"
-                disabled={authBusy || !form.moyskladLogin || !form.moyskladPassword}
+                disabled={
+                  authBusy ||
+                  !form.moyskladLogin ||
+                  !form.moyskladPassword ||
+                  form.invRemoteEnabled === 'true'
+                }
                 onClick={signIn}
               >
                 {authBusy ? 'Вход…' : 'Войти в МойСклад'}
@@ -548,15 +773,18 @@ export default function Settings() {
                 <span className="text-emerald-700">Залогинен как</span>{' '}
                 <span className="font-medium">{form.moyskladLogin || 'пользователь'}</span>
               </div>
-              <Button variant="ghost" size="sm" onClick={signOut}>
-                Выйти
-              </Button>
+              {form.invRemoteEnabled !== 'true' && (
+                <Button variant="ghost" size="sm" onClick={signOut}>
+                  Выйти
+                </Button>
+              )}
             </div>
 
             <Field label="Точка продаж">
               <Select
                 value={form.moyskladRetailStoreId}
                 onChange={(e) => void pickStore(e.target.value)}
+                disabled={form.invRemoteEnabled === 'true'}
               >
                 <option value="">— выберите —</option>
                 {stores.map((s) => (
@@ -564,12 +792,21 @@ export default function Settings() {
                     {s.name}
                   </option>
                 ))}
+                {/* Если remote — точка может быть установлена админом без подгрузки списка stores. */}
+                {form.invRemoteEnabled === 'true' &&
+                  form.moyskladRetailStoreId &&
+                  !stores.some((s) => s.id === form.moyskladRetailStoreId) && (
+                    <option value={form.moyskladRetailStoreId}>
+                      {form.moyskladRetailStoreName || form.moyskladRetailStoreId}
+                    </option>
+                  )}
               </Select>
             </Field>
             <Field label="Кассир (ФИО для чека)">
               <Select
                 value={form.moyskladEmployeeId}
                 onChange={(e) => void pickEmployee(e.target.value)}
+                disabled={form.invRemoteEnabled === 'true'}
               >
                 <option value="">— выберите —</option>
                 {employees.map((e) => (
@@ -577,6 +814,13 @@ export default function Settings() {
                     {e.shortFio ?? e.fullName ?? e.name}
                   </option>
                 ))}
+                {form.invRemoteEnabled === 'true' &&
+                  form.moyskladEmployeeId &&
+                  !employees.some((e) => e.id === form.moyskladEmployeeId) && (
+                    <option value={form.moyskladEmployeeId}>
+                      {form.moyskladEmployeeName || form.moyskladEmployeeId}
+                    </option>
+                  )}
               </Select>
             </Field>
 
@@ -894,5 +1138,51 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
       <span className="mb-1 block text-xs font-medium text-slate-700">{label}</span>
       {children}
     </label>
+  )
+}
+
+/**
+ * Цветной бейдж со статусом SSE-канала к inventory server.
+ *  🟢 connected   — поток открыт, live-обновления приходят
+ *  🟡 connecting  — handshake, ещё не получили первое событие
+ *  🔴 disconnected— оборвалось, ждём backoff и retry
+ *  ⚪ idle        — runtime ещё не запускался (remote выключен)
+ */
+function SseStatusBadge({
+  status,
+}: {
+  status: 'connected' | 'disconnected' | 'connecting' | 'idle'
+}) {
+  const map: Record<typeof status, { dot: string; label: string; cls: string }> = {
+    connected: {
+      dot: '🟢',
+      label: 'Live',
+      cls: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+    },
+    connecting: {
+      dot: '🟡',
+      label: 'Подключаюсь…',
+      cls: 'bg-amber-50 text-amber-700 border-amber-200',
+    },
+    disconnected: {
+      dot: '🔴',
+      label: 'Нет связи',
+      cls: 'bg-red-50 text-red-700 border-red-200',
+    },
+    idle: {
+      dot: '⚪',
+      label: 'Не запущен',
+      cls: 'bg-slate-50 text-slate-500 border-slate-200',
+    },
+  }
+  const m = map[status]
+  return (
+    <span
+      className={`inline-flex shrink-0 items-center gap-1 rounded-md border px-2 py-0.5 text-[11px] font-medium ${m.cls}`}
+      title={`SSE канал: ${m.label}`}
+    >
+      <span>{m.dot}</span>
+      <span>{m.label}</span>
+    </span>
   )
 }

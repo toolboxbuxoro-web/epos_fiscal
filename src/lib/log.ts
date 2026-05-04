@@ -11,6 +11,10 @@ export type LogSource =
   | 'updater'
   | 'ui'
   | 'esf-import'
+  | 'inventory.sync'
+  | 'inventory.sse'
+  | 'inventory.retry'
+  | 'inventory.housekeeping'
 
 export interface LogRow {
   id: number

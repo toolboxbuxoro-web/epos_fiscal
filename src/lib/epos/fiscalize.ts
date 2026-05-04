@@ -10,6 +10,14 @@ import {
 import { log } from '@/lib/log'
 import type { BuildMatchResult } from '@/lib/matcher/types'
 import {
+  deletePendingByReservations,
+  getInventoryClient,
+  loadInventoryConfig,
+  markFiscalOk,
+  recordReserved,
+  type ReservationInfo,
+} from '@/lib/inventory'
+import {
   formatPrintDate,
   formatQtyForPrint,
   formatTiyinForPrint,
@@ -118,10 +126,18 @@ export async function fiscalize(
   // 1-2. Сохранить ms_receipt и match.
   const { msReceiptId, matchDbId } = await persistMatch(build, opts)
 
+  // ── Multi-shop: атомарная резервация на сервере ДО EPOS ──────────────
+  // Если включён remote-режим (общий пул через mytoolbox), резервируем
+  // все позиции на сервере. Это блокирует другие магазины от списания
+  // тех же штук. Если 409 — кто-то опередил, кидаем ошибку для re-match.
+  const reserveResult = await tryRemoteReserve(build, build.receipt.id ?? msReceiptId.toString())
+  // ────────────────────────────────────────────────────────────────────
+
   await log.info('fiscalize', `Отправляю чек ${build.receipt.name} в EPOS`, {
     eposUrl,
     items: build.positions.length,
     total: matchedTotal,
+    remoteReserved: reserveResult.reservations?.length ?? 0,
   })
 
   // 3. Выбрать клиент по URL и отправить.
@@ -130,14 +146,23 @@ export async function fiscalize(
   let fiscal: FiscalReceiptInfo
   let requestJson: string
 
-  if (isJsonRpc) {
-    const result = await fiscalizeJsonRpc(eposUrl, build, receivedCash, receivedCard)
-    fiscal = result.fiscal
-    requestJson = result.requestJson
-  } else {
-    const result = await fiscalizeLegacy(eposUrl, eposToken, build, opts, receivedCash, receivedCard)
-    fiscal = result.fiscal
-    requestJson = result.requestJson
+  try {
+    if (isJsonRpc) {
+      const result = await fiscalizeJsonRpc(eposUrl, build, receivedCash, receivedCard)
+      fiscal = result.fiscal
+      requestJson = result.requestJson
+    } else {
+      const result = await fiscalizeLegacy(eposUrl, eposToken, build, opts, receivedCash, receivedCard)
+      fiscal = result.fiscal
+      requestJson = result.requestJson
+    }
+  } catch (eposErr) {
+    // EPOS не выдал FiscalSign — отпускаем резерв чтобы товары
+    // не блокировались в qty_reserved до истечения TTL.
+    if (reserveResult.reservations && reserveResult.reservations.length > 0) {
+      await releaseRemote(reserveResult.reservations, 'epos-failed').catch(() => {})
+    }
+    throw eposErr
   }
 
   await log.info('fiscalize', `Чек фискализирован: ${fiscal.FiscalSign}`, {
@@ -147,9 +172,16 @@ export async function fiscalize(
   })
 
   // 4. Списать остатки.
-  for (const pm of build.positions) {
-    for (const c of pm.candidates) {
-      await consumeEsfItem(c.esfItem.id, c.quantity)
+  if (reserveResult.reservations && reserveResult.reservations.length > 0) {
+    // Remote-режим: confirm на сервере. Локальный consumeEsfItem не зовём —
+    // server is authoritative. SSE придёт обратно и обновит локальный кэш.
+    await confirmRemote(reserveResult.reservations, fiscal.FiscalSign)
+  } else {
+    // Legacy локальный режим — старый путь.
+    for (const pm of build.positions) {
+      for (const c of pm.candidates) {
+        await consumeEsfItem(c.esfItem.id, c.quantity)
+      }
     }
   }
 
@@ -176,6 +208,124 @@ export async function fiscalize(
   await maybePrintReceipt(build, fiscal, receivedCash, receivedCard, false, false)
 
   return { fiscal, fiscalReceiptDbId, matchDbId }
+}
+
+/**
+ * Многошаговая ошибка: «не хватило остатков на сервере».
+ * UI ловит её и показывает «товар закончился, перематчите».
+ */
+export class InventoryConflictError extends Error {
+  constructor(public readonly failed: Array<{ inv_item_id: number; available: number; requested: number }>) {
+    super(
+      `Недостаточно остатков на ${failed.length} позициях — кто-то опередил. ` +
+        `Перезагрузите подбор и попробуйте снова.`,
+    )
+    this.name = 'InventoryConflictError'
+  }
+}
+
+/**
+ * Если включён remote-режим, резервируем все позиции на сервере атомарно.
+ * Возвращает массив reservation IDs для последующего confirm/release.
+ *
+ * Если remote выключен или конфиг неполный — возвращает пустой массив,
+ * и фискализация идёт по старому локальному пути (consumeEsfItem).
+ *
+ * Если ХОТЬ ОДНА candidate.esfItem.server_item_id == null в remote-режиме —
+ * это ошибка: нельзя смешивать remote и legacy позиции в одном чеке
+ * (server потеряет видимость). Кидаем понятную ошибку.
+ */
+async function tryRemoteReserve(
+  build: BuildMatchResult,
+  ms_receipt_id: string,
+): Promise<{ reservations: ReservationInfo[] | null }> {
+  const cfg = await loadInventoryConfig()
+  if (!cfg) return { reservations: null } // legacy mode — продолжаем по-старому
+
+  const client = await getInventoryClient()
+  if (!client) return { reservations: null }
+
+  // Собираем (server_item_id, quantity) пары. Отказываем если есть legacy строки.
+  const items: { inv_item_id: number; quantity: number }[] = []
+  for (const pm of build.positions) {
+    for (const c of pm.candidates) {
+      const sid = c.esfItem.server_item_id
+      if (sid == null) {
+        throw new Error(
+          `Позиция «${c.esfItem.name}» импортирована локально (нет server_item_id). ` +
+            `В remote-режиме все приходы должны быть из общего пула. ` +
+            `Перенесите импорт через mytoolbox админку.`,
+        )
+      }
+      items.push({ inv_item_id: sid, quantity: c.quantity })
+    }
+  }
+
+  const resp = await client.reserve({ ms_receipt_id, items })
+  if (!resp.ok) {
+    throw new InventoryConflictError(resp.failed)
+  }
+
+  // Записываем pending-confirms ДО EPOS — на случай падения программы
+  // между reserve и EPOS, или между EPOS и confirm.
+  for (const r of resp.reservations) {
+    await recordReserved(r.reservation_id, ms_receipt_id).catch((e) => {
+      // Не критично — запись нужна только для retry. Логируем и идём дальше.
+      log.warn('fiscalize', `recordReserved failed: ${e?.message ?? e}`).catch(() => {})
+    })
+  }
+  return { reservations: resp.reservations }
+}
+
+/**
+ * После успеха EPOS: confirm на сервере + удаление pending-записей.
+ * Если confirm не дошёл — оставляем как 'fiscal-ok' в pending для retry
+ * на следующем старте программы. Чек уже в ОФД, фискализация состоялась.
+ */
+async function confirmRemote(reservations: ReservationInfo[], fiscal_sign: string): Promise<void> {
+  const ids = reservations.map((r) => r.reservation_id)
+  // Сначала помечаем 'fiscal-ok' с подписью — чтобы retry-механизм знал
+  // что эти резервации УЖЕ в ОФД и подтверждение обязательно.
+  await markFiscalOk(ids, fiscal_sign).catch((e) =>
+    log.warn('fiscalize', `markFiscalOk failed: ${e?.message ?? e}`).catch(() => {}),
+  )
+
+  const client = await getInventoryClient()
+  if (!client) return
+
+  try {
+    const resp = await client.confirm({ reservation_ids: ids, fiscal_sign })
+    if (resp.ok) {
+      await deletePendingByReservations(ids).catch(() => {})
+    } else {
+      // Это плохой сценарий: фискальный чек в ОФД, но сервер inventory отказал.
+      // Оставляем pending — админ разберёт. retry-механизм попробует ещё раз.
+      await log.warn('fiscalize', `Inventory confirm failed (code=${resp.code})`, resp)
+    }
+  } catch (e) {
+    // Сетевая ошибка — pending остаётся со status='fiscal-ok'. На старте
+    // программы retry.runInventoryHousekeeping() переотправит.
+    const msg = e instanceof Error ? e.message : String(e)
+    await log.warn('fiscalize', `Inventory confirm threw: ${msg}`)
+  }
+}
+
+/** Отпустить резервации (EPOS не выдал FiscalSign). Best-effort, не throw. */
+async function releaseRemote(
+  reservations: ReservationInfo[],
+  reason: string,
+): Promise<void> {
+  const client = await getInventoryClient()
+  if (!client) return
+  const ids = reservations.map((r) => r.reservation_id)
+  try {
+    await client.release({ reservation_ids: ids, reason })
+    await deletePendingByReservations(ids).catch(() => {})
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    await log.warn('fiscalize', `Inventory release threw: ${msg}`)
+    // pending запись останется — на старте retry попробует освободить.
+  }
 }
 
 /**

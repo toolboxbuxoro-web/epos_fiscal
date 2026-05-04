@@ -100,13 +100,35 @@ export const SettingKey = {
   AutoFiscalize: 'matcher.auto_fiscalize',
   /** Включён ли режим подмены ИКПУ для товаров без приходов */
   ReplacementEnabled: 'matcher.replacement_enabled',
+  // ── Multi-shop inventory (общий пул приходов через mytoolbox) ──
+  /**
+   * Использовать удалённый inventory server (mytoolbox) для общего пула
+   * приходов между магазинами. 'true' / 'false'. По умолчанию false —
+   * legacy локальный режим (esf_items только локально).
+   *
+   * Когда включено — приходы синхронизируются с сервера через
+   * GET /items, а consumeEsfItem заменяется на reserve→confirm flow.
+   */
+  InventoryRemoteEnabled: 'inventory.remote_enabled',
+  /** Базовый URL inventory server (например https://mytoolbox-backend.up.railway.app). */
+  InventoryServerUrl: 'inventory.server_url',
+  /** Slug магазина в inv_shops (например 'toolbox-honabod'). */
+  InventoryShopSlug: 'inventory.shop_slug',
+  /**
+   * API key магазина для аутентификации в inventory server.
+   * Хранится plaintext в БД магазина — это секрет, доступный только
+   * процессу нашей программы. Ротация — через админку mytoolbox.
+   */
+  InventoryShopApiKey: 'inventory.shop_api_key',
+  /** Unix-timestamp последнего успешного sync /items?since=. */
+  InventoryLastSyncTs: 'inventory.last_sync_ts',
 } as const
 
 export type SettingKey = (typeof SettingKey)[keyof typeof SettingKey]
 
 // ── esf_items ────────────────────────────────────────────────────
 
-export type EsfSource = 'excel' | 'e-faktura' | 'didox'
+export type EsfSource = 'excel' | 'e-faktura' | 'didox' | 'remote'
 export type OwnerType = 0 | 1 | 2 // 0=перепродажа, 1=производитель, 2=услуга
 
 export interface EsfItemRow {
@@ -125,9 +147,24 @@ export interface EsfItemRow {
   received_at: EpochSec
   imported_at: EpochSec
   notes: string | null
+  /**
+   * id строки на удалённом inventory server (mytoolbox).
+   * Заполнено когда строка пришла через sync (source='remote').
+   * NULL для legacy локальных импортов из Excel/ЭСФ.
+   *
+   * При фискализации в remote-режиме именно этот id отправляется в
+   * /reserve как `inv_item_id`.
+   */
+  server_item_id: number | null
 }
 
-export type NewEsfItem = Omit<EsfItemRow, 'id' | 'qty_consumed' | 'imported_at'>
+export type NewEsfItem = Omit<
+  EsfItemRow,
+  'id' | 'qty_consumed' | 'imported_at' | 'server_item_id'
+> & {
+  /** Опционально: id строки на mytoolbox-сервере, если импорт из remote sync. */
+  server_item_id?: number | null
+}
 
 // ── ms_receipts ──────────────────────────────────────────────────
 

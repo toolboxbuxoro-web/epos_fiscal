@@ -9,6 +9,10 @@ import Settings from '@/routes/Settings'
 import { useEffect } from 'react'
 import { autoApplyOnStartup } from '@/lib/updater'
 import { log } from '@/lib/log'
+import {
+  ensureInventoryRuntime,
+  stopInventoryRuntime,
+} from '@/lib/inventory'
 
 export default function App() {
   useEffect(() => {
@@ -16,6 +20,19 @@ export default function App() {
     // Авто-обновление: если есть новая версия — само скачивается
     // и перезапускает приложение в новой версии. Без диалогов.
     void autoApplyOnStartup()
+
+    // Inventory runtime — если включён remote-режим, тянет конфиг от админа,
+    // подписывается на SSE-обновления, гоняет periodic sync. Если выключен —
+    // тихо ничего не делает. Idempotent — можно дёргать несколько раз.
+    // Внутри уже асинхронно: housekeeping → bootstrap sync → SSE.
+    // НЕ блокируем return — делаем void чтобы UI не задерживать.
+    void ensureInventoryRuntime()
+
+    // На размонтировании App (например HMR) — стопаем SSE+timers, иначе
+    // в DevTools накопятся открытые stream'ы.
+    return () => {
+      stopInventoryRuntime()
+    }
   }, [])
 
   return (
