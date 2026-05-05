@@ -90,6 +90,8 @@ export const log = {
 export interface ListLogsFilter {
   level?: LogLevel | LogLevel[]
   source?: LogSource | LogSource[]
+  /** Unix-секунды — вернёт только логи с ts >= since. */
+  since?: number
   limit?: number
   offset?: number
 }
@@ -109,6 +111,10 @@ export async function listLogs(filter: ListLogsFilter = {}): Promise<LogRow[]> {
     const arr = Array.isArray(filter.source) ? filter.source : [filter.source]
     where.push(`source IN (${arr.map(() => `$${n++}`).join(', ')})`)
     params.push(...arr)
+  }
+  if (typeof filter.since === 'number') {
+    where.push(`ts >= $${n++}`)
+    params.push(filter.since)
   }
 
   const limit = filter.limit ?? 200

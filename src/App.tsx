@@ -1,5 +1,5 @@
 import { Routes, Route } from 'react-router-dom'
-import Layout, { RequireAdmin } from '@/components/Layout'
+import Layout from '@/components/Layout'
 import Dashboard from '@/routes/Dashboard'
 import Receipt from '@/routes/Receipt'
 import Catalog from '@/routes/Catalog'
@@ -58,32 +58,9 @@ export default function App() {
           <Route path="/" element={<Dashboard />} />
           <Route path="/receipts/:id" element={<Receipt />} />
           <Route path="/history" element={<History />} />
-          {/* Admin-only — защищены RequireAdmin (localStorage flag).
-              Кассир не видит их в нав, прямой URL редиректит на /. */}
-          <Route
-            path="/catalog"
-            element={
-              <RequireAdmin>
-                <Catalog />
-              </RequireAdmin>
-            }
-          />
-          <Route
-            path="/logs"
-            element={
-              <RequireAdmin>
-                <Logs />
-              </RequireAdmin>
-            }
-          />
-          <Route
-            path="/settings"
-            element={
-              <RequireAdmin>
-                <Settings />
-              </RequireAdmin>
-            }
-          />
+          <Route path="/catalog" element={<Catalog />} />
+          <Route path="/logs" element={<Logs />} />
+          <Route path="/settings" element={<Settings />} />
         </Route>
       </Routes>
       <Toaster />
