@@ -1,5 +1,4 @@
 import {
-  consumeEsfItem,
   createMatch,
   insertFiscalReceipt,
   setMsReceiptStatus,
@@ -159,9 +158,7 @@ export async function fiscalize(
   } catch (eposErr) {
     // EPOS не выдал FiscalSign — отпускаем резерв чтобы товары
     // не блокировались в qty_reserved до истечения TTL.
-    if (reserveResult.reservations && reserveResult.reservations.length > 0) {
-      await releaseRemote(reserveResult.reservations, 'epos-failed').catch(() => {})
-    }
+    await releaseRemote(reserveResult.reservations, 'epos-failed').catch(() => {})
     throw eposErr
   }
 
@@ -171,19 +168,9 @@ export async function fiscalize(
     qr: fiscal.QRCodeURL,
   })
 
-  // 4. Списать остатки.
-  if (reserveResult.reservations && reserveResult.reservations.length > 0) {
-    // Remote-режим: confirm на сервере. Локальный consumeEsfItem не зовём —
-    // server is authoritative. SSE придёт обратно и обновит локальный кэш.
-    await confirmRemote(reserveResult.reservations, fiscal.FiscalSign)
-  } else {
-    // Legacy локальный режим — старый путь.
-    for (const pm of build.positions) {
-      for (const c of pm.candidates) {
-        await consumeEsfItem(c.esfItem.id, c.quantity)
-      }
-    }
-  }
+  // 4. Confirm резерв → server переводит qty_reserved → qty_consumed.
+  // Server is authoritative. SSE придёт обратно и обновит локальный кэш.
+  await confirmRemote(reserveResult.reservations, fiscal.FiscalSign)
 
   // 5. Сохранить fiscal_receipt.
   const fiscalReceiptDbId = await insertFiscalReceipt({
@@ -225,36 +212,47 @@ export class InventoryConflictError extends Error {
 }
 
 /**
- * Если включён remote-режим, резервируем все позиции на сервере атомарно.
- * Возвращает массив reservation IDs для последующего confirm/release.
+ * Резервируем все позиции чека на сервере атомарно ДО фискализации.
  *
- * Если remote выключен или конфиг неполный — возвращает пустой массив,
- * и фискализация идёт по старому локальному пути (consumeEsfItem).
+ * Remote-режим обязателен — другого пути в 0.10+ не существует. Если
+ * inventory server не сконфигурирован, кидается понятная ошибка
+ * (`InventoryNotConfiguredError`) — кассир увидит «настройте сервер».
  *
- * Если ХОТЬ ОДНА candidate.esfItem.server_item_id == null в remote-режиме —
- * это ошибка: нельзя смешивать remote и legacy позиции в одном чеке
- * (server потеряет видимость). Кидаем понятную ошибку.
+ * Если в кандидатах есть строка с `server_item_id = NULL` — она была
+ * импортирована локально до миграции. Кидаем ошибку с подсказкой
+ * сделать миграцию через Catalog → «Перенести в общий пул».
+ *
+ * При 409 от сервера (`INSUFFICIENT_STOCK`) — `InventoryConflictError`
+ * с failed item_ids; UI ловит и автоматически перематчивает.
  */
 async function tryRemoteReserve(
   build: BuildMatchResult,
   ms_receipt_id: string,
-): Promise<{ reservations: ReservationInfo[] | null }> {
+): Promise<{ reservations: ReservationInfo[] }> {
   const cfg = await loadInventoryConfig()
-  if (!cfg) return { reservations: null } // legacy mode — продолжаем по-старому
+  if (!cfg) {
+    throw new InventoryNotConfiguredError(
+      'Inventory сервер не настроен. Откройте Настройки и подключитесь.',
+    )
+  }
 
   const client = await getInventoryClient()
-  if (!client) return { reservations: null }
+  if (!client) {
+    throw new InventoryNotConfiguredError(
+      'Inventory клиент не инициализирован. Откройте Настройки.',
+    )
+  }
 
-  // Собираем (server_item_id, quantity) пары. Отказываем если есть legacy строки.
+  // Собираем (server_item_id, quantity) пары. Локальные строки без
+  // server_item_id блокируют — миграция через Catalog обязательна.
   const items: { inv_item_id: number; quantity: number }[] = []
   for (const pm of build.positions) {
     for (const c of pm.candidates) {
       const sid = c.esfItem.server_item_id
       if (sid == null) {
         throw new Error(
-          `Позиция «${c.esfItem.name}» импортирована локально (нет server_item_id). ` +
-            `В remote-режиме все приходы должны быть из общего пула. ` +
-            `Перенесите импорт через mytoolbox админку.`,
+          `Приход «${c.esfItem.name}» импортирован локально (старый Excel-импорт). ` +
+            `Откройте Справочник → «Перенести в общий пул» чтобы включить в общий пул.`,
         )
       }
       items.push({ inv_item_id: sid, quantity: c.quantity })
@@ -270,11 +268,18 @@ async function tryRemoteReserve(
   // между reserve и EPOS, или между EPOS и confirm.
   for (const r of resp.reservations) {
     await recordReserved(r.reservation_id, ms_receipt_id).catch((e) => {
-      // Не критично — запись нужна только для retry. Логируем и идём дальше.
       log.warn('fiscalize', `recordReserved failed: ${e?.message ?? e}`).catch(() => {})
     })
   }
   return { reservations: resp.reservations }
+}
+
+/** Inventory server не сконфигурирован — UI показывает с deep-link на Настройки. */
+export class InventoryNotConfiguredError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'InventoryNotConfiguredError'
+  }
 }
 
 /**

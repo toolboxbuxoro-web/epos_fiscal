@@ -61,8 +61,7 @@ interface FormState {
   maxDiscountPerItemSum: string
   // Тестовый режим — фискализация без реальной отправки в Communicator
   testMode: 'true' | 'false'
-  // Inventory Server (общий пул приходов через mytoolbox)
-  invRemoteEnabled: 'true' | 'false'
+  // Inventory Server (общий пул приходов через mytoolbox) — обязательно с 0.10+
   invServerUrl: string
   invShopSlug: string
   invShopApiKey: string
@@ -94,7 +93,6 @@ const empty: FormState = {
   discountForExactSum: 'true',
   maxDiscountPerItemSum: '2000',
   testMode: 'false',
-  invRemoteEnabled: 'false',
   invServerUrl: '',
   invShopSlug: '',
   invShopApiKey: '',
@@ -199,9 +197,6 @@ export default function Settings() {
       testMode: (all[SettingKey.TestMode] ?? 'false') as 'true' | 'false',
       autoFiscalize: (all[SettingKey.AutoFiscalize] ?? 'false') as 'true' | 'false',
       replacementEnabled: (all[SettingKey.ReplacementEnabled] ?? 'true') as 'true' | 'false',
-      invRemoteEnabled: (all[SettingKey.InventoryRemoteEnabled] ?? 'false') as
-        | 'true'
-        | 'false',
       invServerUrl: all[SettingKey.InventoryServerUrl] ?? '',
       invShopSlug: all[SettingKey.InventoryShopSlug] ?? '',
       invShopApiKey: all[SettingKey.InventoryShopApiKey] ?? '',
@@ -335,7 +330,7 @@ export default function Settings() {
         [SettingKey.TestMode]: form.testMode,
         [SettingKey.AutoFiscalize]: form.autoFiscalize,
         [SettingKey.ReplacementEnabled]: form.replacementEnabled,
-        [SettingKey.InventoryRemoteEnabled]: form.invRemoteEnabled,
+        [SettingKey.InventoryRemoteEnabled]: "true",
         [SettingKey.InventoryServerUrl]: form.invServerUrl.replace(/\/$/, ''),
         [SettingKey.InventoryShopSlug]: form.invShopSlug.trim(),
         [SettingKey.InventoryShopApiKey]: form.invShopApiKey.trim(),
@@ -365,7 +360,7 @@ export default function Settings() {
       }
       // Сначала сохраняем — служебные функции читают из БД, не из form.
       await setSettings({
-        [SettingKey.InventoryRemoteEnabled]: form.invRemoteEnabled,
+        [SettingKey.InventoryRemoteEnabled]: "true",
         [SettingKey.InventoryServerUrl]: form.invServerUrl.replace(/\/$/, ''),
         [SettingKey.InventoryShopSlug]: form.invShopSlug.trim(),
         [SettingKey.InventoryShopApiKey]: form.invShopApiKey.trim(),
@@ -382,7 +377,7 @@ export default function Settings() {
       await client.ping()
 
       // Если remote включён — подтягиваем МС-creds от админа и приходы.
-      if (form.invRemoteEnabled === 'true') {
+      if (true) {
         setInvTestMsg('Подтягиваю МС-настройки от админа…')
         const cfg = await syncShopConfig()
         if (cfg.applied) {
@@ -645,22 +640,8 @@ export default function Settings() {
             </ul>
             Магазин и его API key создаёт админ в mytoolbox.
           </div>
-          {form.invRemoteEnabled === 'true' && (
-            <SseStatusBadge status={invSseStatus} />
-          )}
+          <SseStatusBadge status={invSseStatus} />
         </div>
-
-        <Field label="Использовать общий пул">
-          <Select
-            value={form.invRemoteEnabled}
-            onChange={(e) =>
-              setField('invRemoteEnabled', e.target.value as 'true' | 'false')
-            }
-          >
-            <option value="false">Выключено (локальный SQLite каждый магазин сам по себе)</option>
-            <option value="true">Включено (общий пул через сервер)</option>
-          </Select>
-        </Field>
 
         <Field label="Inventory Server URL">
           <Input
@@ -705,7 +686,7 @@ export default function Settings() {
           >
             {invConnecting ? 'Подключаюсь…' : 'Подключиться'}
           </Button>
-          {form.invRemoteEnabled === 'true' && (
+          {true && (
             <Button
               variant="secondary"
               size="sm"
@@ -720,7 +701,7 @@ export default function Settings() {
       </Section>
 
       <Section title="МойСклад">
-        {form.invRemoteEnabled === 'true' && (
+        {true && (
           <div className="col-span-1 md:col-span-2 rounded-md bg-canvas border border-border p-3 text-xs text-ink-muted">
             🔒 Настройки управляются админом mytoolbox (поля только для чтения).
             Чтобы изменить — попроси админа обновить привязку магазина к МС-аккаунту,
@@ -735,7 +716,7 @@ export default function Settings() {
                 onChange={(e) => setField('moyskladLogin', e.target.value)}
                 placeholder="user@example.com"
                 autoComplete="username"
-                disabled={form.invRemoteEnabled === 'true'}
+                disabled={true}
               />
             </Field>
             <Field label="Пароль">
@@ -745,7 +726,7 @@ export default function Settings() {
                 onChange={(e) => setField('moyskladPassword', e.target.value)}
                 placeholder="••••••••"
                 autoComplete="current-password"
-                disabled={form.invRemoteEnabled === 'true'}
+                disabled={true}
               />
             </Field>
             <div className="col-span-1 md:col-span-2 flex items-center gap-3">
@@ -755,7 +736,7 @@ export default function Settings() {
                   authBusy ||
                   !form.moyskladLogin ||
                   !form.moyskladPassword ||
-                  form.invRemoteEnabled === 'true'
+                  true
                 }
                 onClick={signIn}
               >
@@ -773,7 +754,7 @@ export default function Settings() {
                 <span className="text-success">Залогинен как</span>{' '}
                 <span className="font-medium">{form.moyskladLogin || 'пользователь'}</span>
               </div>
-              {form.invRemoteEnabled !== 'true' && (
+              {false && (
                 <Button variant="ghost" size="sm" onClick={signOut}>
                   Выйти
                 </Button>
@@ -784,7 +765,7 @@ export default function Settings() {
               <Select
                 value={form.moyskladRetailStoreId}
                 onChange={(e) => void pickStore(e.target.value)}
-                disabled={form.invRemoteEnabled === 'true'}
+                disabled={true}
               >
                 <option value="">— выберите —</option>
                 {stores.map((s) => (
@@ -793,7 +774,7 @@ export default function Settings() {
                   </option>
                 ))}
                 {/* Если remote — точка может быть установлена админом без подгрузки списка stores. */}
-                {form.invRemoteEnabled === 'true' &&
+                {true &&
                   form.moyskladRetailStoreId &&
                   !stores.some((s) => s.id === form.moyskladRetailStoreId) && (
                     <option value={form.moyskladRetailStoreId}>
@@ -806,7 +787,7 @@ export default function Settings() {
               <Select
                 value={form.moyskladEmployeeId}
                 onChange={(e) => void pickEmployee(e.target.value)}
-                disabled={form.invRemoteEnabled === 'true'}
+                disabled={true}
               >
                 <option value="">— выберите —</option>
                 {employees.map((e) => (
@@ -814,7 +795,7 @@ export default function Settings() {
                     {e.shortFio ?? e.fullName ?? e.name}
                   </option>
                 ))}
-                {form.invRemoteEnabled === 'true' &&
+                {true &&
                   form.moyskladEmployeeId &&
                   !employees.some((e) => e.id === form.moyskladEmployeeId) && (
                     <option value={form.moyskladEmployeeId}>

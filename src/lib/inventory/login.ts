@@ -191,30 +191,18 @@ export async function signOut(): Promise<void> {
 }
 
 /**
- * Хук-чекер для AppGate. Возвращает true если есть валидная сессия.
- *
- * Логика гибкая под dual-mode:
- *   - Remote (новый flow): нужны MoyskladCredentials + InventoryShopApiKey
- *   - Legacy (старые установки): достаточно MoyskladCredentials
- *
- * Без МС-creds в любом случае нет смысла пускать в приложение —
- * поллер не запустится. Поэтому МС — обязательный признак сессии.
+ * Хук-чекер для AppGate. Сессия валидна если есть:
+ *   - MoyskladCredentials (для МС-поллера)
+ *   - InventoryShopApiKey (для inventory-сервера, обязательно с 0.10+)
  *
  * Не делает сетевых запросов — только локальная проверка. Если ключи
  * протухли — это обнаружится при первом API-вызове и пользователя
  * вернёт на Login через UI flow (см. AppGate.tsx).
  */
 export async function hasActiveSession(): Promise<boolean> {
-  const ms = await getSetting(SettingKey.MoyskladCredentials)
-  if (!ms) return false
-  // Если remote-режим включён — нужен api_key. Без него inventory вызовы
-  // упадут с 401 и UI это покажет, поэтому здесь не блокируем — только
-  // отбрасываем явно сломанное состояние (remote=true но api_key пуст).
-  const remoteEnabled =
-    (await getSetting(SettingKey.InventoryRemoteEnabled)) === 'true'
-  if (remoteEnabled) {
-    const apiKey = await getSetting(SettingKey.InventoryShopApiKey)
-    if (!apiKey) return false
-  }
-  return true
+  const [ms, apiKey] = await Promise.all([
+    getSetting(SettingKey.MoyskladCredentials),
+    getSetting(SettingKey.InventoryShopApiKey),
+  ])
+  return Boolean(ms && apiKey)
 }

@@ -2,22 +2,15 @@
  * Runtime для multi-shop inventory: SSE-подписка + housekeeping + periodic sync.
  *
  * Запускается один раз на всё приложение из App.tsx (`ensureInventoryRuntime`).
- * Не делает ничего если remote-режим выключен в Settings.
+ * Если конфиг сервера отсутствует (apiKey/serverUrl пусто) — тихо ничего не
+ * делает (но AppGate в этом случае и не пустит в приложение).
  *
  * Что внутри:
  *   1. **Housekeeping на старте** — `runInventoryHousekeeping`:
  *      sync МС-creds от админа, retry зависших confirm, release stale reserved.
  *   2. **SSE-подписка** на `/api/v1/inventory/events` — live-обновления остатков.
- *      Каждое `inv.items.updated` пишется в local SQLite через `applyItemsUpdate`.
- *      Auto-reconnect с exponential backoff внутри `subscribeToInventoryEvents`.
- *   3. **Periodic sync** — fallback на случай если SSE отвалился.
- *      Раз в 5 минут зовём `syncFromServer` (incremental по `updated_since`).
- *   4. **Periodic housekeeping** — раз в 10 минут retry pending confirms
- *      (на случай если в момент confirm была сетевая ошибка).
- *
- * Если remote-режим переключают runtime'ом — нужно делать `restart`. Простой
- * способ — попросить юзера перезапустить программу. Усложнять с listenerами
- * на SettingKey.InventoryRemoteEnabled пока не будем.
+ *   3. **Periodic sync** — fallback каждые 5 мин (если SSE отвалился).
+ *   4. **Periodic housekeeping** — каждые 10 мин retry pending confirms.
  */
 
 import { log } from '@/lib/log'

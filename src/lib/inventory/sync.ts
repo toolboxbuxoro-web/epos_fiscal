@@ -35,16 +35,15 @@ import { InventoryServerClient } from './server-client'
 import type { RemoteInvItem } from './types'
 
 /**
- * Прочитать конфиг из настроек. Если remote режим выключен или нет
- * url/key — возвращает null.
+ * Прочитать конфиг из настроек. Если нет url/api_key — возвращает null
+ * (это значит магазин не залогинен или сессия пуста — AppGate должен
+ * был не пустить в приложение).
  */
 export async function loadInventoryConfig(): Promise<{
   serverUrl: string
   apiKey: string
   shopSlug: string
 } | null> {
-  const enabled = (await getSetting(SettingKey.InventoryRemoteEnabled)) === 'true'
-  if (!enabled) return null
   const serverUrl = await getSetting(SettingKey.InventoryServerUrl)
   const apiKey = await getSetting(SettingKey.InventoryShopApiKey)
   const shopSlug = (await getSetting(SettingKey.InventoryShopSlug)) ?? ''

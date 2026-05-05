@@ -1,15 +1,12 @@
 import { useEffect, useState } from 'react'
 import {
   countEsfItems,
-  getSetting,
   listEsfItems,
-  SettingKey,
   type EsfItemWithAvailable,
 } from '@/lib/db'
 import { Button, Card, toast } from '@/components/ui'
 import { Input } from '@/components/ui/Input'
-import { ExcelImportDialog } from '@/components/ExcelImportDialog'
-import { CloudUpload, Loader2, TriangleAlert } from 'lucide-react'
+import { CloudUpload, Loader2 } from 'lucide-react'
 import {
   getMigrationStats,
   migrateLocalToServer,
@@ -25,11 +22,9 @@ export default function Catalog() {
   const [items, setItems] = useState<EsfItemWithAvailable[]>([])
   const [total, setTotal] = useState(0)
   const [search, setSearch] = useState('')
-  const [showImport, setShowImport] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   // Migration state
-  const [remoteEnabled, setRemoteEnabled] = useState(false)
   const [unmigratedCount, setUnmigratedCount] = useState(0)
   const [migrating, setMigrating] = useState(false)
   const [migrationProgress, setMigrationProgress] = useState<MigrationProgress | null>(
@@ -40,15 +35,13 @@ export default function Catalog() {
     setLoading(true)
     setError(null)
     try {
-      const [rows, count, remote, stats] = await Promise.all([
+      const [rows, count, stats] = await Promise.all([
         listEsfItems({ search: search || undefined, limit: 200 }),
         countEsfItems(),
-        getSetting(SettingKey.InventoryRemoteEnabled),
         getMigrationStats(),
       ])
       setItems(rows)
       setTotal(count)
-      setRemoteEnabled(remote === 'true')
       setUnmigratedCount(stats.unmigratedCount)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -100,30 +93,26 @@ export default function Catalog() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Справочник приходов</h1>
           <p className="mt-1 text-sm text-ink-muted">
-            Товары с налоговыми приходами. Из них Matcher собирает чеки для отправки в EPOS.
+            Приходы с ИКПУ из общего пула. Загружает бухгалтер через mytoolbox админку —
+            здесь только просмотр.
           </p>
-        </div>
-        <div className="flex gap-2">
-          <Button variant="primary" onClick={() => setShowImport(true)}>
-            Импорт Excel
-          </Button>
         </div>
       </div>
 
-      {/* Migration banner — показывается когда remote включён И есть
-          непереданные локальные приходы. После миграции счётчик 0 → исчезает. */}
-      {remoteEnabled && unmigratedCount > 0 && (
+      {/* Migration banner — есть непереданные локальные приходы (с 0.8.x). */}
+      {unmigratedCount > 0 && (
         <Card className="border-info/20 bg-info-soft">
           <Card.Body className="flex items-start gap-3">
             <CloudUpload size={18} className="text-info shrink-0 mt-0.5" />
             <div className="flex-1 min-w-0">
               <div className="text-body font-medium text-ink">
-                Локальные приходы можно перенести в общий пул
+                Локальные приходы нужно перенести в общий пул
               </div>
               <div className="text-caption text-ink-muted mt-0.5">
                 {unmigratedCount} {unmigratedCount === 1 ? 'приход' : 'приходов'}{' '}
-                импортированы локально через Excel и пока не привязаны к серверу.
-                После переноса остатки будут синхронизироваться с другими магазинами.
+                остались с прошлой версии (импортированы локально через Excel).
+                После переноса они станут доступны всем магазинам сети, до этого —
+                фискализация будет падать с ошибкой «приход импортирован локально».
               </div>
               {migrationProgress && (
                 <div className="mt-2 text-caption text-ink-muted">
@@ -142,20 +131,6 @@ export default function Catalog() {
             >
               Перенести
             </Button>
-          </Card.Body>
-        </Card>
-      )}
-
-      {/* Warning когда remote включён но локально импорт через Excel */}
-      {remoteEnabled && unmigratedCount === 0 && (
-        <Card className="border-warning/20 bg-warning-soft">
-          <Card.Body className="flex items-start gap-3 text-caption">
-            <TriangleAlert size={16} className="text-warning shrink-0 mt-0.5" />
-            <div className="text-ink">
-              <strong className="text-warning">Remote-режим активен.</strong>{' '}
-              Импорт Excel локально больше не используется — приходы загружает
-              бухгалтер централизованно через mytoolbox админку.
-            </div>
           </Card.Body>
         </Card>
       )}
@@ -207,7 +182,7 @@ export default function Catalog() {
                 <td className="px-3 py-8 text-center text-sm text-ink-muted" colSpan={7}>
                   {search
                     ? 'По запросу ничего не найдено.'
-                    : 'Справочник пуст. Импортируйте приходы из Excel.'}
+                    : 'Справочник пуст. Бухгалтер загружает приходы через mytoolbox админку.'}
                 </td>
               </tr>
             ) : (
@@ -239,16 +214,6 @@ export default function Catalog() {
           </tbody>
         </table>
       </div>
-
-      {showImport && (
-        <ExcelImportDialog
-          onClose={() => setShowImport(false)}
-          onImported={() => {
-            setShowImport(false)
-            void load()
-          }}
-        />
-      )}
     </div>
   )
 }
