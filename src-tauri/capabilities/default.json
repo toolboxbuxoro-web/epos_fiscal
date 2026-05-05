@@ -22,6 +22,7 @@
       "identifier": "http:default",
       "allow": [
         { "url": "https://api.moysklad.ru/*" },
+        { "url": "https://backend-production-c3d4.up.railway.app/*" },
         { "url": "http://localhost:*" },
         { "url": "http://127.0.0.1:*" },
         { "url": "http://192.168.*:*" },

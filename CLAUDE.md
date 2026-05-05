@@ -310,15 +310,26 @@ latest.json с подписями
 
 ## Capabilities Tauri
 
-`src-tauri/capabilities/default.json` — **не сужать**. Сейчас разрешено:
-- `localhost:*` (любой порт — Communicator может быть на 8347/3448)
-- `127.0.0.1:*`
-- `192.168.*:*` / `10.*:*` (LAN, если Communicator на другом ПК)
-- `https://api.moysklad.ru/*`
+`src-tauri/capabilities/default.json` — принцип: **localhost broad, HTTPS точечно**.
 
-Прошлая версия с whitelist'ом конкретных портов **молча блокировала**
-запросы к новым портам без понятных ошибок. Урок: не делать строгий
-whitelist, делать broad по нашим use case.
+Сейчас разрешено:
+- `http://localhost:*` (любой порт — Communicator может быть на 8347/3448)
+- `http://127.0.0.1:*`
+- `http://192.168.*:*` / `http://10.*:*` (LAN, если Communicator на другом ПК)
+- `https://api.moysklad.ru/*` (МойСклад API)
+- `https://backend-production-c3d4.up.railway.app/*` (mytoolbox inventory API)
+
+**Почему так:**
+- Localhost+LAN broad **по портам** (не по конкретным `:8347`/`:3448`) — потому что
+  раньше был баг: жёсткий whitelist портов **молча блочил** запросы к новым портам
+  Communicator без понятных ошибок. Любой порт на localhost безопасен (доступ к
+  localhost требует уже быть на машине).
+- HTTPS — **точечно по доменам**, НЕ `https://*`. Иначе при XSS из ms-данных или
+  supply-chain атаке на пакет атакующий сможет сливать ИКПУ/фискальные данные на
+  свой домен. Точечный whitelist — defense-in-depth.
+
+**При добавлении нового внешнего HTTPS-сервиса** — добавляй конкретный домен,
+не `*`. Если для Communicator появится новый порт — он автоматически разрешён.
 
 ## Команды разработки
 
@@ -346,7 +357,7 @@ irm https://raw.githubusercontent.com/toolboxbuxoro-web/epos_fiscal/main/scripts
 src-tauri/
   Cargo.toml              ← features: tauri-plugin-http["gzip"], printers
   tauri.conf.json         ← bundle.createUpdaterArtifacts: true (для подписи)
-  capabilities/default.json ← НЕ сужать allow-list
+  capabilities/default.json ← localhost broad, HTTPS точечно
   src/
     printer.rs            ← raw ESC/POS + CP866 + native QR (GS ( k)
   migrations/
