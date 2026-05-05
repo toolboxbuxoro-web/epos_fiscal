@@ -154,34 +154,39 @@ export default function Login() {
             </form>
           </Card.Body>
 
-          <Card.Footer className="justify-between">
-            <span className="text-caption text-ink-muted">
-              {serverUrl ? (
-                <span className="truncate" title={serverUrl}>
-                  Сервер: {serverUrl.replace(/^https?:\/\//, '')}
-                </span>
-              ) : (
-                <span className="text-warning">Сервер не настроен</span>
-              )}
-            </span>
-            <button
-              type="button"
-              onClick={() => setShowServerUrlField((v) => !v)}
-              className="text-caption text-ink-muted hover:text-ink transition-colors inline-flex items-center gap-1"
-            >
-              <SettingsIcon size={12} />
-              Сервер
-            </button>
-          </Card.Footer>
+          {/* Footer с конфигурацией сервера — ТОЛЬКО в dev-режиме.
+              В production кассиру он не нужен: дефолтный URL подкладывается
+              автоматически, а если нужен другой — админ меняет в /settings. */}
+          {import.meta.env.DEV && (
+            <Card.Footer className="justify-between">
+              <span className="text-caption text-ink-muted">
+                {serverUrl ? (
+                  <span className="truncate" title={serverUrl}>
+                    Сервер: {serverUrl.replace(/^https?:\/\//, '')}
+                  </span>
+                ) : (
+                  <span className="text-warning">Сервер не настроен</span>
+                )}
+              </span>
+              <button
+                type="button"
+                onClick={() => setShowServerUrlField((v) => !v)}
+                className="text-caption text-ink-muted hover:text-ink transition-colors inline-flex items-center gap-1"
+              >
+                <SettingsIcon size={12} />
+                Сервер
+              </button>
+            </Card.Footer>
+          )}
         </Card>
 
-        {showServerUrlField && (
+        {import.meta.env.DEV && showServerUrlField && (
           <div className="mt-3 animate-fade-in">
             <Card>
               <Card.Body>
                 <Field
                   label="Inventory Server URL"
-                  hint="Адрес mytoolbox-сервера. Узнайте у администратора."
+                  hint="Адрес mytoolbox-сервера. Только в dev-режиме."
                 >
                   <Input
                     type="url"
