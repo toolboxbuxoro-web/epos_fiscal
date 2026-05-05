@@ -3,6 +3,10 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Принудительная светлая тема: иначе на macOS/Win с темной темой WebView
+         автоматически перекрашивает <button> / <input> в тёмные UA-стили,
+         даже когда наши CSS-переменные задают конкретные цвета. -->
+    <meta name="color-scheme" content="light" />
     <title>EPOS Fiscal</title>
   </head>
   <body>

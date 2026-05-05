@@ -6,10 +6,16 @@
  * Design tokens — CSS variables.
  * Используются в tailwind.config.ts через rgb(var(--…) / <alpha>).
  *
- * Light theme (по умолчанию).
- * Dark theme через `.dark` класс на <html> (Phase D добавим тоггл, пока off).
+ * Light theme (по умолчанию). Dark theme — opt-in через `.dark` класс
+ * на <html> + кнопка переключения (TODO в Settings).
+ *
+ * `color-scheme: light` — критично для Tauri WebView когда ОС в Dark Mode:
+ * без этого UA-стили перекрашивают `<button>` / `<input>` / `<select>` в
+ * системные тёмные цвета поверх наших токенов, и кнопки становятся
+ * нечитаемые (тёмный текст на тёмном фоне).
  */
 :root {
+  color-scheme: light;
   /* Neutral surfaces */
   --canvas: 250 250 250;          /* #fafafa — фон страницы */
   --surface: 255 255 255;         /* #ffffff — фон карточек */
@@ -40,6 +46,7 @@
 }
 
 .dark {
+  color-scheme: dark;
   --canvas: 9 9 11;
   --surface: 24 24 27;
   --surface-hover: 39 39 42;
