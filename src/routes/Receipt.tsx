@@ -21,7 +21,7 @@ import {
 } from '@/lib/db'
 import type { MsReceiptRow } from '@/lib/db/types'
 import { buildMatch, extractPositions, type BuildMatchResult } from '@/lib/matcher'
-import { fiscalize } from '@/lib/epos'
+import { fiscalize, InventoryConflictError } from '@/lib/epos'
 import { MoyskladClient, inlinePositions, type MsRetailDemand } from '@/lib/moysklad'
 import {
   Badge,
@@ -49,6 +49,12 @@ export default function Receipt() {
   const [error, setError] = useState<string | null>(null)
   const [fiscalizing, setFiscalizing] = useState(false)
   const [testMode, setTestMode] = useState(false)
+  /**
+   * server_item_id'ы которые сервер отказал на reserve (другой магазин
+   * успел забрать). При rematch matcher их игнорирует — иначе сразу
+   * предложил бы те же товары и снова получил 409.
+   */
+  const [excludedServerIds, setExcludedServerIds] = useState<number[]>([])
 
   const rd: MsRetailDemand | null = useMemo(() => {
     if (!receipt) return null
@@ -163,6 +169,7 @@ export default function Receipt() {
         roundUpToSum,
         discountForExactSum: discountEnabled,
         maxDiscountPerItemTiyin,
+        excludeServerItemIds: excludedServerIds.length > 0 ? excludedServerIds : undefined,
       })
       setMatch(result)
 
@@ -196,6 +203,28 @@ export default function Receipt() {
       toast.success(`Чек фискализирован: ${result.fiscal.FiscalSign}`)
       nav('/history')
     } catch (e) {
+      // Multi-shop конфликт: другой магазин успел забрать товар.
+      // НЕ ставим status='failed' — чек не failed, просто нужно перематчить
+      // с другим товаром. Добавляем отказанные server_item_id в exclude
+      // и автоматом перерендериваем match (matcher их пропустит).
+      if (e instanceof InventoryConflictError) {
+        const newExcludes = [
+          ...excludedServerIds,
+          ...e.failed.map((f) => f.inv_item_id),
+        ]
+        setExcludedServerIds(newExcludes)
+        toast.error(
+          `Товар закончился — другой магазин опередил. Подбираю замену...`,
+          { duration: 4000 },
+        )
+        // Re-build match с новым excludes — тут же без перезагрузки страницы.
+        // useEffect от excludedServerIds не сработает, поэтому зовём load() явно.
+        // Чуть-чуть ждём чтобы SSE может прилететь.
+        setTimeout(() => {
+          void load()
+        }, 300)
+        return
+      }
       setError(e instanceof Error ? e.message : String(e))
       await setMsReceiptStatus(receipt.id, 'failed').catch(() => undefined)
     } finally {

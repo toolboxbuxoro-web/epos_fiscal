@@ -74,7 +74,17 @@ export interface PoolItem {
  * во всех трёх стратегиях для всех позиций чека.
  */
 export async function loadMatcherPool(opts: MatcherOptions = {}): Promise<MatcherPool> {
-  const raw = await listEsfItems({ minAvailable: 1000, limit: 5000 })
+  const rawAll = await listEsfItems({ minAvailable: 1000, limit: 5000 })
+  // Исключаем server_item_id'ы которые сервер только что отказал — даже
+  // если локальный кэш ещё «думает» что они доступны (SSE не догнал).
+  // Без этого retry после 409 сразу попадает в тот же конфликт.
+  const excludeSet =
+    opts.excludeServerItemIds && opts.excludeServerItemIds.length > 0
+      ? new Set(opts.excludeServerItemIds)
+      : null
+  const raw = excludeSet
+    ? rawAll.filter((i) => i.server_item_id == null || !excludeSet.has(i.server_item_id))
+    : rawAll
   const markup = opts.markupPercent ?? DEFAULT_MARKUP
   const roundUp = opts.roundUpToSum ?? DEFAULT_ROUND_UP_SUM
   let minSellingPrice = Number.POSITIVE_INFINITY
