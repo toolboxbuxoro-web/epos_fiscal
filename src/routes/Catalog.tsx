@@ -1,12 +1,20 @@
 import { useEffect, useState } from 'react'
 import {
   countEsfItems,
+  getSetting,
   listEsfItems,
+  SettingKey,
   type EsfItemWithAvailable,
 } from '@/lib/db'
-import { Button } from '@/components/ui/Button'
+import { Button, Card, toast } from '@/components/ui'
 import { Input } from '@/components/ui/Input'
 import { ExcelImportDialog } from '@/components/ExcelImportDialog'
+import { CloudUpload, Loader2, TriangleAlert } from 'lucide-react'
+import {
+  getMigrationStats,
+  migrateLocalToServer,
+  type MigrationProgress,
+} from '@/lib/inventory'
 import {
   formatDate,
   milliQtyToDisplay,
@@ -20,17 +28,28 @@ export default function Catalog() {
   const [showImport, setShowImport] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  // Migration state
+  const [remoteEnabled, setRemoteEnabled] = useState(false)
+  const [unmigratedCount, setUnmigratedCount] = useState(0)
+  const [migrating, setMigrating] = useState(false)
+  const [migrationProgress, setMigrationProgress] = useState<MigrationProgress | null>(
+    null,
+  )
 
   async function load() {
     setLoading(true)
     setError(null)
     try {
-      const [rows, count] = await Promise.all([
+      const [rows, count, remote, stats] = await Promise.all([
         listEsfItems({ search: search || undefined, limit: 200 }),
         countEsfItems(),
+        getSetting(SettingKey.InventoryRemoteEnabled),
+        getMigrationStats(),
       ])
       setItems(rows)
       setTotal(count)
+      setRemoteEnabled(remote === 'true')
+      setUnmigratedCount(stats.unmigratedCount)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -41,6 +60,39 @@ export default function Catalog() {
   useEffect(() => {
     void load()
   }, [search])
+
+  async function startMigration() {
+    if (
+      !confirm(
+        `Перенести ${unmigratedCount} локальных приходов в общий пул на сервере?\n\n` +
+          `Это безопасно: повторный запуск не создаёт дубликаты, серверная сторона ` +
+          `дедупит по (ИКПУ + наименование + дата прихода). Если такой же приход уже ` +
+          `есть на сервере (например другой магазин уже его импортнул) — локальная ` +
+          `строка просто привяжется к существующей серверной.\n\n` +
+          `После миграции приходы перестанут импортироваться локально через Excel — ` +
+          `их будет загружать бухгалтер централизованно через mytoolbox админку.`,
+      )
+    ) {
+      return
+    }
+    setMigrating(true)
+    setMigrationProgress(null)
+    try {
+      const result = await migrateLocalToServer((p) => setMigrationProgress(p))
+      if (result.ok) {
+        toast.success(
+          `Миграция завершена: ${result.inserted} новых, ${result.skipped} уже было на сервере`,
+        )
+        await load() // обновим список + счётчики
+      } else {
+        toast.error(result.errorMessage ?? 'Миграция не завершилась')
+      }
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e))
+    } finally {
+      setMigrating(false)
+    }
+  }
 
   return (
     <div className="space-y-4">
@@ -58,6 +110,56 @@ export default function Catalog() {
         </div>
       </div>
 
+      {/* Migration banner — показывается когда remote включён И есть
+          непереданные локальные приходы. После миграции счётчик 0 → исчезает. */}
+      {remoteEnabled && unmigratedCount > 0 && (
+        <Card className="border-info/20 bg-info-soft">
+          <Card.Body className="flex items-start gap-3">
+            <CloudUpload size={18} className="text-info shrink-0 mt-0.5" />
+            <div className="flex-1 min-w-0">
+              <div className="text-body font-medium text-ink">
+                Локальные приходы можно перенести в общий пул
+              </div>
+              <div className="text-caption text-ink-muted mt-0.5">
+                {unmigratedCount} {unmigratedCount === 1 ? 'приход' : 'приходов'}{' '}
+                импортированы локально через Excel и пока не привязаны к серверу.
+                После переноса остатки будут синхронизироваться с другими магазинами.
+              </div>
+              {migrationProgress && (
+                <div className="mt-2 text-caption text-ink-muted">
+                  Перенесено: {migrationProgress.processed} из{' '}
+                  {migrationProgress.total} (новых: {migrationProgress.inserted}, уже было:{' '}
+                  {migrationProgress.skipped}, ошибок: {migrationProgress.errors})
+                </div>
+              )}
+            </div>
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={startMigration}
+              loading={migrating}
+              icon={!migrating ? <CloudUpload size={14} /> : undefined}
+            >
+              Перенести
+            </Button>
+          </Card.Body>
+        </Card>
+      )}
+
+      {/* Warning когда remote включён но локально импорт через Excel */}
+      {remoteEnabled && unmigratedCount === 0 && (
+        <Card className="border-warning/20 bg-warning-soft">
+          <Card.Body className="flex items-start gap-3 text-caption">
+            <TriangleAlert size={16} className="text-warning shrink-0 mt-0.5" />
+            <div className="text-ink">
+              <strong className="text-warning">Remote-режим активен.</strong>{' '}
+              Импорт Excel локально больше не используется — приходы загружает
+              бухгалтер централизованно через mytoolbox админку.
+            </div>
+          </Card.Body>
+        </Card>
+      )}
+
       <div className="flex items-center gap-3">
         <Input
           placeholder="Поиск по названию или штрих-коду…"
@@ -66,6 +168,12 @@ export default function Catalog() {
           className="max-w-md"
         />
         <span className="text-xs text-ink-muted">Всего записей: {total}</span>
+        {migrating && (
+          <span className="text-xs text-info inline-flex items-center gap-1">
+            <Loader2 size={12} className="animate-spin" />
+            Миграция…
+          </span>
+        )}
       </div>
 
       {error && (

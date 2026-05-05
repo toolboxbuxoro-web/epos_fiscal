@@ -45,3 +45,9 @@ export {
 } from './runtime'
 export { signInWithMs, signOut, hasActiveSession } from './login'
 export type { LoginErrorCode, LoginSuccess, LoginFailure } from './login'
+export {
+  migrateLocalToServer,
+  getMigrationStats,
+  type MigrationProgress,
+  type MigrationResult,
+} from './migrate'

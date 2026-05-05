@@ -186,3 +186,59 @@ export async function clearAllEsfItems(): Promise<number> {
   const result = await db.execute('DELETE FROM esf_items')
   return result.rowsAffected ?? 0
 }
+
+// ── Migration helpers ──────────────────────────────────────────────────
+
+/**
+ * Локальные приходы которые ещё НЕ перенесены в общий пул.
+ *
+ *   - source != 'remote' (из Excel/ЭСФ/didox, не пришедшие через sync)
+ *   - server_item_id IS NULL (нет связи с серверной строкой)
+ *   - available > 0 (зачем переносить уже использованные?)
+ *
+ * Используется migration-tool в Catalog UI.
+ */
+export async function listLocalUnmigrated(): Promise<EsfItemRow[]> {
+  const db = await getDb()
+  return db.select<EsfItemRow[]>(
+    `SELECT * FROM esf_items
+     WHERE server_item_id IS NULL
+       AND source != 'remote'
+       AND (qty_received - qty_consumed) > 0
+     ORDER BY received_at ASC`,
+  )
+}
+
+/** Сколько локальных непереданных. */
+export async function countLocalUnmigrated(): Promise<number> {
+  const db = await getDb()
+  const rows = await db.select<Array<{ c: number }>>(
+    `SELECT COUNT(*) AS c FROM esf_items
+     WHERE server_item_id IS NULL
+       AND source != 'remote'
+       AND (qty_received - qty_consumed) > 0`,
+  )
+  return rows[0]?.c ?? 0
+}
+
+/**
+ * Привязать локальную строку к id на сервере (после успешной миграции).
+ * Также обнуляем qty_consumed — потому что фактический остаток теперь живёт
+ * на сервере (мы отправили на сервер `qty_received - qty_consumed` как новый
+ * qty_received). Локальный qty_received → также синхронизируется в режиме
+ * remote через applyItemsUpdate, так что после миграции при первом SSE-event
+ * данные станут консистентны.
+ */
+export async function setServerItemId(
+  localId: number,
+  serverItemId: number,
+): Promise<void> {
+  const db = await getDb()
+  await db.execute(
+    `UPDATE esf_items
+       SET server_item_id = $1,
+           qty_consumed = 0
+     WHERE id = $2`,
+    [serverItemId, localId],
+  )
+}
