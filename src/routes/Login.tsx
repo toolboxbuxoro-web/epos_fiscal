@@ -6,6 +6,13 @@ import { getSetting, setSetting, SettingKey } from '@/lib/db'
 import { signInWithMs } from '@/lib/inventory'
 
 /**
+ * Дефолтный inventory-сервер. Фиксирован для нашей инсталляции — у всех
+ * 4 магазинов один общий backend на Railway. Магазин может переопределить
+ * вручную через кнопку «Сервер» (для dev или нестандартных deploy'ев).
+ */
+const DEFAULT_SERVER_URL = 'https://backend-production-c3d4.up.railway.app'
+
+/**
  * Login screen — единственный экран без Layout/Sidebar.
  *
  * Flow:
@@ -32,10 +39,16 @@ export default function Login() {
 
   useEffect(() => {
     void (async () => {
-      const url = await getSetting(SettingKey.InventoryServerUrl)
+      const stored = await getSetting(SettingKey.InventoryServerUrl)
       const lastLogin = await getSetting(SettingKey.MoyskladLogin)
-      setServerUrl(url || null)
-      setServerUrlDraft(url || '')
+      // Если URL не сохранён — подкладываем дефолт и сохраняем чтобы при
+      // следующем старте уже был. Кассиру вообще не нужно знать про сервер.
+      const url = stored || DEFAULT_SERVER_URL
+      if (!stored) {
+        await setSetting(SettingKey.InventoryServerUrl, DEFAULT_SERVER_URL)
+      }
+      setServerUrl(url)
+      setServerUrlDraft(url)
       if (lastLogin) setEmail(lastLogin)
     })()
   }, [])
