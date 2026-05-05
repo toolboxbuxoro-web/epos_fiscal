@@ -599,13 +599,13 @@ export default function Settings() {
     <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">Настройки</h1>
-        <p className="mt-1 text-sm text-slate-500">
+        <p className="mt-1 text-sm text-ink-muted">
           Подключения к МойСклад и EPOS Communicator, реквизиты компании.
         </p>
       </div>
 
       {form.testMode === 'true' && (
-        <div className="rounded-lg border-2 border-amber-400 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+        <div className="rounded-lg border-2 border-warning/20 bg-warning-soft px-4 py-3 text-sm text-warning">
           <strong>⚠️ Тестовый режим включён.</strong> При нажатии «Фискализировать»
           чек НЕ отправляется в ОФД ГНК — только проверяется подбор. Чтобы
           реально пробивать чеки — выключите ниже и сохраните.
@@ -623,7 +623,7 @@ export default function Settings() {
             <option value="false">Выключен (реальная фискализация в ОФД)</option>
             <option value="true">Включён (без отправки в Communicator)</option>
           </Select>
-          <div className="mt-1 text-xs text-slate-500">
+          <div className="mt-1 text-xs text-ink-muted">
             При включённом режиме UI ведёт себя как обычно (подбор работает,
             кнопка «Фискализировать» жмётся), но запрос в EPOS Communicator
             НЕ уходит. Никаких записей в ОФД, остатки не списываются, история
@@ -635,7 +635,7 @@ export default function Settings() {
 
       <Section title="Общий пул приходов (Inventory Server)">
         <div className="col-span-1 md:col-span-2 flex items-center justify-between gap-3 text-xs">
-          <div className="text-slate-600">
+          <div className="text-ink-muted">
             Если все магазины твоей сети используют общий пул приходов через
             mytoolbox-сервер — включи здесь и подключись. Тогда:
             <ul className="mt-1 ml-5 list-disc">
@@ -668,7 +668,7 @@ export default function Settings() {
             onChange={(e) => setField('invServerUrl', e.target.value)}
             placeholder="https://mytoolbox-backend.up.railway.app"
           />
-          <div className="mt-1 text-xs text-slate-500">
+          <div className="mt-1 text-xs text-ink-muted">
             Базовый URL mytoolbox backend. Без хвостового слэша.
           </div>
         </Field>
@@ -679,7 +679,7 @@ export default function Settings() {
             onChange={(e) => setField('invShopSlug', e.target.value)}
             placeholder="toolbox-honabod"
           />
-          <div className="mt-1 text-xs text-slate-500">
+          <div className="mt-1 text-xs text-ink-muted">
             Идентификатор магазина из админки (для логов; auth по API key).
           </div>
         </Field>
@@ -691,7 +691,7 @@ export default function Settings() {
             onChange={(e) => setField('invShopApiKey', e.target.value)}
             placeholder="epf_..."
           />
-          <div className="mt-1 text-xs text-slate-500">
+          <div className="mt-1 text-xs text-ink-muted">
             Выдаётся админом в mytoolbox при создании магазина (показывается один раз).
           </div>
         </Field>
@@ -715,13 +715,13 @@ export default function Settings() {
               Перечитать настройки от админа
             </Button>
           )}
-          <span className="text-xs text-slate-700">{invTestMsg}</span>
+          <span className="text-xs text-ink-muted">{invTestMsg}</span>
         </div>
       </Section>
 
       <Section title="МойСклад">
         {form.invRemoteEnabled === 'true' && (
-          <div className="col-span-1 md:col-span-2 rounded-md bg-slate-50 border border-slate-200 p-3 text-xs text-slate-700">
+          <div className="col-span-1 md:col-span-2 rounded-md bg-canvas border border-border p-3 text-xs text-ink-muted">
             🔒 Настройки управляются админом mytoolbox (поля только для чтения).
             Чтобы изменить — попроси админа обновить привязку магазина к МС-аккаунту,
             затем нажми <strong>«Перечитать настройки от админа»</strong> в секции выше.
@@ -762,15 +762,15 @@ export default function Settings() {
                 {authBusy ? 'Вход…' : 'Войти в МойСклад'}
               </Button>
               {authError && (
-                <span className="text-sm text-red-700">{authError}</span>
+                <span className="text-sm text-danger">{authError}</span>
               )}
             </div>
           </>
         ) : (
           <>
-            <div className="col-span-1 md:col-span-2 flex items-center justify-between rounded-md bg-emerald-50 p-3 text-sm">
+            <div className="col-span-1 md:col-span-2 flex items-center justify-between rounded-md bg-success-soft p-3 text-sm">
               <div>
-                <span className="text-emerald-700">Залогинен как</span>{' '}
+                <span className="text-success">Залогинен как</span>{' '}
                 <span className="font-medium">{form.moyskladLogin || 'пользователь'}</span>
               </div>
               {form.invRemoteEnabled !== 'true' && (
@@ -846,10 +846,10 @@ export default function Settings() {
             onChange={(e) => setField('eposCommunicatorUrl', e.target.value)}
             placeholder="http://localhost:3448/rpc/api"
           />
-          <div className="mt-1 text-xs text-slate-500">
-            Новый API (рекомендуется): <code className="bg-slate-100 px-1 rounded">http://localhost:3448/rpc/api</code>
+          <div className="mt-1 text-xs text-ink-muted">
+            Новый API (рекомендуется): <code className="bg-surface-hover px-1 rounded">http://localhost:3448/rpc/api</code>
             <br />
-            Старый API: <code className="bg-slate-100 px-1 rounded">http://localhost:8347/uzpos</code>
+            Старый API: <code className="bg-surface-hover px-1 rounded">http://localhost:8347/uzpos</code>
           </div>
         </Field>
         <Field label="Токен">
@@ -871,7 +871,7 @@ export default function Settings() {
           <Button variant="secondary" size="sm" onClick={testEpos}>
             Проверить подключение
           </Button>
-          <span className="text-xs text-slate-600">{eposTest}</span>
+          <span className="text-xs text-ink-muted">{eposTest}</span>
         </div>
       </Section>
 
@@ -910,7 +910,7 @@ export default function Settings() {
             value={form.matchToleranceTiyin}
             onChange={(e) => setField('matchToleranceTiyin', e.target.value)}
           />
-          <div className="mt-1 text-xs text-slate-500">
+          <div className="mt-1 text-xs text-ink-muted">
             Насколько может расходиться сумма подобранного товара с оригиналом.
             <br />
             <strong>100000</strong> = ±1 000 сум (рекомендуется),{' '}
@@ -951,7 +951,7 @@ export default function Settings() {
             value={form.markupPercent}
             onChange={(e) => setField('markupPercent', e.target.value)}
           />
-          <div className="mt-1 text-xs text-slate-500">
+          <div className="mt-1 text-xs text-ink-muted">
             К приходной цене из справочника добавляется эта наценка, потом
             начисляется НДС товара. По умолчанию <strong>10</strong>.
           </div>
@@ -963,13 +963,13 @@ export default function Settings() {
             value={form.roundUpToSum}
             onChange={(e) => setField('roundUpToSum', e.target.value)}
           />
-          <div className="mt-1 text-xs text-slate-500">
+          <div className="mt-1 text-xs text-ink-muted">
             Продажная цена округляется ВВЕРХ до этого шага.{' '}
             <strong>1000</strong> = 15 500 → 16 000, 667 450 → 668 000.{' '}
             <strong>100</strong> = до сотен. <strong>1</strong> = без округления.
           </div>
         </Field>
-        <div className="md:col-span-2 rounded-md bg-slate-50 p-3 text-xs text-slate-600">
+        <div className="md:col-span-2 rounded-md bg-canvas p-3 text-xs text-ink-muted">
           <strong>Формула:</strong> продажная_цена = round_up( приход × (1 +
           наценка/100) × (1 + НДС/100), шаг ).
           <br />
@@ -994,7 +994,7 @@ export default function Settings() {
               Выключена — итог может быть выше чека МС
             </option>
           </Select>
-          <div className="mt-1 text-xs text-slate-500">
+          <div className="mt-1 text-xs text-ink-muted">
             Из-за округления вверх продажная цена систематически выше
             оригинальной. Если включить — программа применит скидку на
             позиции чтобы итог совпал 1-в-1. Скидка не опускает цену
@@ -1012,7 +1012,7 @@ export default function Settings() {
             }
             disabled={form.discountForExactSum === 'false'}
           />
-          <div className="mt-1 text-xs text-slate-500">
+          <div className="mt-1 text-xs text-ink-muted">
             Сколько максимум разрешено скинуть на одну позицию (даже если
             себестоимость позволяет больше). По умолчанию <strong>2000</strong>.
           </div>
@@ -1045,7 +1045,7 @@ export default function Settings() {
               {printerLoading ? '…' : 'Обновить'}
             </Button>
           </div>
-          <div className="mt-1 text-xs text-slate-500">
+          <div className="mt-1 text-xs text-ink-muted">
             Список берётся из ОС. Если принтера нет — установите драйвер
             Xprinter (или Generic Text Only ESC/POS) и нажмите «Обновить».
           </div>
@@ -1063,7 +1063,7 @@ export default function Settings() {
               Печатать QR-код автоматически после успеха
             </option>
           </Select>
-          <div className="mt-1 text-xs text-slate-500">
+          <div className="mt-1 text-xs text-ink-muted">
             Сейчас печатается только QR-код фискального чека. Покупатель
             сканирует QR — открывается электронный чек на soliq.uz.
           </div>
@@ -1083,8 +1083,8 @@ export default function Settings() {
               <span
                 className={
                   printerTestMsg.startsWith('✓')
-                    ? 'text-xs text-emerald-700'
-                    : 'text-xs text-red-700'
+                    ? 'text-xs text-success'
+                    : 'text-xs text-danger'
                 }
               >
                 {printerTestMsg}
@@ -1099,25 +1099,25 @@ export default function Settings() {
           <Button variant="secondary" size="sm" onClick={checkUpdate}>
             Проверить обновления
           </Button>
-          <span className="text-xs text-slate-600">{updateMsg}</span>
+          <span className="text-xs text-ink-muted">{updateMsg}</span>
         </div>
-        <div className="col-span-1 md:col-span-2 text-xs text-slate-500">
+        <div className="col-span-1 md:col-span-2 text-xs text-ink-muted">
           Приложение само проверяет наличие новой версии при запуске.
           Кнопка выше делает это вручную.
         </div>
       </Section>
 
       {error && (
-        <div className="rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-800">
+        <div className="rounded-md border border-danger/20 bg-danger-soft p-3 text-sm text-danger">
           {error}
         </div>
       )}
 
-      <div className="flex items-center gap-3 border-t border-slate-200 pt-4">
+      <div className="flex items-center gap-3 border-t border-border pt-4">
         <Button variant="primary" disabled={busy} onClick={save}>
           {busy ? 'Сохранение…' : 'Сохранить остальные настройки'}
         </Button>
-        {saved && <span className="text-sm text-emerald-700">Сохранено</span>}
+        {saved && <span className="text-sm text-success">Сохранено</span>}
       </div>
     </div>
   )
@@ -1125,7 +1125,7 @@ export default function Settings() {
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <section className="rounded-lg border border-slate-200 bg-white p-5">
+    <section className="rounded-lg border border-border bg-surface p-5">
       <h2 className="mb-4 text-base font-semibold">{title}</h2>
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">{children}</div>
     </section>
@@ -1135,7 +1135,7 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="block text-sm">
-      <span className="mb-1 block text-xs font-medium text-slate-700">{label}</span>
+      <span className="mb-1 block text-xs font-medium text-ink-muted">{label}</span>
       {children}
     </label>
   )
@@ -1157,22 +1157,22 @@ function SseStatusBadge({
     connected: {
       dot: '🟢',
       label: 'Live',
-      cls: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+      cls: 'bg-success-soft text-success border-success/20',
     },
     connecting: {
       dot: '🟡',
       label: 'Подключаюсь…',
-      cls: 'bg-amber-50 text-amber-700 border-amber-200',
+      cls: 'bg-warning-soft text-warning border-warning/20',
     },
     disconnected: {
       dot: '🔴',
       label: 'Нет связи',
-      cls: 'bg-red-50 text-red-700 border-red-200',
+      cls: 'bg-danger-soft text-danger border-danger/20',
     },
     idle: {
       dot: '⚪',
       label: 'Не запущен',
-      cls: 'bg-slate-50 text-slate-500 border-slate-200',
+      cls: 'bg-canvas text-ink-muted border-border',
     },
   }
   const m = map[status]

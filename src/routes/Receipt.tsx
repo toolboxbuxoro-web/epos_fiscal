@@ -1,6 +1,17 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import {
+  AlertCircle,
+  ArrowLeft,
+  Banknote,
+  Check,
+  CreditCard,
+  QrCode,
+  Send,
+  SplitSquareHorizontal,
+  TriangleAlert,
+} from 'lucide-react'
+import {
   getDb,
   getMsReceipt,
   getSetting,
@@ -12,13 +23,21 @@ import type { MsReceiptRow } from '@/lib/db/types'
 import { buildMatch, extractPositions, type BuildMatchResult } from '@/lib/matcher'
 import { fiscalize } from '@/lib/epos'
 import { MoyskladClient, inlinePositions, type MsRetailDemand } from '@/lib/moysklad'
-import { Button } from '@/components/ui/Button'
+import {
+  Badge,
+  Button,
+  Card,
+  EmptyState,
+  PageHeader,
+  toast,
+} from '@/components/ui'
 import {
   formatDateTime,
   milliQtyToDisplay,
   tiyinToSumDisplay,
   tiyinToSumDisplayPrecise,
 } from '@/lib/format'
+import { cn } from '@/lib/cn'
 
 export default function Receipt() {
   const { id } = useParams<{ id: string }>()
@@ -40,11 +59,6 @@ export default function Receipt() {
     }
   }, [receipt])
 
-  /**
-   * Позиции исходного чека из МойСклад — независимо от matcher.
-   * Левая колонка экрана показывает что прислал МС, даже если автоподбор провалился.
-   * Идентифицируем замэтченные через Set индексов из match.positions.
-   */
   const sourcePositions = useMemo(() => {
     if (!rd) return []
     return extractPositions(rd)
@@ -56,15 +70,8 @@ export default function Receipt() {
   }, [match])
 
   /**
-   * Тип оплаты из МойСклад. Бейдж показывает кассиру что МС прислал ДО
-   * нажатия «Фискализировать». Логика выбора:
-   *   - все три (cash/noCash/qr) > 0 — таких в природе не бывает, но если
-   *     случайно: считаем смешанной
-   *   - cash > 0 И (noCash > 0 ИЛИ qr > 0) → mixed
-   *   - только qr → 'qr'
-   *   - только noCash → 'card'
-   *   - только cash → 'cash'
-   *   - все нули → null (странный чек, fiscalize fallback на нал)
+   * Тип оплаты из МойСклад — для бейджа над заголовком.
+   * См. подробное описание правил в коммитах прошлых релизов.
    */
   const paymentKind = useMemo<
     null | 'cash' | 'card' | 'qr' | 'mixed'
@@ -98,9 +105,8 @@ export default function Receipt() {
 
       let parsed = JSON.parse(r.raw_json) as MsRetailDemand
 
-      // МойСклад в list-запросе не отдаёт inline positions.
-      // Если их нет — делаем одиночный запрос с expand (там работает),
-      // обновляем raw_json в БД, чтобы повторно не дёргать.
+      // МС в list-запросе не отдаёт inline positions. Если их нет —
+      // одиночный GET с expand, обновляем raw_json в БД.
       if (!inlinePositions(parsed)) {
         const basic = await getSetting(SettingKey.MoyskladCredentials)
         const token = basic ? null : await getSetting(SettingKey.MoyskladToken)
@@ -117,22 +123,13 @@ export default function Receipt() {
               [newRawJson, now(), r.id],
             )
             parsed = full
-            // ВАЖНО: state receipt тоже надо обновить — иначе useMemo для `rd`
-            // и `sourcePositions` пересчитаются из старого raw_json и левая
-            // колонка останется пустой, хотя matcher уже видит позиции.
             setReceipt({ ...r, raw_json: newRawJson })
           } catch (fetchErr) {
-            // Не критично — продолжим без позиций, покажем варнинг.
             console.warn('Не удалось дозагрузить позиции чека:', fetchErr)
           }
         }
       }
 
-      // Дефолт допуска — 100 000 тийинов = 1 000 сум.
-      // На реальных чеках цены в МС vs приходах часто расходятся на копейки/рубли
-      // из-за округлений, дробных скидок, разных курсов конвертации.
-      // С tolerance=0 матчер отказывается даже на разнице в 1 сум, что абсурдно.
-      // Кассир может настроить точнее в разделе «Настройки».
       const DEFAULT_TOLERANCE_TIYIN = 100_000
       const tolStr = await getSetting(SettingKey.MatchToleranceTiyin)
       const tolerance =
@@ -140,10 +137,6 @@ export default function Receipt() {
           ? Number.parseInt(tolStr, 10) || 0
           : DEFAULT_TOLERANCE_TIYIN
 
-      // Параметры ценообразования: наценка (по умолчанию 10%) + округление
-      // продажной цены вверх до шага (по умолчанию 1000 сум).
-      // Matcher применяет их к каждому товару из справочника, чтобы сравнить
-      // с суммой чека МС по продажной (а не приходной) цене.
       const markupStr = await getSetting(SettingKey.MarkupPercent)
       const markupPercent =
         markupStr != null && markupStr !== ''
@@ -155,12 +148,6 @@ export default function Receipt() {
           ? Number.parseInt(roundStr, 10) || 0
           : 1000
 
-      // Опции скидки для точной суммы — distributeDiscount применит после
-      // основного цикла стратегий, чтобы Jami совпал с rd.sum.
-      // ВАЖНО: дефолт = true (включено) если в БД ничего не сохранено.
-      // Если по getSetting вернётся null (новая Win-машина или новый параметр) —
-      // считаем включённым, иначе скидка не работала бы пока кассир не зашёл
-      // в Settings и не нажал «Сохранить».
       const discRaw = await getSetting(SettingKey.DiscountForExactSum)
       const discountEnabled = discRaw == null ? true : discRaw === 'true'
       const maxDiscStr = await getSetting(SettingKey.MaxDiscountPerItemSum)
@@ -179,7 +166,6 @@ export default function Receipt() {
       })
       setMatch(result)
 
-      // Прочитаем тестовый режим — для UI-баннера и текста кнопки.
       const test = (await getSetting(SettingKey.TestMode)) === 'true'
       setTestMode(test)
     } catch (e) {
@@ -195,26 +181,19 @@ export default function Receipt() {
     setError(null)
     try {
       const result = await fiscalize(match, { msReceiptId: receipt.id })
-      // Тестовый режим: fiscalize возвращает фейковые TerminalID/FiscalSign
-      // и НЕ создаёт fiscal_receipt в БД. Показываем сухой отчёт + остаёмся
-      // на этом же экране (а не уходим в Историю — там этого чека нет).
       if (testMode) {
         const total = match.matchedTotalTiyin / 100
         const itemsCount = match.positions.reduce(
           (s, p) => s + p.candidates.length,
           0,
         )
-        alert(
-          `ТЕСТОВЫЙ РЕЖИМ\n\n` +
-            `Чек НЕ отправлен в ОФД ГНК.\n` +
-            `Подбор: ${itemsCount} позиций на ${total.toLocaleString('ru-RU')} сум.\n\n` +
-            `Чтобы пробивать реально — выключите тестовый режим в Настройках.`,
+        toast.success(
+          `Тестовый режим: подбор готов на ${total.toLocaleString('ru-RU')} сум, ${itemsCount} позиций`,
+          { duration: 5000 },
         )
         return
       }
-      alert(
-        `Чек фискализирован\n\nFiscal sign: ${result.fiscal.FiscalSign}\nQR: ${result.fiscal.QRCodeURL}`,
-      )
+      toast.success(`Чек фискализирован: ${result.fiscal.FiscalSign}`)
       nav('/history')
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -225,70 +204,96 @@ export default function Receipt() {
   }
 
   if (busy && !receipt) {
-    return <div className="text-sm text-slate-500">Загрузка…</div>
+    return (
+      <Card>
+        <Card.Body>
+          <div className="text-body text-ink-muted">Загрузка чека…</div>
+        </Card.Body>
+      </Card>
+    )
   }
 
   if (error && !receipt) {
     return (
-      <div className="rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-800">
-        {error}
-      </div>
+      <Card>
+        <Card.Body>
+          <EmptyState
+            icon={<AlertCircle size={36} />}
+            title="Чек не найден"
+            description={error}
+            action={
+              <Button onClick={() => nav('/')} icon={<ArrowLeft size={14} />}>
+                К списку
+              </Button>
+            }
+          />
+        </Card.Body>
+      </Card>
     )
   }
 
   if (!receipt || !rd || !match) return null
 
   return (
-    <div className="space-y-4">
-      <div className="flex items-end justify-between">
-        <div>
-          <div className="flex items-center gap-3">
-            <h1 className="text-2xl font-semibold tracking-tight">
-              Сборка чека {receipt.ms_name ?? `#${receipt.id}`}
-            </h1>
-            {paymentKind && (
-              <PaymentBadge
-                kind={paymentKind}
-                cashSum={rd.cashSum ?? 0}
-                cardSum={rd.noCashSum ?? 0}
-                qrSum={rd.qrSum ?? 0}
-              />
-            )}
+    <div className="space-y-6">
+      <PageHeader
+        title={`Чек ${receipt.ms_name ?? `#${receipt.id}`}`}
+        subtitle={`${formatDateTime(receipt.ms_moment)} · оригинал из МойСклад`}
+        action={
+          <div className="flex gap-2">
+            <Button
+              variant="ghost"
+              onClick={() => nav('/')}
+              icon={<ArrowLeft size={14} />}
+            >
+              Назад
+            </Button>
+            <Button
+              variant="primary"
+              loading={fiscalizing}
+              disabled={fiscalizing || match.positions.length === 0}
+              onClick={doFiscalize}
+              icon={!fiscalizing ? <Send size={14} /> : undefined}
+            >
+              {testMode ? 'Тестовая фискализация' : 'Фискализировать'}
+            </Button>
           </div>
-          <p className="mt-1 text-sm text-slate-500">
-            {formatDateTime(receipt.ms_moment)} · оригинал из МойСклад
-          </p>
-        </div>
-        <div className="flex gap-2">
-          <Button variant="ghost" onClick={() => nav('/')}>
-            ← Назад
-          </Button>
-          <Button
-            variant="primary"
-            disabled={fiscalizing || match.positions.length === 0}
-            onClick={doFiscalize}
-          >
-            {fiscalizing
-              ? 'Отправка…'
-              : testMode
-                ? 'Тестовая фискализация (без ОФД)'
-                : 'Фискализировать через EPOS'}
-          </Button>
-        </div>
-      </div>
+        }
+      />
 
-      {testMode && (
-        <div className="rounded-md border border-amber-400 bg-amber-50 px-3 py-2 text-sm text-amber-900">
-          ⚠️ <strong>Тестовый режим.</strong> Фискализация будет имитирована —
-          в ОФД ничего не уйдёт. Чтобы пробивать реально, выключите режим в
-          Настройках.
+      {/* Payment badge — отдельной строкой */}
+      {paymentKind && (
+        <div>
+          <PaymentBadge
+            kind={paymentKind}
+            cashSum={rd.cashSum ?? 0}
+            cardSum={rd.noCashSum ?? 0}
+            qrSum={rd.qrSum ?? 0}
+          />
         </div>
       )}
 
+      {testMode && (
+        <Card className="border-warning/20 bg-warning-soft">
+          <Card.Body className="flex items-start gap-3">
+            <TriangleAlert size={18} className="text-warning shrink-0 mt-0.5" />
+            <div className="text-body text-ink">
+              <strong className="text-warning">Тестовый режим включён.</strong>{' '}
+              Фискализация будет имитирована, в ОФД ничего не уйдёт. Чтобы
+              пробивать реально — выключите режим в{' '}
+              <em className="not-italic font-medium">Admin → Настройки</em>.
+            </div>
+          </Card.Body>
+        </Card>
+      )}
+
       {error && (
-        <div className="rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-800">
-          {error}
-        </div>
+        <Card className="border-danger/20 bg-danger-soft">
+          <Card.Body className="flex items-start gap-3">
+            <AlertCircle size={18} className="text-danger shrink-0 mt-0.5" />
+            <div className="text-body text-danger">{error}</div>
+          </Card.Body>
+        </Card>
       )}
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
@@ -306,7 +311,7 @@ export default function Receipt() {
         </Side>
 
         <Side
-          title={`Подбор (${strategyLabel(match.overallStrategy)})`}
+          title={`Подбор: ${strategyLabel(match.overallStrategy)}`}
           sumTiyin={match.matchedTotalTiyin}
           sumDiff={match.totalDiffTiyin}
         >
@@ -315,9 +320,7 @@ export default function Receipt() {
               pm.candidates.map((c) => ({
                 name: c.esfItem.name,
                 quantity: c.quantity,
-                // К оплате — с учётом скидки (Selling - Discount).
                 total: c.priceTiyin - c.discountTiyin,
-                // Если скидка > 0, передаём её в таблицу для отдельной строки.
                 discount: c.discountTiyin > 0 ? c.discountTiyin : undefined,
                 originalPrice: c.discountTiyin > 0 ? c.priceTiyin : undefined,
                 vatPercent: c.esfItem.vat_percent,
@@ -330,14 +333,24 @@ export default function Receipt() {
       </div>
 
       {match.warnings.length > 0 && (
-        <section className="rounded-lg border border-amber-200 bg-amber-50 p-4">
-          <h3 className="mb-2 text-sm font-medium text-amber-900">Предупреждения</h3>
-          <ul className="space-y-1 text-xs text-amber-900">
-            {match.warnings.map((w, i) => (
-              <li key={i}>• {w}</li>
-            ))}
-          </ul>
-        </section>
+        <Card className="border-warning/20 bg-warning-soft">
+          <Card.Header className="border-warning/20">
+            <div className="flex items-center gap-2">
+              <TriangleAlert size={16} className="text-warning" />
+              <Card.Title className="text-warning">Предупреждения</Card.Title>
+            </div>
+          </Card.Header>
+          <Card.Body>
+            <ul className="space-y-1.5 text-body text-ink">
+              {match.warnings.map((w, i) => (
+                <li key={i} className="flex gap-2">
+                  <span className="text-warning shrink-0">·</span>
+                  <span>{w}</span>
+                </li>
+              ))}
+            </ul>
+          </Card.Body>
+        </Card>
       )}
     </div>
   )
@@ -357,96 +370,105 @@ function strategyLabel(s: string): string {
 interface DisplayPosition {
   name: string
   quantity: number
-  /** Итоговая сумма за позицию (К ОПЛАТЕ, после скидки если была). */
+  /** К оплате после скидки. */
   total: number
-  /** Размер скидки в тийинах, если была применена. undefined если нет. */
+  /** Размер скидки в тийинах, если применена. */
   discount?: number
-  /** Цена ДО скидки, чтобы показать «было/стало». undefined если скидки нет. */
+  /** Цена ДО скидки — для отображения «было/стало». */
   originalPrice?: number
   vatPercent: number
   meta: string
-  /**
-   * Для левой колонки (исходник МС): true если позицию удалось замэтчить.
-   * Для правой колонки (подбор) — всегда true.
-   * Используется для подсветки и индикатора ✓/✗.
-   */
   matched: boolean
 }
 
 function PositionsTable({ positions }: { positions: DisplayPosition[] }) {
   if (positions.length === 0) {
     return (
-      <div className="px-4 py-6 text-center text-sm text-slate-500">
+      <div className="px-5 py-8 text-center text-body text-ink-muted">
         Нет позиций
       </div>
     )
   }
   return (
-    <table className="min-w-full divide-y divide-slate-200 text-sm">
-      <thead className="bg-slate-50/80">
+    <table className="w-full text-body">
+      <thead className="border-b border-border bg-canvas">
         <tr>
-          <th className="w-6 px-2 py-2"></th>
-          <th className="px-3 py-2 text-left text-xs font-medium text-slate-600">
+          <th className="w-10 px-3 py-2.5"></th>
+          <th className="px-3 py-2.5 text-left text-caption font-medium text-ink-muted uppercase tracking-wide">
             Товар
           </th>
-          <th className="px-3 py-2 text-right text-xs font-medium text-slate-600">
+          <th className="px-3 py-2.5 text-right text-caption font-medium text-ink-muted uppercase tracking-wide">
             Кол-во
           </th>
-          <th className="px-3 py-2 text-right text-xs font-medium text-slate-600">
+          <th className="px-3 py-2.5 text-right text-caption font-medium text-ink-muted uppercase tracking-wide">
             Сумма
           </th>
         </tr>
       </thead>
-      <tbody className="divide-y divide-slate-100">
+      <tbody>
         {positions.map((p, i) => (
-          <tr key={i} className={p.matched ? '' : 'bg-amber-50/60'}>
-            <td className="w-6 px-2 py-2 text-center align-top">
-              {p.matched ? (
-                <span
-                  className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-emerald-100 text-xs font-semibold text-emerald-700"
-                  title="Подобрано"
-                >
-                  ✓
-                </span>
-              ) : (
-                <span
-                  className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-amber-100 text-xs font-semibold text-amber-700"
-                  title="Не подобрано"
-                >
-                  ✗
-                </span>
-              )}
+          <tr
+            key={i}
+            className={cn(
+              'border-b border-border last:border-0',
+              !p.matched && 'bg-warning-soft/40',
+            )}
+          >
+            <td className="w-10 px-3 py-3 text-center align-top">
+              <MatchIcon matched={p.matched} />
             </td>
-            <td className="px-3 py-2">
-              <div className="font-medium text-slate-900">{p.name}</div>
-              <div className="font-mono text-xs text-slate-500">
+            <td className="px-3 py-3">
+              <div className="font-medium text-ink">{p.name}</div>
+              <div className="font-mono text-caption text-ink-subtle mt-0.5">
                 {p.meta} · НДС {p.vatPercent}%
               </div>
             </td>
-            <td className="px-3 py-2 text-right tabular-nums">
+            <td className="px-3 py-3 text-right tabular-nums text-ink-muted">
               {milliQtyToDisplay(p.quantity)}
             </td>
-            <td className="px-3 py-2 text-right tabular-nums">
+            <td className="px-3 py-3 text-right tabular-nums">
               {p.discount && p.originalPrice ? (
                 <div className="space-y-0.5">
-                  <div className="text-xs text-slate-400 line-through">
+                  <div className="text-caption text-ink-subtle line-through">
                     {tiyinToSumDisplayPrecise(p.originalPrice)}
                   </div>
-                  <div className="text-xs text-rose-600">
-                    −{tiyinToSumDisplayPrecise(p.discount)} скидка
+                  <div className="text-caption text-danger">
+                    −{tiyinToSumDisplayPrecise(p.discount)}
                   </div>
-                  <div className="font-medium">
+                  <div className="font-medium text-ink">
                     {tiyinToSumDisplayPrecise(p.total)}
                   </div>
                 </div>
               ) : (
-                tiyinToSumDisplayPrecise(p.total)
+                <span className="text-ink">{tiyinToSumDisplayPrecise(p.total)}</span>
               )}
             </td>
           </tr>
         ))}
       </tbody>
     </table>
+  )
+}
+
+/** Иконка статуса подбора позиции — заменяет ✓/✗. */
+function MatchIcon({ matched }: { matched: boolean }) {
+  if (matched) {
+    return (
+      <span
+        className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-success-soft text-success"
+        title="Подобрано"
+      >
+        <Check size={12} strokeWidth={3} />
+      </span>
+    )
+  }
+  return (
+    <span
+      className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-warning-soft text-warning"
+      title="Не подобрано"
+    >
+      <TriangleAlert size={11} />
+    </span>
   )
 }
 
@@ -459,38 +481,36 @@ interface SideProps {
 
 function Side({ title, sumTiyin, sumDiff, children }: SideProps) {
   return (
-    <section className="overflow-hidden rounded-lg border border-slate-200 bg-white">
-      <header className="flex items-center justify-between border-b border-slate-200 bg-slate-50 px-4 py-3">
-        <h2 className="text-sm font-semibold">{title}</h2>
-        <div className="text-right">
-          <div className="text-xs text-slate-500">Итого</div>
-          <div className="text-sm font-semibold tabular-nums">
-            {tiyinToSumDisplay(sumTiyin)} сум
-          </div>
-          {sumDiff !== undefined && sumDiff !== 0 && (
-            <div
-              className={`text-xs tabular-nums ${
-                sumDiff > 0 ? 'text-amber-600' : 'text-blue-600'
-              }`}
-            >
-              {sumDiff > 0 ? '+' : ''}
-              {tiyinToSumDisplayPrecise(sumDiff)}
+    <Card className="overflow-hidden">
+      <Card.Header className="bg-canvas">
+        <Card.Title className="text-body">{title}</Card.Title>
+        <Card.HeaderAction>
+          <div className="text-right">
+            <div className="text-caption text-ink-muted">Итого</div>
+            <div className="text-body font-semibold tabular-nums text-ink">
+              {tiyinToSumDisplay(sumTiyin)} сум
             </div>
-          )}
-        </div>
-      </header>
+            {sumDiff !== undefined && sumDiff !== 0 && (
+              <div
+                className={cn(
+                  'text-caption tabular-nums',
+                  sumDiff > 0 ? 'text-warning' : 'text-info',
+                )}
+              >
+                {sumDiff > 0 ? '+' : ''}
+                {tiyinToSumDisplayPrecise(sumDiff)}
+              </div>
+            )}
+          </div>
+        </Card.HeaderAction>
+      </Card.Header>
       {children}
-    </section>
+    </Card>
   )
 }
 
 /**
- * Бейдж типа оплаты — показывается рядом с заголовком чека.
- *
- * Показывает кассиру что МС прислал ДО клика «Фискализировать» вместе
- * с конкретными суммами в каждом канале оплаты. Для смешанной видны
- * все три суммы (нал/карта/QR), кассир сразу видит сколько чем заплатили
- * и в каких пропорциях это уйдёт в ReceivedCash/ReceivedCard.
+ * Бейдж типа оплаты — рядом с заголовком чека. Показывает суммы по каналам.
  */
 function PaymentBadge({
   kind,
@@ -503,48 +523,33 @@ function PaymentBadge({
   cardSum: number
   qrSum: number
 }) {
-  const styles = {
-    cash: {
-      icon: '💵',
-      cls: 'bg-emerald-100 text-emerald-800 border-emerald-300',
-    },
-    card: {
-      icon: '💳',
-      cls: 'bg-blue-100 text-blue-800 border-blue-300',
-    },
-    qr: {
-      icon: '📱',
-      cls: 'bg-violet-100 text-violet-800 border-violet-300',
-    },
-    mixed: {
-      icon: '🔀',
-      cls: 'bg-orange-100 text-orange-800 border-orange-300',
-    },
+  const config = {
+    cash: { Icon: Banknote, variant: 'success' as const },
+    card: { Icon: CreditCard, variant: 'info' as const },
+    qr: { Icon: QrCode, variant: 'info' as const },
+    mixed: { Icon: SplitSquareHorizontal, variant: 'warning' as const },
   }[kind]
 
-  // Собираем строку «Нал X + Карта Y + QR Z» для смешанной;
-  // для одиночных — только сумму этого канала.
   const parts: string[] = []
   if (kind === 'mixed') {
     if (cashSum > 0) parts.push(`нал ${tiyinToSumDisplay(cashSum)}`)
     if (cardSum > 0) parts.push(`карта ${tiyinToSumDisplay(cardSum)}`)
     if (qrSum > 0) parts.push(`QR ${tiyinToSumDisplay(qrSum)}`)
   } else if (kind === 'cash') {
-    parts.push(`Наличные ${tiyinToSumDisplay(cashSum)} сум`)
+    parts.push(`Наличные ${tiyinToSumDisplay(cashSum)}`)
   } else if (kind === 'card') {
-    parts.push(`Карта ${tiyinToSumDisplay(cardSum)} сум`)
+    parts.push(`Карта ${tiyinToSumDisplay(cardSum)}`)
   } else if (kind === 'qr') {
-    parts.push(`QR ${tiyinToSumDisplay(qrSum)} сум`)
+    parts.push(`QR ${tiyinToSumDisplay(qrSum)}`)
   }
-  const label = parts.join(' + ') + (kind === 'mixed' ? ' сум' : '')
 
   return (
-    <span
-      className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-0.5 text-xs font-medium ${styles.cls}`}
-      title="Тип оплаты из МойСклад"
+    <Badge
+      variant={config.variant}
+      icon={<config.Icon size={14} />}
+      className="text-body py-1 px-2.5"
     >
-      <span>{styles.icon}</span>
-      <span className="tabular-nums">{label}</span>
-    </span>
+      <span className="tabular-nums">{parts.join(' + ')} сум</span>
+    </Badge>
   )
 }

@@ -43,3 +43,5 @@ export {
   stopInventoryRuntime,
   getInventorySseStatus,
 } from './runtime'
+export { signInWithMs, signOut, hasActiveSession } from './login'
+export type { LoginErrorCode, LoginSuccess, LoginFailure } from './login'

@@ -1,7 +1,7 @@
 {
   "name": "epos-fiscal",
   "private": true,
-  "version": "0.8.1",
+  "version": "0.9.0",
   "type": "module",
   "description": "Помощник кассира: автоподбор чеков с налоговыми приходами и фискализация через EPOS Communicator",
   "scripts": {
@@ -19,9 +19,13 @@
     "@tauri-apps/plugin-process": "^2.2.0",
     "@tauri-apps/plugin-sql": "^2.2.0",
     "@tauri-apps/plugin-updater": "^2.3.0",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.468.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "react-hot-toast": "^2.6.0",
     "react-router-dom": "^6.28.0",
+    "tailwind-merge": "^2.5.5",
     "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   },
   "devDependencies": {

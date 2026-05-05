@@ -1,37 +1,74 @@
-import type { ButtonHTMLAttributes } from 'react'
+import { forwardRef, type ButtonHTMLAttributes, type ReactNode } from 'react'
+import { Loader2 } from 'lucide-react'
+import { cn } from '@/lib/cn'
 
 type Variant = 'primary' | 'secondary' | 'ghost' | 'danger'
-type Size = 'sm' | 'md'
+type Size = 'sm' | 'md' | 'lg'
 
 interface Props extends ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: Variant
   size?: Size
+  /** Показать spinner и заблокировать клики. */
+  loading?: boolean
+  /** Иконка слева от текста (16px Lucide рекомендуется). */
+  icon?: ReactNode
+  /** Иконка справа. */
+  iconRight?: ReactNode
 }
 
 const variants: Record<Variant, string> = {
-  primary: 'bg-slate-900 text-white hover:bg-slate-800 disabled:bg-slate-300',
+  primary:
+    'bg-primary text-ink-inverse hover:bg-primary-hover disabled:bg-ink-subtle disabled:text-ink-inverse',
   secondary:
-    'bg-white text-slate-900 border border-slate-300 hover:bg-slate-50 disabled:opacity-50',
-  ghost: 'bg-transparent text-slate-700 hover:bg-slate-100 disabled:opacity-50',
+    'bg-surface text-ink border border-border hover:bg-surface-hover disabled:opacity-50',
+  ghost:
+    'bg-transparent text-ink-muted hover:bg-surface-hover hover:text-ink disabled:opacity-50',
   danger:
-    'bg-red-600 text-white hover:bg-red-700 disabled:bg-red-300',
+    'bg-danger text-ink-inverse hover:opacity-90 disabled:opacity-50',
 }
 
 const sizes: Record<Size, string> = {
-  sm: 'h-8 px-3 text-xs',
-  md: 'h-9 px-4 text-sm',
+  sm: 'h-8 px-3 text-caption gap-1.5',
+  md: 'h-9 px-4 text-body gap-2',
+  lg: 'h-11 px-5 text-body gap-2',
 }
 
-export function Button({
-  variant = 'secondary',
-  size = 'md',
-  className = '',
-  ...rest
-}: Props) {
+export const Button = forwardRef<HTMLButtonElement, Props>(function Button(
+  {
+    variant = 'secondary',
+    size = 'md',
+    loading = false,
+    icon,
+    iconRight,
+    className,
+    disabled,
+    children,
+    ...rest
+  },
+  ref,
+) {
+  const isDisabled = disabled || loading
   return (
     <button
-      className={`inline-flex items-center justify-center rounded-md font-medium transition disabled:cursor-not-allowed ${variants[variant]} ${sizes[size]} ${className}`}
+      ref={ref}
+      disabled={isDisabled}
+      className={cn(
+        'inline-flex items-center justify-center rounded-md font-medium transition-colors',
+        'disabled:cursor-not-allowed',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-canvas',
+        variants[variant],
+        sizes[size],
+        className,
+      )}
       {...rest}
-    />
+    >
+      {loading ? (
+        <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+      ) : (
+        icon && <span className="shrink-0">{icon}</span>
+      )}
+      {children}
+      {!loading && iconRight && <span className="shrink-0">{iconRight}</span>}
+    </button>
   )
-}
+})

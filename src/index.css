@@ -2,6 +2,69 @@
 @tailwind components;
 @tailwind utilities;
 
+/*
+ * Design tokens — CSS variables.
+ * Используются в tailwind.config.ts через rgb(var(--…) / <alpha>).
+ *
+ * Light theme (по умолчанию).
+ * Dark theme через `.dark` класс на <html> (Phase D добавим тоггл, пока off).
+ */
+:root {
+  /* Neutral surfaces */
+  --canvas: 250 250 250;          /* #fafafa — фон страницы */
+  --surface: 255 255 255;         /* #ffffff — фон карточек */
+  --surface-hover: 244 244 245;   /* #f4f4f5 — hover на табах/строках */
+  --border: 228 228 231;          /* #e4e4e7 — линии/обводки */
+  --border-strong: 212 212 216;   /* #d4d4d8 — focus rings */
+
+  /* Text */
+  --ink: 9 9 11;                  /* #09090b — primary */
+  --ink-muted: 113 113 122;       /* #71717a — secondary */
+  --ink-subtle: 161 161 170;      /* #a1a1aa — placeholder/hint */
+  --ink-inverse: 250 250 250;     /* #fafafa — на тёмных кнопках */
+
+  /* Primary brand (нейтральный почти-чёрный — банковский стиль) */
+  --primary: 24 24 27;            /* #18181b */
+  --primary-hover: 39 39 42;      /* #27272a */
+  --primary-soft: 244 244 245;    /* #f4f4f5 — для tonal buttons */
+
+  /* Semantic statuses */
+  --success: 22 163 74;           /* #16a34a */
+  --success-soft: 240 253 244;    /* #f0fdf4 */
+  --warning: 217 119 6;            /* #d97706 */
+  --warning-soft: 255 251 235;    /* #fffbeb */
+  --danger: 220 38 38;             /* #dc2626 */
+  --danger-soft: 254 242 242;     /* #fef2f2 */
+  --info: 37 99 235;               /* #2563eb */
+  --info-soft: 239 246 255;       /* #eff6ff */
+}
+
+.dark {
+  --canvas: 9 9 11;
+  --surface: 24 24 27;
+  --surface-hover: 39 39 42;
+  --border: 39 39 42;
+  --border-strong: 63 63 70;
+
+  --ink: 250 250 250;
+  --ink-muted: 161 161 170;
+  --ink-subtle: 113 113 122;
+  --ink-inverse: 9 9 11;
+
+  --primary: 250 250 250;
+  --primary-hover: 244 244 245;
+  --primary-soft: 39 39 42;
+
+  --success: 34 197 94;
+  --success-soft: 20 83 45;
+  --warning: 245 158 11;
+  --warning-soft: 120 53 15;
+  --danger: 239 68 68;
+  --danger-soft: 127 29 29;
+  --info: 59 130 246;
+  --info-soft: 30 58 138;
+}
+
 @layer base {
   html,
   body,
@@ -9,7 +72,33 @@
     height: 100%;
   }
   body {
-    @apply bg-slate-50 text-slate-900 antialiased;
+    @apply bg-canvas text-ink antialiased font-sans;
+    /* Tabular figures для денежных значений в таблицах */
     font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  }
+
+  /* Sensible focus rings для accessibility */
+  *:focus-visible {
+    outline: 2px solid rgb(var(--primary));
+    outline-offset: 2px;
+  }
+}
+
+/* Scrollbar — тонкий, не отвлекает */
+@layer utilities {
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(var(--border-strong)) transparent;
+  }
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: rgb(var(--border-strong));
+    border-radius: 4px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: transparent;
   }
 }

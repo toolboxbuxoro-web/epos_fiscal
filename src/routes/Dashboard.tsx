@@ -1,5 +1,12 @@
-import { useEffect, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { useEffect, useMemo, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+import {
+  ArrowRight,
+  Receipt as ReceiptIcon,
+  RefreshCcw,
+  Wifi,
+  WifiOff,
+} from 'lucide-react'
 import {
   countMsReceiptsByStatus,
   listMsReceipts,
@@ -11,7 +18,35 @@ import {
   subscribePollerStatus,
 } from '@/lib/poller-runtime'
 import type { PollerStatus } from '@/lib/moysklad/poller'
+import { useShiftStatus } from '@/lib/moysklad'
 import { formatDateTime, tiyinToSumDisplay } from '@/lib/format'
+import {
+  Badge,
+  Button,
+  Card,
+  DataTable,
+  EmptyState,
+  PageHeader,
+  StatusBadge,
+  type Column,
+} from '@/components/ui'
+import { cn } from '@/lib/cn'
+
+/**
+ * Достать UUID активной смены из MsRetailDemand.raw_json.
+ * Парсим лениво и кэшируем — так дешевле чем JSON1 в SQLite.
+ */
+function getShiftIdFromRawJson(raw: string): string | null {
+  try {
+    const parsed = JSON.parse(raw) as { retailShift?: { meta?: { href?: string } } }
+    const href = parsed?.retailShift?.meta?.href
+    if (typeof href !== 'string') return null
+    const idx = href.lastIndexOf('/')
+    return idx >= 0 ? href.slice(idx + 1) : null
+  } catch {
+    return null
+  }
+}
 
 const STATUS_FILTERS: { value: MsReceiptStatus | 'all'; label: string }[] = [
   { value: 'pending', label: 'Ожидают' },
@@ -21,8 +56,25 @@ const STATUS_FILTERS: { value: MsReceiptStatus | 'all'; label: string }[] = [
   { value: 'all', label: 'Все' },
 ]
 
+const STATUS_TO_BADGE: Record<
+  MsReceiptStatus,
+  { label: string; status: 'pending' | 'info' | 'success' | 'error' | 'warning' | 'neutral' }
+> = {
+  pending: { label: 'Ожидает', status: 'pending' },
+  matched: { label: 'Подобран', status: 'info' },
+  fiscalized: { label: 'Готов', status: 'success' },
+  failed: { label: 'Ошибка', status: 'error' },
+  manual: { label: 'Ручной', status: 'warning' },
+  skipped: { label: 'Пропущен', status: 'neutral' },
+}
+
+type Scope = 'shift' | 'all'
+
 export default function Dashboard() {
+  const navigate = useNavigate()
   const [filter, setFilter] = useState<MsReceiptStatus | 'all'>('pending')
+  const [scope, setScope] = useState<Scope>('shift')
+  const shift = useShiftStatus()
   const [items, setItems] = useState<MsReceiptRow[]>([])
   const [counts, setCounts] = useState<Record<MsReceiptStatus, number>>({
     pending: 0,
@@ -48,7 +100,6 @@ export default function Dashboard() {
 
   useEffect(() => {
     void load()
-    // Авто-обновление списка раз в 5 секунд.
     const t = setInterval(() => {
       void load()
     }, 5000)
@@ -75,154 +126,223 @@ export default function Dashboard() {
     }
   }
 
+  // Локальный фильтр по retailShift.id из raw_json. Поллер тащит все чеки
+  // в БД (для истории), а UI показывает текущую смену по умолчанию.
+  const visibleItems = useMemo(() => {
+    if (scope === 'all') return items
+    if (!shift.shiftId) return []
+    return items.filter((it) => getShiftIdFromRawJson(it.raw_json) === shift.shiftId)
+  }, [items, scope, shift.shiftId])
+
+  const subtitle = (() => {
+    const total = visibleItems.length
+    const pendingCount = visibleItems.filter((i) => i.status === 'pending').length
+    if (total === 0) return 'Нет чеков'
+    if (filter === 'pending') return `${pendingCount} ожидают фискализации`
+    return `${total} ${total === 1 ? 'чек' : total < 5 ? 'чека' : 'чеков'}`
+  })()
+
+  const columns: Column<MsReceiptRow>[] = [
+    {
+      key: 'name',
+      label: 'Чек',
+      width: '20%',
+      cell: (r) => (
+        <span className="font-medium text-ink">{r.ms_name ?? `#${r.id}`}</span>
+      ),
+    },
+    {
+      key: 'time',
+      label: 'Время',
+      cell: (r) => (
+        <span className="text-ink-muted">{formatDateTime(r.ms_moment)}</span>
+      ),
+    },
+    {
+      key: 'sum',
+      label: 'Сумма',
+      align: 'right',
+      mono: true,
+      cell: (r) => (
+        <span className="text-ink">{tiyinToSumDisplay(r.ms_sum_tiyin)} сум</span>
+      ),
+    },
+    {
+      key: 'status',
+      label: 'Статус',
+      width: '140px',
+      cell: (r) => {
+        const m = STATUS_TO_BADGE[r.status]
+        return <StatusBadge status={m.status}>{m.label}</StatusBadge>
+      },
+    },
+    {
+      key: 'action',
+      label: '',
+      width: '80px',
+      align: 'right',
+      cell: () => (
+        <ArrowRight size={16} className="text-ink-subtle inline-block" />
+      ),
+    },
+  ]
+
   return (
     <div className="space-y-6">
-      <div className="flex items-end justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Очередь чеков</h1>
-          <p className="mt-1 text-sm text-slate-500">
-            Чеки из МойСклад — выберите ожидающий, чтобы собрать и фискализировать.
-          </p>
+      <PageHeader
+        title="Касса"
+        subtitle={subtitle}
+        icon={<ReceiptIcon size={24} />}
+        action={
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => void load()}
+            icon={<RefreshCcw size={14} />}
+          >
+            Обновить
+          </Button>
+        }
+      />
+
+      {/* Top row: scope selector + poller indicator */}
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div className="flex flex-wrap items-center gap-1.5">
+          <ScopeButton active={scope === 'shift'} onClick={() => setScope('shift')}>
+            Текущая смена
+            {shift.shiftId && shift.openedAt && (
+              <span className="ml-1.5 text-ink-subtle">
+                {shift.openedAt.toLocaleTimeString('ru-RU', {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                })}
+              </span>
+            )}
+          </ScopeButton>
+          <ScopeButton active={scope === 'all'} onClick={() => setScope('all')}>
+            Все чеки
+          </ScopeButton>
+          {scope === 'shift' && !shift.shiftId && shift.ready && (
+            <span className="ml-2 text-caption text-warning">
+              Смена не открыта в МойСклад
+            </span>
+          )}
         </div>
         <PollerIndicator status={pollerStatus} />
       </div>
 
+      {/* Status filters */}
       <div className="flex flex-wrap gap-2">
-        {STATUS_FILTERS.map((f) => (
-          <button
-            key={f.value}
-            onClick={() => setFilter(f.value)}
-            className={`rounded-full border px-3 py-1 text-xs font-medium transition ${
-              filter === f.value
-                ? 'border-slate-900 bg-slate-900 text-white'
-                : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-50'
-            }`}
-          >
-            {f.label}
-            {f.value !== 'all' && (
-              <span className="ml-1.5 opacity-70">
-                {counts[f.value as MsReceiptStatus] ?? 0}
-              </span>
-            )}
-          </button>
-        ))}
+        {STATUS_FILTERS.map((f) => {
+          const isActive = filter === f.value
+          const count = f.value === 'all' ? null : counts[f.value as MsReceiptStatus]
+          return (
+            <button
+              key={f.value}
+              onClick={() => setFilter(f.value)}
+              className={cn(
+                'inline-flex items-center gap-2 rounded-md border px-3 py-1.5 text-caption transition-colors',
+                isActive
+                  ? 'border-primary bg-primary text-ink-inverse'
+                  : 'border-border bg-surface text-ink-muted hover:bg-surface-hover hover:text-ink',
+              )}
+            >
+              {f.label}
+              {count != null && (
+                <Badge
+                  variant={isActive ? 'primary' : 'neutral'}
+                  size="sm"
+                  className={cn(
+                    isActive && 'bg-ink-inverse/20 text-ink-inverse border-transparent',
+                  )}
+                >
+                  {count}
+                </Badge>
+              )}
+            </button>
+          )
+        })}
       </div>
 
       {error && (
-        <div className="rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-800">
-          {error}
-        </div>
+        <Card>
+          <Card.Body className="text-danger text-body">{error}</Card.Body>
+        </Card>
       )}
 
-      <div className="overflow-x-auto rounded-lg border border-slate-200 bg-white">
-        <table className="min-w-full divide-y divide-slate-200 text-sm">
-          <thead className="bg-slate-50">
-            <tr>
-              <Th>№</Th>
-              <Th>Время</Th>
-              <Th>Сумма</Th>
-              <Th>Статус</Th>
-              <Th>Действие</Th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-slate-100">
-            {loading && items.length === 0 ? (
-              <tr>
-                <td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={5}>
-                  Загрузка…
-                </td>
-              </tr>
-            ) : items.length === 0 ? (
-              <tr>
-                <td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={5}>
-                  Нет чеков с этим статусом.
-                </td>
-              </tr>
-            ) : (
-              items.map((it) => (
-                <tr key={it.id} className="hover:bg-slate-50">
-                  <Td className="font-medium">{it.ms_name ?? `#${it.id}`}</Td>
-                  <Td>{formatDateTime(it.ms_moment)}</Td>
-                  <Td className="text-right tabular-nums">
-                    {tiyinToSumDisplay(it.ms_sum_tiyin)} сум
-                  </Td>
-                  <Td>
-                    <StatusBadge status={it.status} />
-                  </Td>
-                  <Td>
-                    <Link
-                      to={`/receipts/${it.id}`}
-                      className="text-sm font-medium text-slate-900 underline-offset-2 hover:underline"
-                    >
-                      Открыть →
-                    </Link>
-                  </Td>
-                </tr>
-              ))
-            )}
-          </tbody>
-        </table>
-      </div>
+      <Card>
+        {visibleItems.length === 0 && !loading ? (
+          <EmptyState
+            icon={<ReceiptIcon size={36} />}
+            title={
+              scope === 'shift'
+                ? shift.shiftId
+                  ? 'В этой смене пока нет чеков'
+                  : 'Откройте смену в МойСклад'
+                : 'Нет чеков'
+            }
+            description={
+              scope === 'shift' && !shift.shiftId
+                ? 'Чеки появятся здесь сразу после того как кассир откроет смену в МС.'
+                : 'Чеки автоматически появятся когда МС-касса пробьёт первый.'
+            }
+          />
+        ) : (
+          <DataTable
+            columns={columns}
+            rows={visibleItems}
+            rowKey={(r) => r.id}
+            onRowClick={(r) => navigate(`/receipts/${r.id}`)}
+            loading={loading && visibleItems.length === 0}
+          />
+        )}
+      </Card>
     </div>
+  )
+}
+
+function ScopeButton({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean
+  onClick: () => void
+  children: React.ReactNode
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        'rounded-md px-3 py-1.5 text-caption transition-colors',
+        active
+          ? 'bg-primary text-ink-inverse'
+          : 'text-ink-muted hover:bg-surface-hover hover:text-ink',
+      )}
+    >
+      {children}
+    </button>
   )
 }
 
 function PollerIndicator({ status }: { status: PollerStatus | null }) {
   const isOk = !!status?.running && !status.lastError
-  const isWarn = !!status?.lastError
-  const dotColor = isOk ? 'bg-emerald-500' : isWarn ? 'bg-amber-500' : 'bg-slate-300'
+  const isErr = !!status?.lastError
+  const Icon = isOk ? Wifi : WifiOff
+  const tone = isOk ? 'text-success' : isErr ? 'text-warning' : 'text-ink-subtle'
+  const label = !status?.running
+    ? 'МС: не запущен'
+    : isErr
+      ? 'МС: ошибка'
+      : `МС: каждые ${status.intervalSec}с`
   return (
-    <div className="flex flex-col items-end gap-0.5 text-xs">
-      <div className="flex items-center gap-2">
-        <span className={`inline-block h-2 w-2 rounded-full ${dotColor}`} />
-        <span className="text-slate-600">
-          {!status?.running
-            ? 'МойСклад: не запущен'
-            : isWarn
-              ? 'МойСклад: ошибка'
-              : `МойСклад: каждые ${status.intervalSec}с`}
-        </span>
-      </div>
-      {status?.lastSuccessAt && (
-        <span className="text-slate-400">
-          Последний успех: {formatDateTime(status.lastSuccessAt)}
-        </span>
-      )}
-      {status?.lastError && (
-        <span className="text-amber-700" title={status.lastError}>
-          {status.lastError.slice(0, 60)}…
-        </span>
-      )}
+    <div
+      className={cn('flex items-center gap-1.5 text-caption', tone)}
+      title={status?.lastError ?? undefined}
+    >
+      <Icon size={14} />
+      <span>{label}</span>
     </div>
   )
-}
-
-const STATUS_LABELS: Record<MsReceiptStatus, { label: string; color: string }> = {
-  pending: { label: 'Ожидает', color: 'bg-slate-100 text-slate-700' },
-  matched: { label: 'Подобран', color: 'bg-blue-100 text-blue-700' },
-  fiscalized: { label: 'Готов', color: 'bg-emerald-100 text-emerald-700' },
-  failed: { label: 'Ошибка', color: 'bg-red-100 text-red-700' },
-  manual: { label: 'Ручной', color: 'bg-amber-100 text-amber-700' },
-  skipped: { label: 'Пропущен', color: 'bg-slate-100 text-slate-500' },
-}
-
-function StatusBadge({ status }: { status: MsReceiptStatus }) {
-  const { label, color } = STATUS_LABELS[status]
-  return (
-    <span className={`inline-block rounded-full px-2 py-0.5 text-xs font-medium ${color}`}>
-      {label}
-    </span>
-  )
-}
-
-function Th({ children }: { children: React.ReactNode }) {
-  return (
-    <th className="px-3 py-2 text-left text-xs font-medium text-slate-600">
-      {children}
-    </th>
-  )
-}
-
-function Td({ children, className = '' }: { children: React.ReactNode; className?: string }) {
-  return <td className={`whitespace-nowrap px-3 py-2 ${className}`}>{children}</td>
 }

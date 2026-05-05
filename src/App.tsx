@@ -1,11 +1,13 @@
 import { Routes, Route } from 'react-router-dom'
-import Layout from '@/components/Layout'
+import Layout, { RequireAdmin } from '@/components/Layout'
 import Dashboard from '@/routes/Dashboard'
 import Receipt from '@/routes/Receipt'
 import Catalog from '@/routes/Catalog'
 import History from '@/routes/History'
 import Logs from '@/routes/Logs'
 import Settings from '@/routes/Settings'
+import Login from '@/routes/Login'
+import { AppGate, RedirectIfAuthed } from '@/components/AppGate'
 import { useEffect } from 'react'
 import { autoApplyOnStartup } from '@/lib/updater'
 import { log } from '@/lib/log'
@@ -13,6 +15,7 @@ import {
   ensureInventoryRuntime,
   stopInventoryRuntime,
 } from '@/lib/inventory'
+import { Toaster } from '@/components/ui'
 
 export default function App() {
   useEffect(() => {
@@ -24,27 +27,66 @@ export default function App() {
     // Inventory runtime — если включён remote-режим, тянет конфиг от админа,
     // подписывается на SSE-обновления, гоняет periodic sync. Если выключен —
     // тихо ничего не делает. Idempotent — можно дёргать несколько раз.
-    // Внутри уже асинхронно: housekeeping → bootstrap sync → SSE.
-    // НЕ блокируем return — делаем void чтобы UI не задерживать.
     void ensureInventoryRuntime()
 
-    // На размонтировании App (например HMR) — стопаем SSE+timers, иначе
-    // в DevTools накопятся открытые stream'ы.
     return () => {
       stopInventoryRuntime()
     }
   }, [])
 
   return (
-    <Routes>
-      <Route element={<Layout />}>
-        <Route path="/" element={<Dashboard />} />
-        <Route path="/receipts/:id" element={<Receipt />} />
-        <Route path="/catalog" element={<Catalog />} />
-        <Route path="/history" element={<History />} />
-        <Route path="/logs" element={<Logs />} />
-        <Route path="/settings" element={<Settings />} />
-      </Route>
-    </Routes>
+    <>
+      <Routes>
+        {/* Login — без Layout, без AppGate (наоборот — отбрасывает залогиненных) */}
+        <Route
+          path="/login"
+          element={
+            <RedirectIfAuthed>
+              <Login />
+            </RedirectIfAuthed>
+          }
+        />
+
+        {/* Все остальные routes — за AppGate'ом, под Layout'ом */}
+        <Route
+          element={
+            <AppGate>
+              <Layout />
+            </AppGate>
+          }
+        >
+          <Route path="/" element={<Dashboard />} />
+          <Route path="/receipts/:id" element={<Receipt />} />
+          <Route path="/history" element={<History />} />
+          {/* Admin-only — защищены RequireAdmin (localStorage flag).
+              Кассир не видит их в нав, прямой URL редиректит на /. */}
+          <Route
+            path="/catalog"
+            element={
+              <RequireAdmin>
+                <Catalog />
+              </RequireAdmin>
+            }
+          />
+          <Route
+            path="/logs"
+            element={
+              <RequireAdmin>
+                <Logs />
+              </RequireAdmin>
+            }
+          />
+          <Route
+            path="/settings"
+            element={
+              <RequireAdmin>
+                <Settings />
+              </RequireAdmin>
+            }
+          />
+        </Route>
+      </Routes>
+      <Toaster />
+    </>
   )
 }

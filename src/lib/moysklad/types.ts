@@ -44,6 +44,28 @@ export interface MsRef {
   meta: MsMeta
 }
 
+// ── Розничная смена (retailshift) ───────────────────────────────
+//
+// МС-смены: точка открывает смену → пробивает чеки → закрывает.
+// `closeDate=null` ⇒ смена активна. У `retaildemand` всегда есть
+// `retailShift` (meta-ссылка на смену в которой пробит).
+export interface MsRetailShift {
+  meta: MsMeta
+  id: string
+  accountId: string
+  name?: string
+  /** Когда открыта (ISO с миллисекундами в UTC). */
+  created: string
+  /** Когда закрыта. null/undefined = активна. */
+  closeDate?: string | null
+  /** Сводные суммы — могут быть полезны для UI. */
+  proceedsCash?: number
+  proceedsNoCash?: number
+  retailStore?: MsRef
+  organization?: MsRef
+  store?: MsRef
+}
+
 export interface MsListResponse<T> {
   context?: { employee?: { meta: MsMeta } }
   meta: {

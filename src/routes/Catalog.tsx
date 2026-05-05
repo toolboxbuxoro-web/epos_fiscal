@@ -47,7 +47,7 @@ export default function Catalog() {
       <div className="flex items-end justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Справочник приходов</h1>
-          <p className="mt-1 text-sm text-slate-500">
+          <p className="mt-1 text-sm text-ink-muted">
             Товары с налоговыми приходами. Из них Matcher собирает чеки для отправки в EPOS.
           </p>
         </div>
@@ -65,18 +65,18 @@ export default function Catalog() {
           onChange={(e) => setSearch(e.target.value)}
           className="max-w-md"
         />
-        <span className="text-xs text-slate-500">Всего записей: {total}</span>
+        <span className="text-xs text-ink-muted">Всего записей: {total}</span>
       </div>
 
       {error && (
-        <div className="rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-800">
+        <div className="rounded-md border border-danger/20 bg-danger-soft p-3 text-sm text-danger">
           {error}
         </div>
       )}
 
-      <div className="overflow-x-auto rounded-lg border border-slate-200 bg-white">
-        <table className="min-w-full divide-y divide-slate-200 text-sm">
-          <thead className="bg-slate-50">
+      <div className="overflow-x-auto rounded-lg border border-border bg-surface">
+        <table className="min-w-full divide-y divide-border text-sm">
+          <thead className="bg-canvas">
             <tr>
               <Th>Наименование</Th>
               <Th>ИКПУ</Th>
@@ -87,16 +87,16 @@ export default function Catalog() {
               <Th>Дата</Th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-slate-100">
+          <tbody className="divide-y divide-border">
             {loading && items.length === 0 ? (
               <tr>
-                <td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={7}>
+                <td className="px-3 py-8 text-center text-sm text-ink-muted" colSpan={7}>
                   Загрузка…
                 </td>
               </tr>
             ) : items.length === 0 ? (
               <tr>
-                <td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={7}>
+                <td className="px-3 py-8 text-center text-sm text-ink-muted" colSpan={7}>
                   {search
                     ? 'По запросу ничего не найдено.'
                     : 'Справочник пуст. Импортируйте приходы из Excel.'}
@@ -104,11 +104,11 @@ export default function Catalog() {
               </tr>
             ) : (
               items.map((item) => (
-                <tr key={item.id} className="hover:bg-slate-50">
+                <tr key={item.id} className="hover:bg-canvas">
                   <Td>
-                    <div className="font-medium text-slate-900">{item.name}</div>
+                    <div className="font-medium text-ink">{item.name}</div>
                     {item.barcode && (
-                      <div className="text-xs text-slate-500">{item.barcode}</div>
+                      <div className="text-xs text-ink-muted">{item.barcode}</div>
                     )}
                   </Td>
                   <Td className="font-mono text-xs">{item.class_code}</Td>
@@ -117,14 +117,14 @@ export default function Catalog() {
                   <Td className="text-right">
                     <span
                       className={
-                        item.available > 0 ? 'text-emerald-700 font-medium' : 'text-slate-400'
+                        item.available > 0 ? 'text-success font-medium' : 'text-ink-subtle'
                       }
                     >
                       {milliQtyToDisplay(item.available)}
                     </span>
                   </Td>
                   <Td className="text-center">{item.vat_percent}%</Td>
-                  <Td className="text-xs text-slate-600">{formatDate(item.received_at)}</Td>
+                  <Td className="text-xs text-ink-muted">{formatDate(item.received_at)}</Td>
                 </tr>
               ))
             )}
@@ -147,7 +147,7 @@ export default function Catalog() {
 
 function Th({ children }: { children: React.ReactNode }) {
   return (
-    <th className="px-3 py-2 text-left text-xs font-medium text-slate-600">
+    <th className="px-3 py-2 text-left text-xs font-medium text-ink-muted">
       {children}
     </th>
   )

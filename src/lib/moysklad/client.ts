@@ -4,6 +4,7 @@ import {
   type MsEmployee,
   type MsListResponse,
   type MsRetailDemand,
+  type MsRetailShift,
   type MsRetailStore,
 } from './types'
 
@@ -159,5 +160,55 @@ export class MoyskladClient {
       '/entity/employee?limit=200',
     )
     return res.rows.filter((e) => e.archived !== true)
+  }
+
+  /**
+   * Получить АКТИВНУЮ розничную смену указанной точки продаж.
+   *
+   *   filter=retailStore=<href>;closeDate=null
+   *
+   * Возвращает первую найденную (если их вдруг несколько — берём самую свежую).
+   * null = нет открытой смены сейчас.
+   */
+  async getActiveShift(retailStoreId: string): Promise<MsRetailShift | null> {
+    const params = new URLSearchParams()
+    params.set(
+      'filter',
+      [
+        `retailStore=https://api.moysklad.ru/api/remap/1.2/entity/retailstore/${retailStoreId}`,
+        'closeDate=', // closeDate IS NULL — синтаксис МС
+      ].join(';'),
+    )
+    params.set('order', 'created,desc')
+    params.set('limit', '1')
+    const res = await this.request<MsListResponse<MsRetailShift>>(
+      `/entity/retailshift?${params.toString()}`,
+    )
+    return res.rows[0] ?? null
+  }
+
+  /**
+   * Получить розничные продажи КОНКРЕТНОЙ смены.
+   *
+   * Используется при включённом «фильтре по смене»: вместо `updated>cursor`
+   * подтягиваем чеки точно этой retailShift. Эффективно для дашборда смены.
+   */
+  async listShiftReceipts(
+    retailShiftId: string,
+    limit = 100,
+  ): Promise<MsRetailDemand[]> {
+    const params = new URLSearchParams()
+    params.set(
+      'filter',
+      `retailShift=https://api.moysklad.ru/api/remap/1.2/entity/retailshift/${retailShiftId}`,
+    )
+    params.set('order', 'moment,desc')
+    params.set('limit', String(Math.min(limit, 1000)))
+    params.set('expand', 'positions.assortment')
+
+    const res = await this.request<MsListResponse<MsRetailDemand>>(
+      `/entity/retaildemand?${params.toString()}`,
+    )
+    return res.rows
   }
 }
