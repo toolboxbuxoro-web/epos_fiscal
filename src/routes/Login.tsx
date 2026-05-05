@@ -4,6 +4,7 @@ import { LogIn, Receipt, Settings as SettingsIcon } from 'lucide-react'
 import { Button, Field, Input, Card } from '@/components/ui'
 import { getSetting, setSetting, SettingKey } from '@/lib/db'
 import { signInWithMs } from '@/lib/inventory'
+import { useDevMode } from '@/lib/dev-mode'
 
 /**
  * Дефолтный inventory-сервер. Фиксирован для нашей инсталляции — у всех
@@ -29,6 +30,7 @@ const DEFAULT_SERVER_URL = 'https://backend-production-c3d4.up.railway.app'
  */
 export default function Login() {
   const navigate = useNavigate()
+  const devMode = useDevMode()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [busy, setBusy] = useState(false)
@@ -157,7 +159,7 @@ export default function Login() {
           {/* Footer с конфигурацией сервера — ТОЛЬКО в dev-режиме.
               В production кассиру он не нужен: дефолтный URL подкладывается
               автоматически, а если нужен другой — админ меняет в /settings. */}
-          {import.meta.env.DEV && (
+          {devMode && (
             <Card.Footer className="justify-between">
               <span className="text-caption text-ink-muted">
                 {serverUrl ? (
@@ -180,7 +182,7 @@ export default function Login() {
           )}
         </Card>
 
-        {import.meta.env.DEV && showServerUrlField && (
+        {devMode && showServerUrlField && (
           <div className="mt-3 animate-fade-in">
             <Card>
               <Card.Body>

@@ -16,6 +16,9 @@ import {
   syncFromServer,
   syncShopConfig,
 } from '@/lib/inventory'
+import { AdminUnlockModal } from '@/components/AdminUnlockModal'
+import { lockDevMode, useRuntimeDevUnlocked } from '@/lib/dev-mode'
+import { ShieldCheck, Lock as LockIcon, Unlock } from 'lucide-react'
 import {
   listPrinters,
   printTestQr,
@@ -24,6 +27,7 @@ import {
 import { Button } from '@/components/ui/Button'
 import { Input } from '@/components/ui/Input'
 import { Select } from '@/components/ui/Select'
+import { toast } from '@/components/ui'
 
 interface FormState {
   // МойСклад логин
@@ -118,6 +122,9 @@ export default function Settings() {
   const [invSseStatus, setInvSseStatus] = useState<
     'connected' | 'disconnected' | 'connecting' | 'idle'
   >('idle')
+  // Admin gate
+  const [showAdminModal, setShowAdminModal] = useState(false)
+  const devUnlocked = useRuntimeDevUnlocked()
 
   useEffect(() => {
     void load()
@@ -1088,6 +1095,44 @@ export default function Settings() {
         </div>
       </Section>
 
+      <Section title="Режим разработчика">
+        <div className="col-span-1 md:col-span-2 flex items-start justify-between gap-3">
+          <div className="text-xs text-ink-muted max-w-2xl">
+            Активирует диагностические функции (смена сервера на login screen,
+            DEV-плашка в углу и т.п.). Требует администраторские учётные данные
+            и PIN. Сбрасывается при закрытии программы.
+          </div>
+          {devUnlocked ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              icon={<Unlock size={14} className="text-warning" />}
+              onClick={() => {
+                lockDevMode()
+                toast.success('Режим разработчика заблокирован')
+              }}
+            >
+              Заблокировать
+            </Button>
+          ) : (
+            <Button
+              variant="secondary"
+              size="sm"
+              icon={<ShieldCheck size={14} />}
+              onClick={() => setShowAdminModal(true)}
+            >
+              Активировать
+            </Button>
+          )}
+        </div>
+        {devUnlocked && (
+          <div className="col-span-1 md:col-span-2 flex items-start gap-2 text-xs text-warning">
+            <LockIcon size={12} className="mt-0.5" />
+            <span>Режим активен. Диагностические функции доступны.</span>
+          </div>
+        )}
+      </Section>
+
       {error && (
         <div className="rounded-md border border-danger/20 bg-danger-soft p-3 text-sm text-danger">
           {error}
@@ -1100,6 +1145,11 @@ export default function Settings() {
         </Button>
         {saved && <span className="text-sm text-success">Сохранено</span>}
       </div>
+
+      <AdminUnlockModal
+        open={showAdminModal}
+        onClose={() => setShowAdminModal(false)}
+      />
     </div>
   )
 }

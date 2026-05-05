@@ -122,6 +122,12 @@ export const SettingKey = {
   InventoryShopApiKey: 'inventory.shop_api_key',
   /** Unix-timestamp последнего успешного sync /items?since=. */
   InventoryLastSyncTs: 'inventory.last_sync_ts',
+  /**
+   * Хеш PIN администратора (PBKDF2-SHA256 100k итераций + соль).
+   * Формат: `<saltBase64>:<hashBase64>`. Проверяется при разблокировке
+   * dev-режима в Settings (login=admin + password=admin + PIN).
+   */
+  AdminPinHash: 'admin.pin_hash',
 } as const
 
 export type SettingKey = (typeof SettingKey)[keyof typeof SettingKey]
