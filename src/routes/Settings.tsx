@@ -80,7 +80,7 @@ const empty: FormState = {
   moyskladEmployeeId: '',
   moyskladEmployeeName: '',
   moyskladPollInterval: '30',
-  eposCommunicatorUrl: 'http://localhost:8347/uzpos',
+  eposCommunicatorUrl: 'http://localhost:3448/rpc/api',
   eposToken: 'DXJFX32CN1296678504F2',
   companyName: '',
   companyInn: '',
@@ -182,7 +182,7 @@ export default function Settings() {
       moyskladEmployeeName: all[SettingKey.MoyskladEmployeeName] ?? '',
       moyskladPollInterval: all[SettingKey.MoyskladPollIntervalSec] ?? '30',
       eposCommunicatorUrl:
-        all[SettingKey.EposCommunicatorUrl] ?? 'http://localhost:8347/uzpos',
+        all[SettingKey.EposCommunicatorUrl] ?? 'http://localhost:3448/rpc/api',
       eposToken: all[SettingKey.EposToken] ?? 'DXJFX32CN1296678504F2',
       companyName: all[SettingKey.CompanyName] ?? '',
       companyInn: all[SettingKey.CompanyInn] ?? '',
@@ -835,9 +835,9 @@ export default function Settings() {
             placeholder="http://localhost:3448/rpc/api"
           />
           <div className="mt-1 text-xs text-ink-muted">
-            Новый API (рекомендуется): <code className="bg-surface-hover px-1 rounded">http://localhost:3448/rpc/api</code>
+            JSON-RPC API: <code className="bg-surface-hover px-1 rounded">http://localhost:3448/rpc/api</code>
             <br />
-            Старый API: <code className="bg-surface-hover px-1 rounded">http://localhost:8347/uzpos</code>
+            Legacy <code>/uzpos</code> больше не поддерживается (с 0.10.8).
           </div>
         </Field>
         <Field label="Токен">

@@ -23,18 +23,10 @@ import {
   printFiscalReceipt,
   type ReceiptData,
 } from '@/lib/printer'
-import { EposClient } from './client'
 import { JsonRpcEposClient, formatGoTime, type JsonRpcReceipt } from './jsonrpc-client'
-import type {
-  CommunicatorItem,
-  CommunicatorParams,
-  CommunicatorSaleRequest,
-  FiscalReceiptInfo,
-} from './types'
+import type { FiscalReceiptInfo } from './types'
 
 export interface FiscalizeOptions {
-  /** Использовать `fastSale` (без печати чека) — только для legacy /uzpos. */
-  fast?: boolean
   staffName?: string
   clientTin?: string
   clientPinfl?: string
@@ -53,9 +45,10 @@ export interface FiscalizeResult {
 /**
  * Главная функция фискализации.
  *
- * Авто-определяет протокол по URL Communicator:
- *   • URL содержит `/rpc/api` → новый JSON-RPC 2.0 (Api.SendSaleReceipt)
- *   • иначе → legacy /uzpos (sale/fastSale)
+ * Использует ТОЛЬКО JSON-RPC 2.0 (Api.SendSaleReceipt) на /rpc/api.
+ * Legacy /uzpos удалён в 0.10.8: в актуальных версиях Communicator он
+ * либо урезан (NO_SUCH_METHOD_AVAILABLE), либо НЕ передаёт ИКПУ в ОФД,
+ * из-за чего ОФД не начислял кешбэк покупателям.
  *
  * Все денежные значения и количество приходят уже в правильных единицах
  * (тийины и тысячные).
@@ -66,9 +59,10 @@ export async function fiscalize(
 ): Promise<FiscalizeResult> {
   const eposUrl =
     (await getSetting(SettingKey.EposCommunicatorUrl)) ??
-    'http://localhost:8347/uzpos'
-  const eposToken =
-    (await getSetting(SettingKey.EposToken)) ?? 'DXJFX32CN1296678504F2'
+    'http://localhost:3448/rpc/api'
+  // EposToken не используется — JSON-RPC аутентификации не требует.
+  // Поле в Settings оставлено для обратной совместимости (для UI), но
+  // в payload никогда не попадает.
 
   if (build.positions.length === 0) {
     throw new Error('Нечего отправлять в Communicator: пустой план')
@@ -132,6 +126,27 @@ export async function fiscalize(
   const reserveResult = await tryRemoteReserve(build, build.receipt.id ?? msReceiptId.toString())
   // ────────────────────────────────────────────────────────────────────
 
+  // Жёсткий guard: ИКПУ + код упаковки обязательны на ВСЁМ пути фискализации.
+  // Без MXIK ОФД не начисляет покупателю кешбэк и ГНК штрафует магазин на 1%
+  // (постановление ВМ-255 от 12.05.2022 п.20 ч.5).
+  const noIkpuItems: string[] = []
+  for (const pm of build.positions) {
+    for (const c of pm.candidates) {
+      if (!c.esfItem.class_code || !c.esfItem.package_code) {
+        noIkpuItems.push(c.esfItem.name)
+      }
+    }
+  }
+  if (noIkpuItems.length > 0) {
+    await releaseRemote(reserveResult.reservations, 'no-ikpu').catch(() => {})
+    throw new Error(
+      `Нельзя фискализировать: у ${noIkpuItems.length} товаров отсутствует ИКПУ. ` +
+        `Дозаполните в mytoolbox админке → Inventory → Приходы. ` +
+        `Товары: ${noIkpuItems.slice(0, 3).join(', ')}` +
+        (noIkpuItems.length > 3 ? ` и ещё ${noIkpuItems.length - 3}` : ''),
+    )
+  }
+
   await log.info('fiscalize', `Отправляю чек ${build.receipt.name} в EPOS`, {
     eposUrl,
     items: build.positions.length,
@@ -139,22 +154,17 @@ export async function fiscalize(
     remoteReserved: reserveResult.reservations?.length ?? 0,
   })
 
-  // 3. Выбрать клиент по URL и отправить.
-  const isJsonRpc = /\/rpc\/?(?:api)?$/i.test(eposUrl) || eposUrl.includes(':3448')
-
+  // Только JSON-RPC `/rpc/api` — legacy `/uzpos` удалён в 0.10.8 потому что
+  // новые установки Communicator (после ~2024) НЕ передают ИКПУ из legacy
+  // запросов в ОФД, в результате чего MXIK пропадает и покупатель не
+  // получает кешбэк (наблюдалось в реальных чеках Toolbox-Хонабод).
   let fiscal: FiscalReceiptInfo
   let requestJson: string
 
   try {
-    if (isJsonRpc) {
-      const result = await fiscalizeJsonRpc(eposUrl, build, receivedCash, receivedCard)
-      fiscal = result.fiscal
-      requestJson = result.requestJson
-    } else {
-      const result = await fiscalizeLegacy(eposUrl, eposToken, build, opts, receivedCash, receivedCard)
-      fiscal = result.fiscal
-      requestJson = result.requestJson
-    }
+    const result = await fiscalizeJsonRpc(eposUrl, build, receivedCash, receivedCard)
+    fiscal = result.fiscal
+    requestJson = result.requestJson
   } catch (eposErr) {
     // EPOS не выдал FiscalSign — отпускаем резерв чтобы товары
     // не блокировались в qty_reserved до истечения TTL.
@@ -529,35 +539,6 @@ async function fiscalizeJsonRpc(
   receivedCash: number,
   receivedCard: number,
 ): Promise<{ fiscal: FiscalReceiptInfo; requestJson: string }> {
-  // Жёсткий guard: ИКПУ + код упаковки обязательны.
-  //
-  // Без MXIK ОФД не начисляет покупателю кешбэк и ГНК штрафует магазин
-  // на 1% от суммы (постановление ВМ-255 от 12.05.2022 п.20 ч.5).
-  //
-  // Throw здесь — последний рубеж защиты. UI Receipt должен ДО клика
-  // «Фискализировать» показать кассиру баннер «Невозможно — N товаров
-  // без ИКПУ» и заблокировать кнопку. Если каким-то образом этот guard
-  // всё-таки сработает — значит UI не догадался, и у нас bug.
-  //
-  // matcher работает только из source='remote' (товары из mytoolbox), так
-  // что обычно ИКПУ есть. Этот guard страхует от дозаполнения админом
-  // приходов с пустыми колонками MXIK в Excel.
-  const noIkpuItems: string[] = []
-  for (const pm of build.positions) {
-    for (const c of pm.candidates) {
-      if (!c.esfItem.class_code || !c.esfItem.package_code) {
-        noIkpuItems.push(c.esfItem.name)
-      }
-    }
-  }
-  if (noIkpuItems.length > 0) {
-    throw new Error(
-      `Нельзя фискализировать: у ${noIkpuItems.length} товаров отсутствует ИКПУ. ` +
-        `Дозаполните в mytoolbox админке → Inventory → Приходы. ` +
-        `Товары: ${noIkpuItems.slice(0, 3).join(', ')}` +
-        (noIkpuItems.length > 3 ? ` и ещё ${noIkpuItems.length - 3}` : ''),
-    )
-  }
 
   const items = build.positions.flatMap((pm) =>
     pm.candidates.map((c) => ({
@@ -641,92 +622,6 @@ async function fiscalizeJsonRpc(
     QRCodeURL: answer.QRCodeURL,
   }
   return { fiscal, requestJson }
-}
-
-// ── Реализация для legacy :8347/uzpos ─────────────────────────────────
-
-async function fiscalizeLegacy(
-  eposUrl: string,
-  eposToken: string,
-  build: BuildMatchResult,
-  opts: FiscalizeOptions,
-  receivedCash: number,
-  receivedCard: number,
-): Promise<{ fiscal: FiscalReceiptInfo; requestJson: string }> {
-  const company = await readCompanySettings()
-  const printerSize = ((await getSetting(SettingKey.PrinterSize)) === '58' ? 58 : 80) as 58 | 80
-  const staffName =
-    opts.staffName ?? (await getSetting(SettingKey.MoyskladEmployeeName)) ?? undefined
-
-  const items: CommunicatorItem[] = build.positions.flatMap((pm) =>
-    pm.candidates.map((c) => ({
-      price: c.priceTiyin,           // до скидки
-      discount: c.discountTiyin,     // размер скидки
-      barcode: c.esfItem.barcode ?? '0',
-      amount: c.quantity,
-      vatPercent: c.esfItem.vat_percent,
-      vat: c.vatTiyin,               // уже пересчитан от (price - discount)
-      name: c.esfItem.name,
-      classCode: c.esfItem.class_code,
-      packageCode: c.esfItem.package_code,
-      other: 0,
-      ownerType: c.esfItem.owner_type,
-    })),
-  )
-
-  const params: CommunicatorParams = {
-    items,
-    paycheckNumber: build.receipt.name || undefined,
-    receivedCash,
-    receivedCard,
-    extraInfos: { 'Модель виртуальной кассы': 'E-POS' },
-  }
-
-  const request: CommunicatorSaleRequest = {
-    token: eposToken,
-    method: opts.fast ? 'fastSale' : 'sale',
-    companyName: company.name,
-    companyAddress: company.address,
-    companyINN: company.inn,
-    staffName,
-    printerSize,
-    phoneNumber: company.phone || undefined,
-    companyPhoneNumber: company.phone || undefined,
-    params,
-    epsInfo: { transactionId: '' },
-    extraInfo: {
-      tin: opts.clientTin,
-      pinfl: opts.clientPinfl,
-      cardType: opts.cardType ?? 2,
-    },
-  }
-
-  const client = new EposClient({ url: eposUrl, token: eposToken })
-
-  // Полный дамп запроса перед отправкой, чтобы можно было отладить ошибки
-  // Communicator (NO_SUCH_METHOD_AVAILABLE / illegal argument) по полям.
-  await log.info('fiscalize', 'Отправляю sale в EPOS (legacy /uzpos)', {
-    eposUrl,
-    request,
-    itemsCount: items.length,
-  })
-
-  try {
-    await client.call(request)
-  } catch (e) {
-    await log.error('fiscalize', 'EPOS Communicator (legacy) вернул ошибку', {
-      error: e instanceof Error ? e.message : String(e),
-      eposUrl,
-      request,
-    })
-    throw e
-  }
-
-  const fiscal = await client.getLastRegisteredReceipt()
-  await log.info('fiscalize', 'Legacy EPOS успешно ответил', {
-    fiscal,
-  })
-  return { fiscal, requestJson: JSON.stringify(request) }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────

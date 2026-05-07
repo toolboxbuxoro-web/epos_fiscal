@@ -29,6 +29,12 @@ pub fn run() {
             sql: include_str!("../migrations/004_drop_legacy_items.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 5,
+            description: "drop_legacy_epos_url",
+            sql: include_str!("../migrations/005_drop_legacy_epos_url.sql"),
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()
