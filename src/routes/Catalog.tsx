@@ -36,7 +36,10 @@ export default function Catalog() {
     setError(null)
     try {
       const [rows, count, stats] = await Promise.all([
-        listEsfItems({ search: search || undefined, limit: 200 }),
+        // source='remote' — показываем только синкнутые из mytoolbox.
+        // Legacy excel-импорты (если ещё не удалены миграцией 004) фильтруем —
+        // чтобы кассир не путался какие товары актуальны.
+        listEsfItems({ search: search || undefined, limit: 200, source: 'remote' }),
         countEsfItems(),
         getMigrationStats(),
       ])

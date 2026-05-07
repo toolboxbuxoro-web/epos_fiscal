@@ -23,6 +23,12 @@ pub fn run() {
             sql: include_str!("../migrations/003_inventory_sync.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 4,
+            description: "drop_legacy_excel_items",
+            sql: include_str!("../migrations/004_drop_legacy_items.sql"),
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()
