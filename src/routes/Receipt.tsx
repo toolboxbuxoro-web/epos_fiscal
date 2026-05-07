@@ -93,6 +93,30 @@ export default function Receipt() {
     return extractPositions(rd)
   }, [rd])
 
+  /**
+   * Список товаров в подборе у которых пустой ИКПУ или код упаковки.
+   *
+   * Без MXIK ОФД не начисляет покупателю кешбэк и магазин рискует штрафом
+   * 1% от суммы (постановление ВМ-255 от 12.05.2022 п.20 ч.5). Поэтому
+   * фискализацию таких чеков мы блокируем — кассир должен дозаполнить
+   * ИКПУ в админке mytoolbox.
+   *
+   * Считаем уникальные имена чтобы баннер не дублировал товары когда
+   * один и тот же выбран в multi-item / split.
+   */
+  const itemsWithoutIkpu = useMemo(() => {
+    if (!match) return [] as string[]
+    const names = new Set<string>()
+    for (const pm of match.positions) {
+      for (const c of pm.candidates) {
+        if (!c.esfItem.class_code || !c.esfItem.package_code) {
+          names.add(c.esfItem.name)
+        }
+      }
+    }
+    return Array.from(names)
+  }, [match])
+
   const matchedSourceIndexes = useMemo(() => {
     if (!match) return new Set<number>()
     return new Set(match.positions.map((pm) => pm.source.index))
@@ -311,9 +335,18 @@ export default function Receipt() {
             <Button
               variant="primary"
               loading={fiscalizing}
-              disabled={fiscalizing || match.positions.length === 0}
+              disabled={
+                fiscalizing ||
+                match.positions.length === 0 ||
+                itemsWithoutIkpu.length > 0
+              }
               onClick={doFiscalize}
               icon={!fiscalizing ? <Send size={14} /> : undefined}
+              title={
+                itemsWithoutIkpu.length > 0
+                  ? `Невозможно фискализировать: ${itemsWithoutIkpu.length} товаров без ИКПУ`
+                  : undefined
+              }
             >
               {testMode ? 'Тестовая фискализация' : 'Фискализировать'}
             </Button>
@@ -352,6 +385,38 @@ export default function Receipt() {
           <Card.Body className="flex items-start gap-3">
             <AlertCircle size={18} className="text-danger shrink-0 mt-0.5" />
             <div className="text-body text-danger">{error}</div>
+          </Card.Body>
+        </Card>
+      )}
+
+      {/* Блокировка фискализации: товары без ИКПУ → ОФД отказал бы в кешбэке +
+          ГНК штрафанула бы магазин на 1% (постановление ВМ-255 от 12.05.2022).
+          Кассир видит баннер и список товаров, кнопка «Фискализировать»
+          выше disabled. Дозаполнить нужно в админке mytoolbox. */}
+      {itemsWithoutIkpu.length > 0 && (
+        <Card className="border-danger/30 bg-danger-soft">
+          <Card.Body className="flex items-start gap-3">
+            <AlertCircle size={18} className="text-danger shrink-0 mt-0.5" />
+            <div className="flex-1">
+              <div className="text-body font-medium text-danger">
+                Невозможно фискализировать: {itemsWithoutIkpu.length}{' '}
+                {itemsWithoutIkpu.length === 1 ? 'товар без ИКПУ' : 'товаров без ИКПУ'}
+              </div>
+              <div className="mt-1 text-caption text-ink">
+                Без MXIK ОФД не начислит покупателю кешбэк, а ГНК штрафует
+                магазин на 1% от суммы. Дозаполните ИКПУ + код упаковки в{' '}
+                <em className="not-italic font-medium">mytoolbox → Inventory → Приходы</em>{' '}
+                и обновите чек.
+              </div>
+              <ul className="mt-2 space-y-0.5 text-caption text-ink">
+                {itemsWithoutIkpu.map((name, i) => (
+                  <li key={i} className="flex gap-2">
+                    <span className="text-danger shrink-0">·</span>
+                    <span className="font-mono truncate">{name}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
           </Card.Body>
         </Card>
       )}

@@ -529,17 +529,19 @@ async function fiscalizeJsonRpc(
   receivedCash: number,
   receivedCard: number,
 ): Promise<{ fiscal: FiscalReceiptInfo; requestJson: string }> {
-  // ИКПУ-проверка как WARNING (не throw): если у товара пустой class_code
-  // или package_code, ОФД не начислит покупателю кешбэк и магазин рискует
-  // штрафом 1% от суммы (постановление ВМ-255 от 12.05.2022 п.20 ч.5).
+  // Жёсткий guard: ИКПУ + код упаковки обязательны.
   //
-  // Раньше тут был throw — но это **парализовало бы магазин** при первом же
-  // товаре без ИКПУ (а в legacy-excel-импортах их немало). Лучше пробить
-  // чек и залогировать предупреждение, чем не пробить вообще.
+  // Без MXIK ОФД не начисляет покупателю кешбэк и ГНК штрафует магазин
+  // на 1% от суммы (постановление ВМ-255 от 12.05.2022 п.20 ч.5).
   //
-  // В перспективе — выводить это в UI как баннер «N товаров без ИКПУ → нет
-  // кешбэка». Кассир сам решает: всё равно пробить или дозаполнить ИКПУ
-  // в админке mytoolbox.
+  // Throw здесь — последний рубеж защиты. UI Receipt должен ДО клика
+  // «Фискализировать» показать кассиру баннер «Невозможно — N товаров
+  // без ИКПУ» и заблокировать кнопку. Если каким-то образом этот guard
+  // всё-таки сработает — значит UI не догадался, и у нас bug.
+  //
+  // matcher работает только из source='remote' (товары из mytoolbox), так
+  // что обычно ИКПУ есть. Этот guard страхует от дозаполнения админом
+  // приходов с пустыми колонками MXIK в Excel.
   const noIkpuItems: string[] = []
   for (const pm of build.positions) {
     for (const c of pm.candidates) {
@@ -549,9 +551,11 @@ async function fiscalizeJsonRpc(
     }
   }
   if (noIkpuItems.length > 0) {
-    await log.warn(
-      'fiscalize',
-      `⚠️ ИКПУ отсутствует у ${noIkpuItems.length} товаров — кешбэк не начислится: ${noIkpuItems.join(', ')}`,
+    throw new Error(
+      `Нельзя фискализировать: у ${noIkpuItems.length} товаров отсутствует ИКПУ. ` +
+        `Дозаполните в mytoolbox админке → Inventory → Приходы. ` +
+        `Товары: ${noIkpuItems.slice(0, 3).join(', ')}` +
+        (noIkpuItems.length > 3 ? ` и ещё ${noIkpuItems.length - 3}` : ''),
     )
   }
 
