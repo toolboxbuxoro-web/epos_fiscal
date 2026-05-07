@@ -74,7 +74,16 @@ export interface PoolItem {
  * во всех трёх стратегиях для всех позиций чека.
  */
 export async function loadMatcherPool(opts: MatcherOptions = {}): Promise<MatcherPool> {
-  const rawAll = await listEsfItems({ minAvailable: 1000, limit: 5000 })
+  // source='remote' — только товары синкнутые из mytoolbox (актуальный склад).
+  // Это предотвращает «призраков» из legacy-excel импортов: исторически
+  // программа умела импортировать Excel прямо в локальную DB; после миграции
+  // на remote-only архитектуру (0.10+) эти записи могут содержать товары,
+  // которых уже нет в фактическом учёте, но они засоряли подбор.
+  const rawAll = await listEsfItems({
+    minAvailable: 1000,
+    limit: 5000,
+    source: 'remote',
+  })
   // Исключаем server_item_id'ы которые сервер только что отказал — даже
   // если локальный кэш ещё «думает» что они доступны (SSE не догнал).
   // Без этого retry после 409 сразу попадает в тот же конфликт.
@@ -149,6 +158,12 @@ export function tryPassthrough(
     strategy: 'passthrough',
     diffTiyin: totalSelling - pos.totalTiyin,
     warnings: [],
+    swappable: false, // ИКПУ менять нельзя, даже если есть товары с такой же ценой
+    alternatives: [],
+    selectedAlternativeIndex: -1,
+    splitLevel: 1,
+    canSplitMore: false,
+    splittable: false, // passthrough = ИКПУ совпадает, дробление нарушит учёт
   }
 }
 
@@ -179,29 +194,67 @@ export function tryPriceBucket(
   const tolerance = opts.toleranceTiyin ?? 0
   const strictVat = opts.vatStrict === true
 
-  let best: { item: EsfItemWithAvailable; sellingPrice: Tiyin; diff: number } | null = null
+  // Свапу даём БОЛЬШИЙ tolerance чем основному match'у:
+  //
+  //   - matchTolerance — используется для проверки «хороший ли это match»
+  //     (best должен быть в этом радиусе). По дефолту 100k тийинов = 1000 сум.
+  //   - swapTolerance — радиус для поиска альтернатив. По дефолту 500k
+  //     тийинов = 5000 сум. Даёт кассиру нормальный выбор (обычно 4-10
+  //     товаров), а разницу в цене покрывает distributeDiscount/Bump
+  //     с расширенным лимитом (см. recalculateAfterSwap, где opts
+  //     получают maxDiscountPerItemTiyin = swapTolerance).
+  //
+  // Ниже мы сначала проверяем что best есть (matchTolerance), а потом
+  // расширяем зону поиска до swapTolerance чтобы UI было что показывать.
+  const matchTolerance = tolerance
+  const SWAP_TOLERANCE_DEFAULT = 500_000 // 5000 сум
+  const swapTolerance = Math.max(matchTolerance, SWAP_TOLERANCE_DEFAULT)
+
+  // Собираем ВСЕХ кандидатов в пределах swapTolerance, отсортированных
+  // по близости к target — первый = best.
+  const inRange: { item: EsfItemWithAvailable; sellingPrice: Tiyin; diff: number }[] = []
   for (const p of pool.items) {
     if (strictVat && p.item.vat_percent !== pos.vatPercent) continue
     const diff = Math.abs(p.sellingPrice - pos.totalTiyin)
-    if (diff > tolerance) continue
-    if (!best || diff < best.diff) {
-      best = { item: p.item, sellingPrice: p.sellingPrice, diff }
-    }
+    if (diff > swapTolerance) continue
+    inRange.push({ item: p.item, sellingPrice: p.sellingPrice, diff })
   }
-  if (!best) return null
+  if (inRange.length === 0) return null
+
+  inRange.sort((a, b) => a.diff - b.diff)
+  const best = inRange[0]!
+
+  // Best должен быть в пределах ОСНОВНОГО tolerance — иначе price-bucket
+  // вообще не подходит, лучше провалиться в multi-item стратегию.
+  if (best.diff > matchTolerance) return null
 
   // Цена в чеке = pos.totalTiyin (что покупатель заплатил).
   // best.sellingPrice (расчётная) использовалась только для матчинга.
-  const candidate = makeCandidate(best.item, 1000, pos.totalTiyin)
+  const bestCandidate = makeCandidate(best.item, 1000, pos.totalTiyin)
+
+  // Топ-N альтернатив (включая best) для UI swap. Limit 10 — баланс
+  // между «достаточно выбора» и «UI не тормозит при рендере списка».
+  const ALT_LIMIT = 10
+  const alternatives: MatchCandidate[] = inRange
+    .slice(0, ALT_LIMIT)
+    .map((alt) => makeCandidate(alt.item, 1000, pos.totalTiyin))
 
   return {
     source: pos,
-    candidates: [candidate],
+    candidates: [bestCandidate],
     strategy: 'price-bucket',
     diffTiyin: 0,
     warnings: pos.classCode
       ? [`ИКПУ заменён: ${pos.classCode} → ${best.item.class_code}`]
       : [`Без ИКПУ в исходной позиции, заменён на ${best.item.class_code}`],
+    swappable: alternatives.length > 1,
+    alternatives,
+    selectedAlternativeIndex: 0,
+    splitLevel: 1,
+    // canSplitMore вычисляется в `enrichSplitInfo` после построения, потому что
+    // зависит от состояния пула после всех других позиций.
+    canSplitMore: canSplitToLevel(pos, pool, opts, 2),
+    splittable: true,
   }
 }
 
@@ -265,7 +318,125 @@ export function tryMultiItem(
     strategy: 'multi-item',
     diffTiyin,
     warnings: [`Подобрано ${picks.length} позиций вместо одной`],
+    swappable: false, // MVP: для multi-item swap пока не реализован (Phase 2)
+    alternatives: [],
+    selectedAlternativeIndex: -1,
+    splitLevel: picks.length,
+    canSplitMore: canSplitToLevel(pos, pool, opts, picks.length + 1),
+    splittable: true,
   }
+}
+
+/**
+ * Принудительно подобрать РОВНО N товаров суммарно на `pos.totalTiyin`.
+ *
+ * Используется UI кнопкой «Раздробить»: кассир видит один товар на 99 000 сум,
+ * жмёт «+» — программа подбирает 2 товара на ту же сумму, ещё «+» — 3 и т.д.
+ *
+ * Алгоритм:
+ *   1. targetAvg = pos.totalTiyin / N — целевая средняя цена за единицу
+ *   2. Сортируем пул по близости sellingPrice к targetAvg
+ *   3. Жадно берём первые N с qty=1 шт каждый, проверяя stock
+ *   4. Если набралось < N — возвращает null (UI отрубит «+»)
+ *   5. Сумма обычно ≠ pos.totalTiyin → выравнивается через
+ *      distributeDiscount/Bump (вне этой функции, в rebuildPositionWithSplit).
+ *
+ * Берём 1 шт каждого товара, не суммарное N×qty — чтобы дробить было
+ * максимально предсказуемо (1 клик = +1 строка в чеке).
+ */
+export function tryMultiItemForce(
+  pos: NormalizedPosition,
+  pool: MatcherPool,
+  opts: MatcherOptions,
+  forceItemCount: number,
+): PositionMatch | null {
+  if (pos.totalTiyin <= 0) return null
+  if (forceItemCount < 2) return null
+  const strictVat = opts.vatStrict === true
+  const targetAvg = Math.floor(pos.totalTiyin / forceItemCount)
+
+  // Фильтр по НДС если strict + только товары с qty >= 1 шт.
+  const candidatesPool = pool.items.filter(
+    (p) =>
+      (!strictVat || p.item.vat_percent === pos.vatPercent) &&
+      p.sellingPrice > 0 &&
+      Math.floor(p.item.available / 1000) >= 1,
+  )
+
+  // Сортируем по близости к target_avg.
+  const sorted = [...candidatesPool].sort(
+    (a, b) =>
+      Math.abs(a.sellingPrice - targetAvg) - Math.abs(b.sellingPrice - targetAvg),
+  )
+
+  // Берём первые N уникальных (одна позиция = один товар, не дублируем).
+  const picks: { item: EsfItemWithAvailable; sellingPrice: Tiyin }[] = []
+  const usedIds = new Set<number>()
+  for (const p of sorted) {
+    if (picks.length >= forceItemCount) break
+    if (usedIds.has(p.item.id)) continue
+    picks.push({ item: p.item, sellingPrice: p.sellingPrice })
+    usedIds.add(p.item.id)
+  }
+  if (picks.length < forceItemCount) return null
+
+  // Сумма sellingPrice обычно не равна pos.totalTiyin — distributeBump/Discount
+  // выровняет в rebuildPositionWithSplit. Но мы пишем в priceTiyin именно
+  // sellingPrice (без претензии на точное совпадение) — distribute сделает
+  // финальную коррекцию через priceTiyin/discountTiyin.
+  const candidates: MatchCandidate[] = picks.map(({ item, sellingPrice }) =>
+    makeCandidate(item, 1000, sellingPrice),
+  )
+  const matchedSum = candidates.reduce((s, c) => s + c.priceTiyin, 0)
+
+  return {
+    source: pos,
+    candidates,
+    strategy: 'multi-item',
+    diffTiyin: matchedSum - pos.totalTiyin,
+    warnings: [`Раздроблено на ${forceItemCount} товаров`],
+    swappable: false,
+    alternatives: [],
+    selectedAlternativeIndex: -1,
+    splitLevel: forceItemCount,
+    canSplitMore: canSplitToLevel(pos, pool, opts, forceItemCount + 1),
+    splittable: true,
+  }
+}
+
+/**
+ * Проверить можно ли в этом пуле подобрать N разных товаров на сумму
+ * `pos.totalTiyin`. Используется для UI флага `canSplitMore`.
+ *
+ * Логика: считаем сколько товаров в пуле имеют sellingPrice близкую
+ * к `targetAvg = totalTiyin / N` (в радиусе toleranceTiyin × N для гибкости).
+ * Если их >= N — `true`.
+ *
+ * Дешёвый O(items) проход без сортировок и аллокаций — годится для вызова
+ * на каждую позицию каждого чека.
+ */
+export function canSplitToLevel(
+  pos: NormalizedPosition,
+  pool: MatcherPool,
+  opts: MatcherOptions,
+  N: number,
+): boolean {
+  if (N < 2) return false
+  if (pos.totalTiyin <= 0) return false
+  const targetAvg = Math.floor(pos.totalTiyin / N)
+  // Радиус расширяем пропорционально N — чем больше частей, тем больше
+  // допустимая средняя погрешность по каждой (распределение скомпенсирует).
+  const radius = Math.max(opts.toleranceTiyin ?? 100_000, 200_000) * N
+  const strictVat = opts.vatStrict === true
+  let cnt = 0
+  for (const p of pool.items) {
+    if (strictVat && p.item.vat_percent !== pos.vatPercent) continue
+    if (Math.floor(p.item.available / 1000) < 1) continue
+    if (Math.abs(p.sellingPrice - targetAvg) > radius) continue
+    cnt++
+    if (cnt >= N) return true
+  }
+  return false
 }
 
 /**

@@ -1,4 +1,4 @@
-# EPOS Fiscal — авто-установка dev-окружения на Windows.
+# Toolbox Fiscal — авто-установка dev-окружения на Windows.
 #
 # Запуск (в PowerShell, можно НЕ от админа — winget сам спросит права когда нужно):
 #   irm https://raw.githubusercontent.com/toolboxbuxoro-web/epos_fiscal/main/scripts/setup-windows.ps1 | iex
@@ -18,7 +18,7 @@ function Have($cmd) {
 }
 
 # ─────────────────────────────────────────────────────────────────
-Write-Host "EPOS Fiscal — установка dev-окружения" -ForegroundColor Green
+Write-Host "Toolbox Fiscal — установка dev-окружения" -ForegroundColor Green
 Write-Host "Это займёт ~20–30 минут (Visual Studio Build Tools ~6 ГБ)." -ForegroundColor Yellow
 
 $wingetArgs = '--accept-package-agreements', '--accept-source-agreements', '--silent'

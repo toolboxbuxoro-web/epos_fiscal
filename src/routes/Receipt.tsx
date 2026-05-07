@@ -5,6 +5,11 @@ import {
   ArrowLeft,
   Banknote,
   Check,
+  ChevronLeft,
+  ChevronRight,
+  Minus,
+  Plus,
+  Scissors,
   CreditCard,
   QrCode,
   Send,
@@ -20,7 +25,16 @@ import {
   now,
 } from '@/lib/db'
 import type { MsReceiptRow } from '@/lib/db/types'
-import { buildMatch, extractPositions, type BuildMatchResult } from '@/lib/matcher'
+import {
+  buildMatch,
+  extractPositions,
+  loadMatcherPool,
+  recalculateAfterSwap,
+  rebuildPositionWithSplit,
+  type BuildMatchResult,
+  type MatcherPool,
+} from '@/lib/matcher'
+import type { MatcherOptions } from '@/lib/matcher/types'
 import { fiscalize, InventoryConflictError } from '@/lib/epos'
 import { MoyskladClient, inlinePositions, type MsRetailDemand } from '@/lib/moysklad'
 import {
@@ -45,6 +59,15 @@ export default function Receipt() {
 
   const [receipt, setReceipt] = useState<MsReceiptRow | null>(null)
   const [match, setMatch] = useState<BuildMatchResult | null>(null)
+  // Сохраняем опции последнего вызова buildMatch — нужны при swap/split
+  // (recalculateAfterSwap / rebuildPositionWithSplit вызывают distribute
+  // c теми же лимитами).
+  const [matcherOpts, setMatcherOpts] = useState<MatcherOptions>({})
+  // Кэш пула товаров — переиспользуется при swap/split чтобы не перегружать
+  // SQLite каждый клик. Загружается параллельно с buildMatch.
+  const [pool, setPool] = useState<MatcherPool | null>(null)
+  // Тост для UX «не получилось раздробить» / «нет альтернатив».
+  const [splitToast, setSplitToast] = useState<string | null>(null)
   const [busy, setBusy] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [fiscalizing, setFiscalizing] = useState(false)
@@ -163,15 +186,23 @@ export default function Receipt() {
           : 2000
       const maxDiscountPerItemTiyin = maxDiscountSum * 100
 
-      const result = await buildMatch(parsed, {
+      const opts: MatcherOptions = {
         toleranceTiyin: tolerance,
         markupPercent,
         roundUpToSum,
         discountForExactSum: discountEnabled,
         maxDiscountPerItemTiyin,
         excludeServerItemIds: excludedServerIds.length > 0 ? excludedServerIds : undefined,
-      })
+      }
+      const result = await buildMatch(parsed, opts)
       setMatch(result)
+      setMatcherOpts(opts)
+      // Кэшируем пул для swap/split — заново не загружаем при каждом клике.
+      // buildMatch внутри тоже грузит pool, но эту копию из state мы используем
+      // в UI helpers (rebuildPositionWithSplit). Это +50ms при первом open
+      // приемлемо — у юзера всё равно идёт fetch МС-чека и тяжёлый buildMatch.
+      const freshPool = await loadMatcherPool(opts)
+      setPool(freshPool)
 
       const test = (await getSetting(SettingKey.TestMode)) === 'true'
       setTestMode(test)
@@ -345,21 +376,125 @@ export default function Receipt() {
           sumDiff={match.totalDiffTiyin}
         >
           <PositionsTable
-            positions={match.positions.flatMap((pm) =>
-              pm.candidates.map((c) => ({
-                name: c.esfItem.name,
-                quantity: c.quantity,
-                total: c.priceTiyin - c.discountTiyin,
-                discount: c.discountTiyin > 0 ? c.discountTiyin : undefined,
-                originalPrice: c.discountTiyin > 0 ? c.priceTiyin : undefined,
-                vatPercent: c.esfItem.vat_percent,
-                meta: c.esfItem.class_code,
-                matched: true,
-              })),
+            positions={match.positions.flatMap((pm, posIdx) =>
+              pm.candidates.map((c, candIdx) => {
+                // Стрелки swap рисуем только на ПЕРВОМ candidate в группе
+                // и только когда позиция не дроблёная (splitLevel=1).
+                // При splitLevel>1 несколько строк — нечего свапать одной кнопкой.
+                const isFirstCand = candIdx === 0
+                const swap =
+                  pm.swappable &&
+                  isFirstCand &&
+                  pm.splitLevel === 1 &&
+                  pm.alternatives.length > 1
+                    ? {
+                        altIndex: pm.selectedAlternativeIndex,
+                        altCount: pm.alternatives.length,
+                        onPrev:
+                          pm.selectedAlternativeIndex > 0
+                            ? () =>
+                                setMatch(
+                                  recalculateAfterSwap(
+                                    match,
+                                    posIdx,
+                                    pm.selectedAlternativeIndex - 1,
+                                    matcherOpts,
+                                  ),
+                                )
+                            : undefined,
+                        onNext:
+                          pm.selectedAlternativeIndex < pm.alternatives.length - 1
+                            ? () =>
+                                setMatch(
+                                  recalculateAfterSwap(
+                                    match,
+                                    posIdx,
+                                    pm.selectedAlternativeIndex + 1,
+                                    matcherOpts,
+                                  ),
+                                )
+                            : undefined,
+                      }
+                    : undefined
+                // Split-контрол показывается только на ПЕРВОМ candidate группы.
+                // Кнопки enabled зависят от splitLevel + canSplitMore.
+                const split =
+                  pm.splittable && isFirstCand
+                    ? {
+                        level: pm.splitLevel,
+                        onMore:
+                          pm.canSplitMore && pool
+                            ? () => {
+                                const next = rebuildPositionWithSplit(
+                                  match,
+                                  posIdx,
+                                  pm.splitLevel + 1,
+                                  pool,
+                                  matcherOpts,
+                                )
+                                if (next) {
+                                  setMatch(next)
+                                  setSplitToast(null)
+                                } else {
+                                  setSplitToast(
+                                    `Не получилось раздробить позицию «${pm.source.name}» на ${pm.splitLevel + 1} товаров — недостаточно товаров на эту цену в справочнике.`,
+                                  )
+                                }
+                              }
+                            : undefined,
+                        onLess:
+                          pm.splitLevel > 1 && pool
+                            ? () => {
+                                const next = rebuildPositionWithSplit(
+                                  match,
+                                  posIdx,
+                                  pm.splitLevel - 1,
+                                  pool,
+                                  matcherOpts,
+                                )
+                                if (next) {
+                                  setMatch(next)
+                                  setSplitToast(null)
+                                }
+                              }
+                            : undefined,
+                      }
+                    : undefined
+                return {
+                  name: c.esfItem.name,
+                  quantity: c.quantity,
+                  total: c.priceTiyin - c.discountTiyin,
+                  discount: c.discountTiyin > 0 ? c.discountTiyin : undefined,
+                  originalPrice: c.discountTiyin > 0 ? c.priceTiyin : undefined,
+                  vatPercent: c.esfItem.vat_percent,
+                  meta: c.esfItem.class_code,
+                  matched: true,
+                  swap,
+                  split,
+                }
+              }),
             )}
           />
         </Side>
       </div>
+
+      {/* Баннер «не получилось раздробить» — показывается когда matcher не нашёл
+          достаточно товаров для запрошенного уровня split. */}
+      {splitToast && (
+        <Card className="border-warning/30 bg-warning-soft">
+          <Card.Body className="flex items-start gap-3">
+            <TriangleAlert size={18} className="text-warning shrink-0 mt-0.5" />
+            <div className="flex-1 text-body text-ink">{splitToast}</div>
+            <button
+              type="button"
+              onClick={() => setSplitToast(null)}
+              className="text-caption text-ink-muted hover:text-ink shrink-0"
+            >
+              Закрыть
+            </button>
+          </Card.Body>
+        </Card>
+      )}
 
       {match.warnings.length > 0 && (
         <Card className="border-warning/20 bg-warning-soft">
@@ -408,6 +543,35 @@ interface DisplayPosition {
   vatPercent: number
   meta: string
   matched: boolean
+  /**
+   * Контрол для замены товара на другой по той же цене.
+   *
+   * Включается только для price-bucket позиций (где matcher выбрал товар
+   * по близости цены, а не по точному ИКПУ). Кассир может переключаться
+   * через `←` `→` чтобы выбрать другой товар на ту же сумму.
+   *
+   * `altIndex` / `altCount` — для счётчика «2 / 10» в UI.
+   * Колбеки `onPrev`/`onNext` undefined на крайних индексах (=> кнопка disabled).
+   */
+  swap?: {
+    altIndex: number
+    altCount: number
+    onPrev?: () => void
+    onNext?: () => void
+  }
+  /**
+   * Контрол дробления — кассир может разбить один товар на несколько меньших
+   * или собрать обратно. Показывается только на первой строке группы и
+   * только для splittable позиций (НЕ passthrough).
+   *
+   * `onMore` undefined если в пуле уже не хватит товаров на следующий уровень
+   * (canSplitMore=false). `onLess` undefined при splitLevel=1.
+   */
+  split?: {
+    level: number
+    onMore?: () => void
+    onLess?: () => void
+  }
 }
 
 function PositionsTable({ positions }: { positions: DisplayPosition[] }) {
@@ -447,10 +611,14 @@ function PositionsTable({ positions }: { positions: DisplayPosition[] }) {
               <MatchIcon matched={p.matched} />
             </td>
             <td className="px-3 py-3">
-              <div className="font-medium text-ink">{p.name}</div>
+              <div className="flex items-center gap-2 flex-wrap">
+                {p.swap && <SwapControl swap={p.swap} />}
+                <div className="font-medium text-ink">{p.name}</div>
+              </div>
               <div className="font-mono text-caption text-ink-subtle mt-0.5">
                 {p.meta} · НДС {p.vatPercent}%
               </div>
+              {p.split && <SplitControl split={p.split} />}
             </td>
             <td className="px-3 py-3 text-right tabular-nums text-ink-muted">
               {milliQtyToDisplay(p.quantity)}
@@ -476,6 +644,109 @@ function PositionsTable({ positions }: { positions: DisplayPosition[] }) {
         ))}
       </tbody>
     </table>
+  )
+}
+
+/**
+ * Контрол `← 2 / 10 →` для переключения товара на альтернативу той же цены.
+ *
+ * Появляется рядом с названием товара только для price-bucket позиций
+ * (matcher выбрал товар по близости цены, не по точному ИКПУ — значит
+ * есть свобода выбора другого товара).
+ */
+function SwapControl({
+  swap,
+}: {
+  swap: {
+    altIndex: number
+    altCount: number
+    onPrev?: () => void
+    onNext?: () => void
+  }
+}) {
+  return (
+    <div className="inline-flex items-center gap-1 shrink-0">
+      <button
+        type="button"
+        onClick={swap.onPrev}
+        disabled={!swap.onPrev}
+        title="Предыдущий товар той же цены"
+        className={cn(
+          'inline-flex h-6 w-6 items-center justify-center rounded-md border border-border',
+          'hover:bg-surface-hover transition-colors',
+          'disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent',
+        )}
+      >
+        <ChevronLeft size={14} />
+      </button>
+      <span className="text-caption text-ink-muted tabular-nums w-12 text-center select-none">
+        {swap.altIndex + 1} / {swap.altCount}
+      </span>
+      <button
+        type="button"
+        onClick={swap.onNext}
+        disabled={!swap.onNext}
+        title="Следующий товар той же цены"
+        className={cn(
+          'inline-flex h-6 w-6 items-center justify-center rounded-md border border-border',
+          'hover:bg-surface-hover transition-colors',
+          'disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent',
+        )}
+      >
+        <ChevronRight size={14} />
+      </button>
+    </div>
+  )
+}
+
+/**
+ * Контрол `[Раздробить] − N +` — позволяет разбить один товар на несколько
+ * на ту же сумму или собрать обратно.
+ *
+ * Размещается под названием товара/ИКПУ строки. Показывается только на
+ * ПЕРВОЙ строке группы (так что для split=3 кнопка одна на 3 товара).
+ */
+function SplitControl({
+  split,
+}: {
+  split: { level: number; onMore?: () => void; onLess?: () => void }
+}) {
+  return (
+    <div className="mt-1.5 inline-flex items-center gap-1.5">
+      <span className="inline-flex items-center gap-1 text-caption text-ink-muted">
+        <Scissors size={11} />
+        Раздробить:
+      </span>
+      <button
+        type="button"
+        onClick={split.onLess}
+        disabled={!split.onLess}
+        title="Собрать в один товар"
+        className={cn(
+          'inline-flex h-6 w-6 items-center justify-center rounded-md border border-border',
+          'hover:bg-surface-hover transition-colors',
+          'disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent',
+        )}
+      >
+        <Minus size={12} />
+      </button>
+      <span className="text-caption text-ink tabular-nums w-5 text-center font-medium select-none">
+        {split.level}
+      </span>
+      <button
+        type="button"
+        onClick={split.onMore}
+        disabled={!split.onMore}
+        title="Раздробить ещё на один товар"
+        className={cn(
+          'inline-flex h-6 w-6 items-center justify-center rounded-md border border-border',
+          'hover:bg-surface-hover transition-colors',
+          'disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent',
+        )}
+      >
+        <Plus size={12} />
+      </button>
+    </div>
   )
 }
 

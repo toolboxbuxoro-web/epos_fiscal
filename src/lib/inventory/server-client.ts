@@ -1,5 +1,5 @@
 /**
- * Клиент для общения с EPOS Fiscal Inventory API на mytoolbox-сервере.
+ * Клиент для общения с Toolbox Fiscal Inventory API на mytoolbox-сервере.
  *
  * Все запросы идут через Bearer-аутентификацию (api_key per-shop).
  * `tauri-plugin-http` (reqwest) — потому что обычный fetch'у CORS мешает,

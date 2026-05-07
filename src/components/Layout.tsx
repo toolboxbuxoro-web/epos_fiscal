@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { NavLink, Outlet, useNavigate } from 'react-router-dom'
+import { NavLink, Outlet } from 'react-router-dom'
 import {
   FileText,
   History as HistoryIcon,
@@ -48,7 +48,6 @@ const NAV_LINKS: NavItem[] = [
 ]
 
 export default function Layout() {
-  const navigate = useNavigate()
   const [shopName, setShopName] = useState<string | null>(null)
   const [msLogin, setMsLogin] = useState<string | null>(null)
   const [employeeName, setEmployeeName] = useState<string | null>(null)
@@ -67,16 +66,19 @@ export default function Layout() {
   }, [])
 
   async function onLogout() {
-    if (
-      !confirm(
-        'Выйти? Локальные настройки сессии (логин МойСклад, токены) будут стёрты. ' +
-          'Войти снова можно вашим МС email и паролем.',
-      )
-    )
-      return
-    stopShiftRuntime()
-    await signOut()
-    navigate('/login', { replace: true })
+    // confirm() в Tauri webview иногда зависает / не возвращает значение,
+    // поэтому делаем logout сразу. Если юзер промахнулся — просто залогинится
+    // обратно своим паролем за 5 секунд.
+    try {
+      stopShiftRuntime()
+      await signOut()
+    } catch (e) {
+      console.error('signOut failed:', e)
+    }
+    // Принудительный reload — самый надёжный способ сбросить in-memory state
+    // (поллеры, SSE-коннекшены, кэши). После reload AppGate в useEffect
+    // вызовет hasActiveSession() и увидит чистые Settings → редирект на /login.
+    window.location.reload()
   }
 
   return (
@@ -91,7 +93,7 @@ export default function Layout() {
             </div>
             <div className="min-w-0 flex-1">
               <div className="text-caption text-ink-muted leading-tight">
-                EPOS Fiscal
+                Toolbox Fiscal
               </div>
               <div className="text-body font-semibold text-ink leading-tight truncate">
                 {shopName || '—'}

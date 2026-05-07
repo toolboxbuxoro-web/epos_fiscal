@@ -186,18 +186,33 @@ export function inlineAssortment(
   return null
 }
 
-/** Парсинг даты МойСклад "YYYY-MM-DD HH:MM:SS.SSS" → epoch секунды. */
+/**
+ * Парсинг даты МойСклад "YYYY-MM-DD HH:MM:SS.SSS" → epoch секунды.
+ *
+ * МойСклад API ВСЕГДА возвращает время в МСК (UTC+3) без указания таймзоны.
+ * Поэтому добавляем явный offset `+03:00`, иначе при отображении на машинах
+ * с другим часовым поясом (Узбекистан UTC+5, например) получится сдвиг.
+ *
+ * Документация: https://dev.moysklad.ru/doc/api/remap/1.2/#mojsklad-json-api-obschie-svedeniq-format-daty-i-vremeni
+ */
 export function parseMsMoment(s: string): number {
   // Пробел между датой и временем. Trailing fractional seconds опциональны.
-  const iso = s.replace(' ', 'T') + 'Z' // считаем как UTC; реально МойСклад в МСК-таймзоне
+  const iso = s.replace(' ', 'T') + '+03:00'
   const t = Date.parse(iso)
   if (Number.isNaN(t)) return 0
   return Math.floor(t / 1000)
 }
 
-/** Форматирование даты для filter-параметра МойСклад: "YYYY-MM-DD HH:MM:SS.SSS". */
+/**
+ * Форматирование даты для filter-параметра МойСклад: "YYYY-MM-DD HH:MM:SS.SSS".
+ *
+ * МС интерпретирует filter-параметр как МСК-время. Поэтому при формировании
+ * курсора `updated>...` берём UTC-эпоху, прибавляем 3 часа и форматируем
+ * как «MSK без таймзоны» — это то что МС ожидает на стороне filter'а.
+ */
 export function formatMsMoment(epochSec: number): string {
-  const d = new Date(epochSec * 1000)
+  // +3 часа к UTC чтобы получить MSK-time для фильтра
+  const d = new Date((epochSec + 3 * 3600) * 1000)
   const yyyy = d.getUTCFullYear()
   const mm = String(d.getUTCMonth() + 1).padStart(2, '0')
   const dd = String(d.getUTCDate()).padStart(2, '0')

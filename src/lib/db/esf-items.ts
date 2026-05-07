@@ -7,6 +7,16 @@ export interface EsfItemFilter {
   classCode?: string
   vatPercent?: number
   search?: string
+  /**
+   * Фильтр по источнику данных:
+   *   'remote' — только синкнутые с mytoolbox (актуальный приход)
+   *   'excel' / 'e-faktura' / 'didox' — старые локальные импорты (legacy)
+   *   undefined — все источники
+   *
+   * Matcher должен использовать только 'remote'. Старые excel-импорты могут
+   * содержать призрачные товары, которых уже нет в актуальном складском учёте.
+   */
+  source?: string
   limit?: number
   offset?: number
 }
@@ -38,6 +48,10 @@ export async function listEsfItems(filter: EsfItemFilter = {}): Promise<EsfItemW
     where.push(`(name LIKE $${n} OR barcode LIKE $${n})`)
     params.push(`%${filter.search}%`)
     n++
+  }
+  if (filter.source) {
+    where.push(`source = $${n++}`)
+    params.push(filter.source)
   }
 
   const limit = filter.limit ?? 200

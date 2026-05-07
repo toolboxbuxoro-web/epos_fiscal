@@ -16,15 +16,19 @@ interface Props extends ButtonHTMLAttributes<HTMLButtonElement> {
   iconRight?: ReactNode
 }
 
+// Используем hardcoded `text-white` / `text-zinc-900` вместо CSS-токенов
+// `text-ink-inverse`, потому что в Tauri WKWebView с macOS Dark Mode UA-стили
+// иногда пробивают CSS-переменные form-controls. Hardcoded `white`/`zinc-900`
+// 100% переопределяет system-цвета и гарантирует читаемость в любой среде.
 const variants: Record<Variant, string> = {
   primary:
-    'bg-primary text-ink-inverse hover:bg-primary-hover disabled:bg-ink-subtle disabled:text-ink-inverse',
+    'bg-primary text-white hover:bg-primary-hover disabled:bg-ink-subtle disabled:text-white',
   secondary:
     'bg-surface text-ink border border-border hover:bg-surface-hover disabled:opacity-50',
   ghost:
     'bg-transparent text-ink-muted hover:bg-surface-hover hover:text-ink disabled:opacity-50',
   danger:
-    'bg-danger text-ink-inverse hover:opacity-90 disabled:opacity-50',
+    'bg-danger text-white hover:opacity-90 disabled:opacity-50',
 }
 
 const sizes: Record<Size, string> = {

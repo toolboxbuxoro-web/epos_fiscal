@@ -4,6 +4,7 @@ import {
   costWithVat,
   loadMatcherPool,
   tryMultiItem,
+  tryMultiItemForce,
   tryPassthrough,
   tryPriceBucket,
   vatIncluded,
@@ -21,6 +22,7 @@ import { tiyinToSumDisplay } from '@/lib/format'
 
 export * from './types'
 export { extractPositions } from './extract'
+export { loadMatcherPool, type MatcherPool } from './strategies'
 
 /**
  * Главная функция: собрать план фискализации для чека МойСклад.
@@ -154,6 +156,194 @@ export async function buildMatch(
     matchedTotalTiyin: matchedTotal,
     canAutoFiscalize,
     warnings,
+  }
+}
+
+/**
+ * Пересчитать BuildMatchResult после swap товара на альтернативу.
+ *
+ * Используется в UI Receipt.tsx когда кассир жмёт стрелку `←`/`→`
+ * у swappable-позиции (price-bucket).
+ *
+ * Что делается:
+ *   1. Заменяет `candidates[0]` выбранной позиции на `alternatives[newIndex]`
+ *      (с обнулённой скидкой — она будет пересчитана ниже).
+ *   2. Сбрасывает дискаунты/бампы у ВСЕХ позиций (не только у swappable —
+ *      потому что distribute-функции могли распределить разницу по нескольким).
+ *   3. Заново применяет `distributeDiscount` + `distributeBump` под
+ *      `receipt.sum`. Это даёт точное совпадение суммы 1-в-1 в обе стороны.
+ *   4. Пересчитывает `matchedTotalTiyin`, `totalDiffTiyin`.
+ *
+ * Чистая функция — оригинальный `result` не мутируется. Возвращает новый
+ * объект (UI просто `setMatch(result)`).
+ */
+export function recalculateAfterSwap(
+  result: BuildMatchResult,
+  positionIndex: number,
+  newAlternativeIndex: number,
+  opts: MatcherOptions = {},
+): BuildMatchResult {
+  if (positionIndex < 0 || positionIndex >= result.positions.length) {
+    return result // невалидный индекс — no-op
+  }
+  const target = result.positions[positionIndex]!
+  if (!target.swappable) return result
+  const alt = target.alternatives[newAlternativeIndex]
+  if (!alt) return result // индекс вне диапазона
+
+  // Глубокий клон позиций. Мутируем только клон.
+  const newPositions = result.positions.map((p, i) => {
+    if (i !== positionIndex) {
+      // Сбрасываем discount у всех candidates, чтобы distribute-функции
+      // считали с нуля (иначе старые скидки с прошлого распределения
+      // останутся и сумма «съедет»).
+      return {
+        ...p,
+        candidates: p.candidates.map((c) => ({
+          ...c,
+          discountTiyin: 0,
+          vatTiyin: vatIncluded(c.priceTiyin, c.esfItem.vat_percent),
+        })),
+      }
+    }
+    // Свапаемая позиция — заменяем единственного кандидата на alt.
+    const freshAlt = {
+      ...alt,
+      discountTiyin: 0,
+      vatTiyin: vatIncluded(alt.priceTiyin, alt.esfItem.vat_percent),
+    }
+    return {
+      ...p,
+      candidates: [freshAlt],
+      selectedAlternativeIndex: newAlternativeIndex,
+    }
+  })
+
+  // Применяем distribute заново. Receipt.sum — целевая сумма (что МС хочет видеть).
+  //
+  // Важно: при swap кассир может выбрать товар отличающийся по цене на
+  // несколько тысяч сум от target. distributeDiscount/Bump по дефолту
+  // лимитированы 200k тийинов (2000 сум) на позицию — этого может не хватить.
+  // Поднимаем лимит до 500k тийинов (5000 сум) — это совпадает с swapTolerance
+  // в `tryPriceBucket`, так что любая выбранная альтернатива гарантированно
+  // компенсируется и итог чека будет = receipt.sum.
+  const target_sum = result.receipt.sum
+  const swapOpts: MatcherOptions = {
+    ...opts,
+    discountForExactSum: true, // forced ON для swap — иначе сумма съедет
+    maxDiscountPerItemTiyin: Math.max(
+      opts.maxDiscountPerItemTiyin ?? 200_000,
+      500_000,
+    ),
+  }
+  distributeDiscount(newPositions, target_sum, swapOpts)
+  distributeBump(newPositions, target_sum, swapOpts)
+
+  const matchedTotal = newPositions.reduce(
+    (s, m) =>
+      s + m.candidates.reduce((cs, c) => cs + c.priceTiyin - c.discountTiyin, 0),
+    0,
+  )
+
+  return {
+    ...result,
+    positions: newPositions,
+    matchedTotalTiyin: matchedTotal,
+    totalDiffTiyin: matchedTotal - target_sum,
+  }
+}
+
+/**
+ * Пересобрать одну позицию с другим уровнем дробления (split).
+ *
+ * Используется UI кнопками «−» / «+» в SplitControl — кассир может разбить
+ * один товар на несколько меньших или собрать обратно.
+ *
+ *   newSplitLevel = 1 → пробуем passthrough → priceBucket (один товар)
+ *   newSplitLevel ≥ 2 → tryMultiItemForce (ровно N товаров)
+ *
+ * Что делается:
+ *   1. Запускает соответствующую стратегию для одной позиции
+ *   2. Если стратегия вернула null — возвращает `result` БЕЗ изменений
+ *      (UI должен показать toast «не получилось» и не менять splitLevel).
+ *   3. Заменяет позицию в массиве, сбрасывает discount у всех (потому что
+ *      сумма всех matched поменялась).
+ *   4. Заново применяет distributeDiscount/Bump с расширенным лимитом
+ *      (как в recalculateAfterSwap — чтобы свапы и дробления компенсировались).
+ *   5. Пересчитывает overall totals.
+ *
+ * Pool передаётся снаружи (из useState в Receipt) — не загружается
+ * заново, чтобы UI не лагал. Pool обновляется только при загрузке чека
+ * или при rematch после reserve-conflict.
+ *
+ * Чистая функция — оригинальный `result` не мутируется.
+ *
+ * @returns обновлённый BuildMatchResult или null если split не получился
+ */
+export function rebuildPositionWithSplit(
+  result: BuildMatchResult,
+  positionIndex: number,
+  newSplitLevel: number,
+  pool: MatcherPool,
+  opts: MatcherOptions = {},
+): BuildMatchResult | null {
+  if (positionIndex < 0 || positionIndex >= result.positions.length) return null
+  if (newSplitLevel < 1) return null
+  const target = result.positions[positionIndex]!
+  if (!target.splittable) return null
+
+  // Выбираем стратегию по уровню.
+  let newMatch: PositionMatch | null
+  if (newSplitLevel === 1) {
+    // Возврат к одиночному товару — пробуем те же стратегии что и в buildMatch
+    // (passthrough → priceBucket; multi-item не зовём, он сам бы тоже не дал
+    // splitLevel=1).
+    newMatch =
+      tryPassthrough(target.source, pool, opts) ??
+      tryPriceBucket(target.source, pool, opts)
+  } else {
+    newMatch = tryMultiItemForce(target.source, pool, opts, newSplitLevel)
+  }
+  if (!newMatch) return null
+
+  // Заменяем позицию + сбрасываем discount у ВСЕХ (заново распределим ниже).
+  const newPositions = result.positions.map((p, i) => {
+    if (i === positionIndex) return newMatch!
+    return {
+      ...p,
+      candidates: p.candidates.map((c) => ({
+        ...c,
+        discountTiyin: 0,
+        vatTiyin: vatIncluded(c.priceTiyin, c.esfItem.vat_percent),
+      })),
+    }
+  })
+
+  // Те же расширенные лимиты что и для swap — split может дать большую
+  // погрешность по сумме чем 2000 сум, особенно при N=4-5.
+  const target_sum = result.receipt.sum
+  const adjustOpts: MatcherOptions = {
+    ...opts,
+    discountForExactSum: true,
+    maxDiscountPerItemTiyin: Math.max(
+      opts.maxDiscountPerItemTiyin ?? 200_000,
+      500_000,
+    ),
+  }
+  distributeDiscount(newPositions, target_sum, adjustOpts)
+  distributeBump(newPositions, target_sum, adjustOpts)
+
+  const matchedTotal = newPositions.reduce(
+    (s, m) =>
+      s + m.candidates.reduce((cs, c) => cs + c.priceTiyin - c.discountTiyin, 0),
+    0,
+  )
+
+  return {
+    ...result,
+    positions: newPositions,
+    matchedTotalTiyin: matchedTotal,
+    totalDiffTiyin: matchedTotal - target_sum,
   }
 }
 

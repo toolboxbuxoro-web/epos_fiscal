@@ -15,7 +15,11 @@
  * нечитаемые (тёмный текст на тёмном фоне).
  */
 :root {
-  color-scheme: light;
+  /* `only light` (вместо просто `light`) — жёстко запрещает WebView применять
+     системные UA-стили для form-controls в macOS Dark Mode. Без `only` Tauri
+     WKWebView всё равно перекрашивал <button> в тёмные цвета поверх наших
+     токенов (тёмный текст на чёрном фоне primary-кнопки). */
+  color-scheme: only light;
   /* Neutral surfaces */
   --canvas: 250 250 250;          /* #fafafa — фон страницы */
   --surface: 255 255 255;         /* #ffffff — фон карточек */
@@ -82,6 +86,18 @@
     @apply bg-canvas text-ink antialiased font-sans;
     /* Tabular figures для денежных значений в таблицах */
     font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  }
+
+  /* Belt-and-suspenders: даже при `color-scheme: only light` некоторые
+     macOS WKWebView версии всё ещё применяют системную тёмную палитру к
+     form-controls. Явное `appearance: none` гарантирует что цвет берётся
+     ТОЛЬКО из наших Tailwind-классов, без UA-наложений. */
+  button,
+  input,
+  select,
+  textarea {
+    appearance: none;
+    -webkit-appearance: none;
   }
 
   /* Sensible focus rings для accessibility */

@@ -152,7 +152,7 @@ fn print_raw(printer_name: &str, bytes: &[u8]) -> Result<u64, String> {
         &[("document-format", "application/vnd.cups-raw")];
 
     let options = PrinterJobOptions {
-        name: Some("EPOS Fiscal — чек"),
+        name: Some("Toolbox Fiscal — чек"),
         raw_properties,
         converter: printers::common::converters::Converter::None,
     };

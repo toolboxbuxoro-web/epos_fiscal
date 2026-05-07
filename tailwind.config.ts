@@ -1,7 +1,7 @@
 import type { Config } from 'tailwindcss'
 
 /**
- * EPOS Fiscal — design tokens.
+ * Toolbox Fiscal — design tokens.
  *
  * Все цвета, типографика и шкалы заданы здесь и в src/index.css (CSS variables).
  * Правила см. в docs/ui-conventions.md.

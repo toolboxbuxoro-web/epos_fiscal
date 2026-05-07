@@ -1,7 +1,7 @@
 [package]
 name = "epos-fiscal"
 version = "0.1.0"
-description = "EPOS Fiscal — fiscalization helper for Uzbekistan"
+description = "Toolbox Fiscal — fiscalization helper for Uzbekistan"
 authors = ["epos_fiscal"]
 edition = "2021"
 

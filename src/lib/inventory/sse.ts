@@ -58,6 +58,14 @@ export function subscribeToInventoryEvents(opts: SubscribeOptions): () => void {
             Authorization: `Bearer ${opts.apiKey}`,
             Accept: 'text/event-stream',
             'Cache-Control': 'no-cache',
+            // ВАЖНО: явно отключаем сжатие. Tauri http plugin (reqwest)
+            // по дефолту шлёт `Accept-Encoding: gzip` (фича включена в
+            // Cargo.toml для МойСклад API) и пытается декомпрессить ответ.
+            // SSE — это потоковый event-stream без сжатия; gzip-декодер
+            // падает с «error decoding response body» на первом chunk'е.
+            // `identity` = «никаких преобразований», reqwest отдаст body
+            // как есть.
+            'Accept-Encoding': 'identity',
           },
           signal: controller.signal,
         })

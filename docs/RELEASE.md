@@ -14,8 +14,8 @@ npm run build
 Результаты:
 ```
 src-tauri/target/release/bundle/
-├── dmg/EPOS Fiscal_0.1.0_<arch>.dmg
-└── macos/EPOS Fiscal.app
+├── dmg/Toolbox Fiscal_0.1.0_<arch>.dmg
+└── macos/Toolbox Fiscal.app
 ```
 
 `.dmg` — это инсталлятор, который можно отдать пользователю. `.app` — само приложение.

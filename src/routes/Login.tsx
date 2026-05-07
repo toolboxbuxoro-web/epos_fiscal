@@ -1,5 +1,4 @@
 import { useEffect, useState, type FormEvent } from 'react'
-import { useNavigate } from 'react-router-dom'
 import { LogIn, Receipt, Settings as SettingsIcon } from 'lucide-react'
 import { Button, Field, Input, Card } from '@/components/ui'
 import { getSetting, setSetting, SettingKey } from '@/lib/db'
@@ -29,7 +28,6 @@ const DEFAULT_SERVER_URL = 'https://backend-production-c3d4.up.railway.app'
  * в Phase D, пока кнопка просто переходит в /settings).
  */
 export default function Login() {
-  const navigate = useNavigate()
   const devMode = useDevMode()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -63,7 +61,12 @@ export default function Login() {
     try {
       const result = await signInWithMs({ email, password })
       if (result.ok) {
-        navigate('/', { replace: true })
+        // Полный reload вместо navigate(): нужно перезапустить App.tsx
+        // mount-эффект чтобы `ensureInventoryRuntime()` подхватил свежие
+        // creds. SoftNavigate оставит in-memory флаг runtime=false с
+        // момента когда мы были не залогинены.
+        window.location.href = '/'
+        window.location.reload()
       } else {
         setError(result.message)
       }
@@ -93,7 +96,7 @@ export default function Login() {
             <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary text-ink-inverse">
               <Receipt size={20} />
             </div>
-            <span className="text-heading font-semibold">EPOS Fiscal</span>
+            <span className="text-heading font-semibold">Toolbox Fiscal</span>
           </div>
         </div>
 
@@ -109,13 +112,13 @@ export default function Login() {
 
           <Card.Body>
             <form onSubmit={onSubmit} className="flex flex-col gap-4">
-              <Field label="Email МойСклад" htmlFor="email">
+              <Field label="Логин МойСклад" htmlFor="email">
                 <Input
                   id="email"
-                  type="email"
+                  type="text"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
-                  placeholder="kassa@toolbox.uz"
+                  placeholder="user@account_name"
                   autoComplete="username"
                   autoFocus
                   disabled={busy}

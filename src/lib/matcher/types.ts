@@ -55,6 +55,47 @@ export interface PositionMatch {
   diffTiyin: Tiyin
   /** Если нужна ручная подстройка — список причин. */
   warnings: string[]
+  /**
+   * Доступен ли swap товара через UI-стрелки `←` / `→`?
+   *
+   * - **price-bucket** → true (выбираем товар по цене, ИКПУ всё равно меняем)
+   * - **passthrough** → false (нельзя менять конкретный ИКПУ-товар, нарушит учёт)
+   * - **multi-item** → false в MVP (нужен сложный UI для группы; Phase 2)
+   */
+  swappable: boolean
+  /**
+   * Альтернативные варианты замены той же ms-позиции — для UI swap-кнопок.
+   * Сортированы по близости цены к `source.totalTiyin`. Первый элемент —
+   * текущий выбор (продублирован из `candidates[0]`). Пустой массив если
+   * `swappable === false` или альтернатив не нашлось.
+   */
+  alternatives: MatchCandidate[]
+  /** Индекс активного варианта в `alternatives`. -1 если alternatives пуст. */
+  selectedAlternativeIndex: number
+  /**
+   * Текущее число товаров в подборе (= `candidates.length` для multi-item-force).
+   *
+   *   1 = одна строка (passthrough / price-bucket / single-item multi)
+   *   2+ = принудительное дробление через UI «Раздробить»
+   *
+   * Используется в UI чтобы:
+   *   - показать счётчик в SplitControl («Раздробить: − 2 +»)
+   *   - скрыть swap-стрелки если splitLevel>1 (нечего свапать одной кнопкой)
+   */
+  splitLevel: number
+  /**
+   * Можно ли увеличить splitLevel? false если в пуле не хватит уникальных
+   * товаров с подходящей ценой для следующего уровня дробления.
+   * UI делает кнопку «+» disabled.
+   */
+  canSplitMore: boolean
+  /**
+   * Можно ли вообще дробить позицию?
+   *   - false для passthrough (нарушит ИКПУ-учёт)
+   *   - true для price-bucket / multi-item
+   * Если false — UI прячет SplitControl целиком.
+   */
+  splittable: boolean
 }
 
 export interface BuildMatchResult {

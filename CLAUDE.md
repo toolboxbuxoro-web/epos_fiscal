@@ -27,7 +27,7 @@
 ## Архитектура (один магазин)
 
 ```
-МойСклад API ──────HTTPS──────► EPOS Fiscal (наша программа на Win)
+МойСклад API ──────HTTPS──────► Toolbox Fiscal (наша программа на Win)
 (розничная касса)                    │
                                      │ HTTP localhost
                                      ▼
@@ -390,7 +390,7 @@ docs/
 
 1. На Win-машине запустить: `irm https://raw.githubusercontent.com/toolboxbuxoro-web/epos_fiscal/main/scripts/setup-windows.ps1 | iex` (если разработка) или скачать `.exe` из GitHub Releases.
 2. Установить EPOS Cashdesk + USB-фискальный модуль (если ещё нет — это E-POS делает).
-3. Открыть EPOS Fiscal → Настройки:
+3. Открыть Toolbox Fiscal → Настройки:
    - Логин/пароль МойСклад → Войти
    - Точка продаж: выбрать конкретный магазин
    - Кассир: выбрать ФИО (для печати)
