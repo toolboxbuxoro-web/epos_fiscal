@@ -80,7 +80,7 @@ const empty: FormState = {
   moyskladEmployeeId: '',
   moyskladEmployeeName: '',
   moyskladPollInterval: '30',
-  eposCommunicatorUrl: 'http://localhost:3448/rpc/api',
+  eposCommunicatorUrl: 'http://localhost:8347/uzpos',
   eposToken: 'DXJFX32CN1296678504F2',
   companyName: '',
   companyInn: '',
@@ -182,7 +182,7 @@ export default function Settings() {
       moyskladEmployeeName: all[SettingKey.MoyskladEmployeeName] ?? '',
       moyskladPollInterval: all[SettingKey.MoyskladPollIntervalSec] ?? '30',
       eposCommunicatorUrl:
-        all[SettingKey.EposCommunicatorUrl] ?? 'http://localhost:3448/rpc/api',
+        all[SettingKey.EposCommunicatorUrl] ?? 'http://localhost:8347/uzpos',
       eposToken: all[SettingKey.EposToken] ?? 'DXJFX32CN1296678504F2',
       companyName: all[SettingKey.CompanyName] ?? '',
       companyInn: all[SettingKey.CompanyInn] ?? '',
@@ -449,7 +449,7 @@ export default function Settings() {
     // Сначала пробуем JSON-RPC :3448/rpc/api (актуальный API).
     const rpcUrl = form.eposCommunicatorUrl.includes('/rpc/')
       ? form.eposCommunicatorUrl
-      : 'http://localhost:3448/rpc/api'
+      : 'http://localhost:8347/uzpos'
 
     await log.info('epos', `[1/2] Пробую JSON-RPC API: ${rpcUrl}`, {
       url: rpcUrl,
@@ -835,9 +835,11 @@ export default function Settings() {
             placeholder="http://localhost:3448/rpc/api"
           />
           <div className="mt-1 text-xs text-ink-muted">
-            JSON-RPC API: <code className="bg-surface-hover px-1 rounded">http://localhost:3448/rpc/api</code>
+            Legacy /uzpos (рекомендуется): <code className="bg-surface-hover px-1 rounded">http://localhost:8347/uzpos</code>
             <br />
-            Legacy <code>/uzpos</code> больше не поддерживается (с 0.10.8).
+            Новый JSON-RPC: <code className="bg-surface-hover px-1 rounded">http://localhost:3448/rpc/api</code>
+            <br />
+            <span className="text-ink-muted/80">Legacy проверен на Communicator 3.23.4 — корректно передаёт ИКПУ в ОФД.</span>
           </div>
         </Field>
         <Field label="Токен">
