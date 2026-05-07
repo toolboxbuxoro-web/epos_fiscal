@@ -529,6 +529,32 @@ async function fiscalizeJsonRpc(
   receivedCash: number,
   receivedCard: number,
 ): Promise<{ fiscal: FiscalReceiptInfo; requestJson: string }> {
+  // ИКПУ-проверка как WARNING (не throw): если у товара пустой class_code
+  // или package_code, ОФД не начислит покупателю кешбэк и магазин рискует
+  // штрафом 1% от суммы (постановление ВМ-255 от 12.05.2022 п.20 ч.5).
+  //
+  // Раньше тут был throw — но это **парализовало бы магазин** при первом же
+  // товаре без ИКПУ (а в legacy-excel-импортах их немало). Лучше пробить
+  // чек и залогировать предупреждение, чем не пробить вообще.
+  //
+  // В перспективе — выводить это в UI как баннер «N товаров без ИКПУ → нет
+  // кешбэка». Кассир сам решает: всё равно пробить или дозаполнить ИКПУ
+  // в админке mytoolbox.
+  const noIkpuItems: string[] = []
+  for (const pm of build.positions) {
+    for (const c of pm.candidates) {
+      if (!c.esfItem.class_code || !c.esfItem.package_code) {
+        noIkpuItems.push(c.esfItem.name)
+      }
+    }
+  }
+  if (noIkpuItems.length > 0) {
+    await log.warn(
+      'fiscalize',
+      `⚠️ ИКПУ отсутствует у ${noIkpuItems.length} товаров — кешбэк не начислится: ${noIkpuItems.join(', ')}`,
+    )
+  }
+
   const items = build.positions.flatMap((pm) =>
     pm.candidates.map((c) => ({
       Price: c.priceTiyin,           // продажная сумма ДО скидки за всё quantity
@@ -539,8 +565,14 @@ async function fiscalizeJsonRpc(
       VAT: c.vatTiyin,
       Name: c.esfItem.name,
       Other: 0,
+      // Дублируем ИКПУ в PascalCase (как остальные JSON-RPC поля) И camelCase
+      // (как в legacy /uzpos API). Communicator проигнорирует то что не знает,
+      // но один формат гарантированно дойдёт до ОФД и будет MXIK для кешбэка.
+      // См. JsonRpcItem в jsonrpc-client.ts — там подробный комментарий.
       ClassCode: c.esfItem.class_code,
       PackageCode: c.esfItem.package_code,
+      classCode: c.esfItem.class_code,
+      packageCode: c.esfItem.package_code,
       VATPercent: c.esfItem.vat_percent,
       OwnerType: c.esfItem.owner_type,
     })),

@@ -49,11 +49,28 @@ export interface JsonRpcItem {
   VAT: number
   Name: string
   Other: number
-  /** ИКПУ. В декомпиле GBS поле отсутствует, но в реальном API
-   * актуальной версии Communicator скорее всего обязательно. Добавляем
-   * опционально — если сервер не знает поле, оно игнорируется. */
+  /**
+   * ИКПУ + код упаковки.
+   *
+   * **Дублируем в PascalCase И camelCase**, потому что без MXIK ОФД не
+   * начисляет кешбэк покупателю (это видно в чеке: «Ushbu chek bo'yicha
+   * sotib olingan mahsulotlar (xizmatlar) kodlari (MXIK) mavjud
+   * bo'lmaganligi sababli keshbek hisoblanmaydi»).
+   *
+   * Legacy `/uzpos` API явно требует camelCase (`classCode`/`packageCode`,
+   * см. docs/external-apis/universal-communicator.md строки 121-122).
+   * JSON-RPC `/rpc/api` мы реверс-инжинирили из декомпиляции GBS Market 6,
+   * там этих полей не было — поэтому раньше шли в PascalCase «по аналогии»
+   * с остальными полями (Price, Amount). Communicator ИГНОРИРОВАЛ их →
+   * ИКПУ не доходил до ОФД → кешбэк = 0.
+   *
+   * Дублирование безопасно: Communicator проигнорирует поле которое не
+   * знает. Один из вариантов гарантированно сработает.
+   */
   ClassCode?: string
   PackageCode?: string
+  classCode?: string
+  packageCode?: string
   VATPercent?: number
   Label?: string
   CommissionTIN?: string
