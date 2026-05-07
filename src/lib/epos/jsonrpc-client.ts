@@ -71,6 +71,22 @@ export interface JsonRpcItem {
   PackageCode?: string
   classCode?: string
   packageCode?: string
+  // 0.10.11 SHOTGUN: реальный тест на активной кассе (TerminalID VG343...)
+  // показал что наш payload через JSON-RPC доходит до ОФД, но в чеке
+  // "MXIK kodi xato!" и значение "0" — Communicator не нашёл наше поле.
+  // Шлём массу алиасов одновременно, какой-то сработает:
+  Mxik?: string
+  mxik?: string
+  MxikCode?: string
+  mxikCode?: string
+  IKPU?: string
+  ikpu?: string
+  Package?: string
+  package?: string
+  PackageName?: string
+  packageName?: string
+  MxikPackage?: string
+  mxikPackage?: string
   VATPercent?: number
   Label?: string
   CommissionTIN?: string
