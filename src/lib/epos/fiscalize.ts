@@ -4,6 +4,7 @@ import {
   setMsReceiptStatus,
   upsertMsReceipt,
   getSetting,
+  setSetting,
   SettingKey,
 } from '@/lib/db'
 import { log } from '@/lib/log'
@@ -162,15 +163,15 @@ export async function fiscalize(
   })
 
   // 3. Выбрать клиент по URL и отправить.
-  const isJsonRpc = /\/rpc\/?(?:api)?$/i.test(eposUrl) || eposUrl.includes(':3448')
+  const isJsonRpcPrimary = /\/rpc\/?(?:api)?$/i.test(eposUrl) || eposUrl.includes(':3448')
+  const fallbackUrl = isJsonRpcPrimary
+    ? 'http://localhost:8347/uzpos'
+    : 'http://localhost:3448/rpc/api'
 
-  // Pre-flight: запросить версию Communicator. Это даёт диагностику если
-  // потом будет ошибка sale — мы знаем какая версия (3.18 / 3.23 / etc).
-  // Не ломаем фискализацию если getVersion не отвечает — просто логируем.
+  // Pre-flight: запросить версию Communicator (best-effort, не ломает sale).
   let communicatorVersion: string | null = null
   try {
-    if (isJsonRpc) {
-      // Для JSON-RPC: Api.Status возвращает StartTime + детали отправщика
+    if (isJsonRpcPrimary) {
       const probe = new JsonRpcEposClient({ url: eposUrl })
       const status = await probe.status()
       communicatorVersion = `JSON-RPC, status: ${JSON.stringify(status).slice(0, 200)}`
@@ -181,7 +182,7 @@ export async function fiscalize(
     }
     await log.info('fiscalize', `Communicator version: ${communicatorVersion}`, {
       eposUrl,
-      protocol: isJsonRpc ? 'json-rpc' : 'legacy',
+      protocol: isJsonRpcPrimary ? 'json-rpc' : 'legacy',
     })
   } catch (verErr) {
     const msg = verErr instanceof Error ? verErr.message : String(verErr)
@@ -192,19 +193,85 @@ export async function fiscalize(
     )
   }
 
+  /**
+   * Auto-fallback: если первичный URL падает с «protocol-level» ошибкой
+   * (метод не найден / порт не отвечает) — автоматически пробуем
+   * альтернативный URL. После успеха обновляем Settings, чтобы следующие
+   * чеки шли сразу правильно без двух попыток.
+   *
+   * Fallback-worthy ошибки:
+   *   - NO_SUCH_METHOD_AVAILABLE — урезанный legacy на новых Communicator
+   *   - "method not found" — JSON-RPC не знает наш метод
+   *   - connection refused / 404 — порт закрыт (на машине нет такого endpoint)
+   *
+   * НЕ fallback'им (это другая категория ошибок, исправляется юзером):
+   *   - WRONG_TOKEN
+   *   - illegal argument
+   *   - 401/403
+   *   - бизнес-ошибки от ОФД
+   */
+  const isFallbackWorthy = (err: unknown): boolean => {
+    const msg = String(err instanceof Error ? err.message : err).toUpperCase()
+    return (
+      msg.includes('NO_SUCH_METHOD_AVAILABLE') ||
+      msg.includes('NO_SUCH_METHOD') ||
+      msg.includes('METHOD NOT FOUND') ||
+      msg.includes('CONNECTION REFUSED') ||
+      msg.includes('CONNECT ERROR') ||
+      msg.includes('ECONNREFUSED') ||
+      msg.includes('NETWORK ERROR') ||
+      msg.includes('HTTP 404')
+    )
+  }
+
+  const callPrimary = isJsonRpcPrimary
+    ? () => fiscalizeJsonRpc(eposUrl, build, receivedCash, receivedCard)
+    : () => fiscalizeLegacy(eposUrl, eposToken, build, opts, receivedCash, receivedCard)
+  const callFallback = isJsonRpcPrimary
+    ? () => fiscalizeLegacy(fallbackUrl, eposToken, build, opts, receivedCash, receivedCard)
+    : () => fiscalizeJsonRpc(fallbackUrl, build, receivedCash, receivedCard)
+
   let fiscal: FiscalReceiptInfo
   let requestJson: string
+  let usedUrl = eposUrl
 
   try {
-    if (isJsonRpc) {
-      const result = await fiscalizeJsonRpc(eposUrl, build, receivedCash, receivedCard)
-      fiscal = result.fiscal
-      requestJson = result.requestJson
-    } else {
-      const result = await fiscalizeLegacy(eposUrl, eposToken, build, opts, receivedCash, receivedCard)
-      fiscal = result.fiscal
-      requestJson = result.requestJson
+    let result
+    try {
+      result = await callPrimary()
+    } catch (primaryErr) {
+      if (!isFallbackWorthy(primaryErr)) throw primaryErr
+      await log.warn(
+        'fiscalize',
+        `Primary URL ${eposUrl} вернул "${primaryErr instanceof Error ? primaryErr.message : primaryErr}". Пробую fallback на ${fallbackUrl}`,
+        { primaryUrl: eposUrl, fallbackUrl },
+      )
+      try {
+        result = await callFallback()
+        usedUrl = fallbackUrl
+        // Auto-save рабочий URL.
+        await setSetting(SettingKey.EposCommunicatorUrl, fallbackUrl)
+        await log.info(
+          'fiscalize',
+          `✅ Fallback на ${fallbackUrl} сработал. URL автоматически обновлён в Settings.`,
+          { newUrl: fallbackUrl },
+        )
+      } catch (fallbackErr) {
+        await log.error(
+          'fiscalize',
+          `❌ Оба URL не работают. Primary: ${primaryErr instanceof Error ? primaryErr.message : primaryErr}. Fallback: ${fallbackErr instanceof Error ? fallbackErr.message : fallbackErr}`,
+          {
+            primaryUrl: eposUrl,
+            primaryError: primaryErr instanceof Error ? primaryErr.message : String(primaryErr),
+            fallbackUrl,
+            fallbackError: fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr),
+          },
+        )
+        throw primaryErr
+      }
     }
+    fiscal = result.fiscal
+    requestJson = result.requestJson
   } catch (eposErr) {
     // Расширенный лог: всё что нужно понять «почему чек не пробился».
     // Сохраняется в БД, видно в Логах, можно прислать саппорту E-POS.
@@ -213,7 +280,8 @@ export async function fiscalize(
     const eposExtra = eposErr as { code?: number; data?: unknown }
     await log.error('fiscalize', `❌ Чек НЕ пробился: ${errMsg}`, {
       eposUrl,
-      protocol: isJsonRpc ? 'json-rpc' : 'legacy',
+      usedUrl,
+      protocol: isJsonRpcPrimary ? 'json-rpc' : 'legacy',
       communicatorVersion,
       jsonRpcCode: eposExtra.code,
       jsonRpcData: eposExtra.data,
@@ -235,8 +303,7 @@ export async function fiscalize(
       ).flat(),
     })
 
-    // EPOS не выдал FiscalSign — отпускаем резерв чтобы товары
-    // не блокировались в qty_reserved до истечения TTL.
+    // EPOS не выдал FiscalSign — отпускаем резерв.
     await releaseRemote(reserveResult.reservations, 'epos-failed').catch(() => {})
     throw eposErr
   }
