@@ -71,22 +71,31 @@ export interface JsonRpcItem {
   PackageCode?: string
   classCode?: string
   packageCode?: string
-  // 0.10.11 SHOTGUN: реальный тест на активной кассе (TerminalID VG343...)
-  // показал что наш payload через JSON-RPC доходит до ОФД, но в чеке
-  // "MXIK kodi xato!" и значение "0" — Communicator не нашёл наше поле.
-  // Шлём массу алиасов одновременно, какой-то сработает:
+  /**
+   * 🎯 0.10.12: НАЙДЕНО ОФИЦИАЛЬНОЕ ИМЯ через docs.epos.uz/ru/mobile-api/receipts-sale.
+   *
+   * E-POS Mobile API (тот же производитель что и Communicator) использует
+   * для MXIK поле `spic` — НЕ classCode и НЕ Mxik. Имя `spic` — внутреннее
+   * сокращение E-POS, сами они не объясняют (видимо «Single Product
+   * Identification Code» или похоже).
+   *
+   * Communicator desktop API документация ещё не опубликована (status
+   * "coming soon" на их сайте), но компании обычно унифицируют имена
+   * полей по продуктовой линейке. Высокий шанс что и в Communicator
+   * JSON-RPC поле называется `spic`.
+   */
+  spic?: string
+  // Также полезные опциональные алиасы из старого shotgun:
   Mxik?: string
   mxik?: string
   MxikCode?: string
   mxikCode?: string
-  IKPU?: string
-  ikpu?: string
-  Package?: string
-  package?: string
-  PackageName?: string
-  packageName?: string
-  MxikPackage?: string
-  mxikPackage?: string
+  /**
+   * `units` — код единицы измерения по узбекскому ОКЕИ (отдельный от
+   * packageCode!). В Mobile API обязателен, в Communicator JSON-RPC
+   * статус неизвестен. Опционально шлём если у товара есть.
+   */
+  units?: number
   VATPercent?: number
   Label?: string
   CommissionTIN?: string

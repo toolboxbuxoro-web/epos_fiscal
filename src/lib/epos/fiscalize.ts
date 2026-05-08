@@ -715,26 +715,21 @@ async function fiscalizeJsonRpc(
       VAT: c.vatTiyin,
       Name: c.esfItem.name,
       Other: 0,
-      // SHOTGUN MXIK 0.10.11: реальный тест на активной кассе показал что
-      // наш payload доходит до ОФД, но в чеке "MXIK kodi xato!" значение "0".
-      // Communicator не нашёл MXIK ни в одном из имён ClassCode/classCode.
-      // Шлём массу алиасов — какой-то Communicator поймёт. См. JsonRpcItem.
+      // 🎯 0.10.12: НАЙДЕНО ИМЯ через docs.epos.uz/ru/mobile-api/receipts-sale —
+      // E-POS Mobile API использует поле `spic` для MXIK (НЕ classCode и
+      // НЕ Mxik). Communicator desktop docs пока "coming soon", но
+      // компания скорее всего унифицирует имена → пробуем `spic`.
+      // Также шлём backup-алиасы в случае несовпадения.
+      spic: c.esfItem.class_code,
+      packageCode: c.esfItem.package_code,
+      // Backup-алиасы (Communicator проигнорирует то что не знает):
       ClassCode: c.esfItem.class_code,
       PackageCode: c.esfItem.package_code,
       classCode: c.esfItem.class_code,
-      packageCode: c.esfItem.package_code,
       Mxik: c.esfItem.class_code,
       mxik: c.esfItem.class_code,
       MxikCode: c.esfItem.class_code,
       mxikCode: c.esfItem.class_code,
-      IKPU: c.esfItem.class_code,
-      ikpu: c.esfItem.class_code,
-      Package: c.esfItem.package_code,
-      package: c.esfItem.package_code,
-      PackageName: c.esfItem.package_code,
-      packageName: c.esfItem.package_code,
-      MxikPackage: c.esfItem.package_code,
-      mxikPackage: c.esfItem.package_code,
       VATPercent: c.esfItem.vat_percent,
       OwnerType: c.esfItem.owner_type,
     })),
