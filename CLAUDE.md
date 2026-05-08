@@ -85,7 +85,7 @@ JSON-RPC 2.0: `{jsonrpc: "2.0", id, method, params}`. Token не нужен.
 
 Методы: `Api.SendSaleReceipt`, `Api.SendRefundReceipt`, `Api.OpenZReport`,
 `Api.CloseZReport`, `Api.GetReceiptCount`, `Api.GetUnsentCount`,
-`Api.Status`.
+`Api.Status`, `Api.GetZReportInfo` (текущий X/Z-отчёт со всеми тоталами).
 
 ### ⚠️ Критичные имена полей в `params.Receipt.Items[]`
 

@@ -7,6 +7,7 @@ import History from '@/routes/History'
 import Logs from '@/routes/Logs'
 import Settings from '@/routes/Settings'
 import Login from '@/routes/Login'
+import Zreport from '@/routes/Zreport'
 import { AppGate, RedirectIfAuthed } from '@/components/AppGate'
 import { useEffect } from 'react'
 import { autoApplyOnStartup } from '@/lib/updater'
@@ -57,6 +58,7 @@ export default function App() {
         >
           <Route path="/" element={<Dashboard />} />
           <Route path="/receipts/:id" element={<Receipt />} />
+          <Route path="/zreport" element={<Zreport />} />
           <Route path="/history" element={<History />} />
           <Route path="/catalog" element={<Catalog />} />
           <Route path="/logs" element={<Logs />} />

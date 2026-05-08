@@ -132,6 +132,41 @@ export interface JsonRpcStatusAnswer {
   DB?: { ArchivedFiles?: Record<string, number> }
 }
 
+/**
+ * Текущий X/Z-отчёт (информация о смене).
+ *
+ * Если `CloseTime` пустая строка — смена открыта (это X-отчёт).
+ * Если непустая — смена закрыта (Z-отчёт).
+ *
+ * Все денежные суммы в **тийинах** (× 100 от значений на бумажном отчёте).
+ *
+ * Получается через `Api.GetZReportInfo`. Подтверждено реальным запросом
+ * на TerminalID VG343420011189 (08.05.2026): результат точно соответствует
+ * бумажному X-отчёту № 354.
+ */
+export interface JsonRpcZReportInfo {
+  TerminalID: string
+  /** Номер смены (он же номер X/Z-отчёта). */
+  Number: number
+  /** Кол-во X-отчётов (или такое же как Number). */
+  Count: number
+  /** "YYYY-MM-DD HH:MM:SS" — когда смена открыта. */
+  OpenTime: string
+  /** Пусто пока смена открыта (X-отчёт). */
+  CloseTime: string
+  FirstReceiptSeq: string
+  LastReceiptSeq: string
+  TotalSaleCount: number
+  TotalSaleCash: number
+  TotalSaleCard: number
+  TotalSaleVAT: number
+  TotalRefundCount: number
+  TotalRefundCash: number
+  TotalRefundCard: number
+  TotalRefundVAT: number
+  AppletVersion: string
+}
+
 // ── Клиент ─────────────────────────────────────────────────────────────
 
 export class JsonRpcEposClient {
@@ -203,6 +238,34 @@ export class JsonRpcEposClient {
   /** Кол-во неотправленных в ОФД чеков + terminal id. */
   getUnsentCount(): Promise<{ Count: number; TerminalID: unknown }> {
     return this.call('Api.GetUnsentCount')
+  }
+
+  /**
+   * Информация о текущей смене (X/Z-отчёт). Если `CloseTime: ""` — смена
+   * открыта (X-отчёт), иначе — закрыта (Z-отчёт).
+   *
+   * Все денежные суммы в тийинах (× 100 от бумажного значения).
+   *
+   * Возвращает `null` если смена не открыта (Communicator вернёт ошибку
+   * вроде «Z-отчёт не открыт»).
+   */
+  async getZReportInfo(): Promise<JsonRpcZReportInfo | null> {
+    try {
+      return await this.call<JsonRpcZReportInfo>('Api.GetZReportInfo')
+    } catch (e) {
+      const msg = String(e instanceof Error ? e.message : e).toLowerCase()
+      // Z-отчёт ещё не открыт — это нормально, не ошибка
+      if (
+        msg.includes('z') &&
+        (msg.includes('не открыт') ||
+          msg.includes("yo'q") ||
+          msg.includes('not open') ||
+          msg.includes('no z'))
+      ) {
+        return null
+      }
+      throw e
+    }
   }
 
   // ── Фискальные методы (write) ──────────────────────────────────
