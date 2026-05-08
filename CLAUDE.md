@@ -136,6 +136,8 @@ JSON-RPC 2.0: `{jsonrpc: "2.0", id, method, params}`. Token не нужен.
 ### Документация
 - `docs/external-apis/universal-communicator.md` — Communicator API (legacy + JSON-RPC)
 - `docs/external-apis/epos-mobile-api.md` — E-POS Mobile API (источник имён `spic`, `packageCode`)
+- `docs/external-apis/fiscal-drive-service.md` — FiscalDriveService (alt путь интеграции,
+  open-source, на :3449/rpc REST, минует E-POS Communicator)
 
 ## МойСклад API — критичные детали
 
