@@ -2,11 +2,88 @@
 
 > Локальный HTTP-сервис фискализации от E-POS Systems. Часть установки E-POS Cashdesk на Windows-кассе, работает с физическим USB-фискальным модулем (смарт-карта). Принимает чеки от внешних POS-систем, подписывает фискальным модулем, отправляет в ОФД ГНК (`ofd.soliq.uz`).
 >
-> **Источник:** Postman-коллекция, предоставленная пользователем (документация поставщика, не публичная).
+> **Источник legacy:** Postman-коллекция от E-POS (документация поставщика, не публичная).
+> **Источник JSON-RPC:** [docs.epos.uz/ru/mobile-api/receipts-sale](https://docs.epos.uz/ru/mobile-api/receipts-sale) (E-POS Mobile API того же производителя — имена полей унифицированы) + реальные тесты на TerminalID `VG343420011189`.
 
 ---
 
-## 1. Базовые сведения
+## 0. JSON-RPC API на `:3448/rpc/api` (используется в Toolbox Fiscal)
+
+Актуальные версии Communicator (3.20+) урезали legacy `/uzpos` — `sale`/`fastSale` отвечают `NO_SUCH_METHOD_AVAILABLE`. Используется JSON-RPC 2.0 на отдельном порту.
+
+### Endpoint
+```
+POST http://localhost:3448/rpc/api
+Content-Type: application/json
+```
+Авторизация не нужна (token из legacy игнорируется).
+
+### Метод `Api.SendSaleReceipt`
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "Api.SendSaleReceipt",
+  "params": {
+    "Receipt": {
+      "Time": "2026-05-08 10:57:46",
+      "ReceivedCash": 1400000,
+      "ReceivedCard": 0,
+      "Cashier": "Рафиев Одилбек",
+      "Items": [
+        {
+          "Name": "Диск отрезной по металлу T41-180...",
+          "Price": 1400000,
+          "Discount": 0,
+          "Amount": 1000,
+          "Barcode": "0",
+          "VAT": 150000,
+          "VATPercent": 12,
+          "Other": 0,
+          "OwnerType": 0,
+          "spic": "06804001002000000",
+          "packageCode": "1343508"
+        }
+      ]
+    }
+  }
+}
+```
+
+### ⚠️ Критичные моменты
+
+1. **`spic` — это MXIK / ИКПУ.** Не `classCode`, не `Mxik`, не `IKPU`. Имя найдено через docs.epos.uz/ru/mobile-api (унифицировано по экосистеме E-POS). Проверено shotgun-стратегией в 0.10.5–0.10.11: `Mxik`/`MxikCode`/`IKPU`/`ClassCode` — все игнорируются. **Работает только `spic`.**
+2. **`packageCode`** — код упаковки для конкретного `spic`. Берётся из `getICPCPackage(spic)` или tasnif.soliq.uz endpoint `/mxik/{mxik}` → `packageNames[].code`. Должен быть валидной парой с MXIK.
+3. **Без `spic`** ОФД помечает «MXIK kodi xato!» с MXIK="0", покупатель не получает кешбэк, магазин рискует штрафом 1% (ВМ-255 от 12.05.2022).
+4. **Реквизиты компании** не передаём — Communicator берёт их с USB-модуля.
+5. **`Time`** — Go-style с пробелом `"YYYY-MM-DD HH:MM:SS"`, без T.
+6. **Деньги** — тийины (1 сум = 100). **Количество** — миллидоли (1 шт = 1000).
+
+### Ответ
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "TerminalID": "VG343420011189",
+    "ReceiptSeq": "7966",
+    "DateTime": "20260508105746",
+    "FiscalSign": "305279002110",
+    "AppletVersion": "0323",
+    "QRCodeURL": "https://ofd.soliq.uz/check?t=...&r=...&c=...&s=..."
+  }
+}
+```
+
+### Прочие методы JSON-RPC
+
+`Api.Status`, `Api.OpenZReport`, `Api.CloseZReport`, `Api.SendRefundReceipt`, `Api.GetReceiptCount`, `Api.GetUnsentCount` — структура аналогична. См. `src/lib/epos/jsonrpc-client.ts`.
+
+---
+
+## 1. Базовые сведения (legacy `/uzpos` — для справки, в Toolbox Fiscal не используется)
 
 ### Endpoint
 - **Локально:** `http://localhost:8347/uzpos`

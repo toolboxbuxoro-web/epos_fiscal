@@ -67,35 +67,26 @@ export interface JsonRpcItem {
    * Дублирование безопасно: Communicator проигнорирует поле которое не
    * знает. Один из вариантов гарантированно сработает.
    */
-  ClassCode?: string
-  PackageCode?: string
-  classCode?: string
-  packageCode?: string
   /**
-   * 🎯 0.10.12: НАЙДЕНО ОФИЦИАЛЬНОЕ ИМЯ через docs.epos.uz/ru/mobile-api/receipts-sale.
+   * MXIK / ИКПУ — 17-значный код товара из tasnif.soliq.uz.
+   * ОБЯЗАТЕЛЬНО для каждой позиции — без него ОФД не начисляет покупателю
+   * кешбэк и ГНК штрафует магазин на 1% от суммы (постановление
+   * ВМ-255 от 12.05.2022 п.20 ч.5).
    *
-   * E-POS Mobile API (тот же производитель что и Communicator) использует
-   * для MXIK поле `spic` — НЕ classCode и НЕ Mxik. Имя `spic` — внутреннее
-   * сокращение E-POS, сами они не объясняют (видимо «Single Product
-   * Identification Code» или похоже).
-   *
-   * Communicator desktop API документация ещё не опубликована (status
-   * "coming soon" на их сайте), но компании обычно унифицируют имена
-   * полей по продуктовой линейке. Высокий шанс что и в Communicator
-   * JSON-RPC поле называется `spic`.
+   * Имя поля найдено через официальную документацию E-POS Mobile API
+   * (https://docs.epos.uz/ru/mobile-api/receipts-sale) — поле называется
+   * именно `spic`, не classCode и не mxik. Подтверждено реальной
+   * фискализацией с TerminalID VG343420011189: MXIK дошёл до ОФД,
+   * кешбэк начислился (см. CHANGELOG 0.10.12).
    */
-  spic?: string
-  // Также полезные опциональные алиасы из старого shotgun:
-  Mxik?: string
-  mxik?: string
-  MxikCode?: string
-  mxikCode?: string
+  spic: string
   /**
-   * `units` — код единицы измерения по узбекскому ОКЕИ (отдельный от
-   * packageCode!). В Mobile API обязателен, в Communicator JSON-RPC
-   * статус неизвестен. Опционально шлём если у товара есть.
+   * Код упаковки — выбранный вариант из `getICPCPackage(spic)`. Должен
+   * соответствовать конкретному MXIK (валидная пара). Например для
+   * сверла MXIK 08207001004000000 валидные packageCode: 1489476 (шт.),
+   * 1814393 (пачка=1 шт.), 1854997 (комплект=3 шт.) и т.д.
    */
-  units?: number
+  packageCode: string
   VATPercent?: number
   Label?: string
   CommissionTIN?: string

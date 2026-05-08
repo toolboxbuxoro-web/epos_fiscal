@@ -4,7 +4,6 @@ import {
   setMsReceiptStatus,
   upsertMsReceipt,
   getSetting,
-  setSetting,
   SettingKey,
 } from '@/lib/db'
 import { log } from '@/lib/log'
@@ -24,14 +23,8 @@ import {
   printFiscalReceipt,
   type ReceiptData,
 } from '@/lib/printer'
-import { EposClient } from './client'
 import { JsonRpcEposClient, formatGoTime, type JsonRpcReceipt } from './jsonrpc-client'
-import type {
-  CommunicatorItem,
-  CommunicatorParams,
-  CommunicatorSaleRequest,
-  FiscalReceiptInfo,
-} from './types'
+import type { FiscalReceiptInfo } from './types'
 
 export interface FiscalizeOptions {
   /** Использовать `fastSale` (без печати чека) — только для legacy /uzpos. */
@@ -67,9 +60,10 @@ export async function fiscalize(
 ): Promise<FiscalizeResult> {
   const eposUrl =
     (await getSetting(SettingKey.EposCommunicatorUrl)) ??
-    'http://localhost:8347/uzpos'
-  const eposToken =
-    (await getSetting(SettingKey.EposToken)) ?? 'DXJFX32CN1296678504F2'
+    'http://localhost:3448/rpc/api'
+  // EposToken больше не используется (legacy /uzpos удалён). Для JSON-RPC
+  // токен не нужен. Поле в Settings оставлено только для обратной
+  // совместимости БД старых установок и UI его не показывает.
 
   if (build.positions.length === 0) {
     throw new Error('Нечего отправлять в Communicator: пустой план')
@@ -162,114 +156,31 @@ export async function fiscalize(
     remoteReserved: reserveResult.reservations?.length ?? 0,
   })
 
-  // 3. Выбрать клиент по URL и отправить.
-  const isJsonRpcPrimary = /\/rpc\/?(?:api)?$/i.test(eposUrl) || eposUrl.includes(':3448')
-  const fallbackUrl = isJsonRpcPrimary
-    ? 'http://localhost:8347/uzpos'
-    : 'http://localhost:3448/rpc/api'
-
-  // Pre-flight: запросить версию Communicator (best-effort, не ломает sale).
+  // 3. Pre-flight: версия Communicator в логи (best-effort, не ломает sale).
   let communicatorVersion: string | null = null
   try {
-    if (isJsonRpcPrimary) {
-      const probe = new JsonRpcEposClient({ url: eposUrl })
-      const status = await probe.status()
-      communicatorVersion = `JSON-RPC, status: ${JSON.stringify(status).slice(0, 200)}`
-    } else {
-      const probe = new EposClient({ url: eposUrl, token: eposToken })
-      const ver = await probe.getVersion()
-      communicatorVersion = String(ver).slice(0, 200)
-    }
-    await log.info('fiscalize', `Communicator version: ${communicatorVersion}`, {
+    const probe = new JsonRpcEposClient({ url: eposUrl })
+    const status = await probe.status()
+    communicatorVersion = JSON.stringify(status).slice(0, 200)
+    await log.info('fiscalize', `Communicator status: ${communicatorVersion}`, {
       eposUrl,
-      protocol: isJsonRpcPrimary ? 'json-rpc' : 'legacy',
     })
   } catch (verErr) {
     const msg = verErr instanceof Error ? verErr.message : String(verErr)
     await log.warn(
       'fiscalize',
-      `Не удалось получить версию Communicator (продолжаем sale): ${msg}`,
+      `Не удалось получить статус Communicator (продолжаем sale): ${msg}`,
       { eposUrl },
     )
   }
 
-  /**
-   * Auto-fallback: если первичный URL падает с «protocol-level» ошибкой
-   * (метод не найден / порт не отвечает) — автоматически пробуем
-   * альтернативный URL. После успеха обновляем Settings, чтобы следующие
-   * чеки шли сразу правильно без двух попыток.
-   *
-   * Fallback-worthy ошибки:
-   *   - NO_SUCH_METHOD_AVAILABLE — урезанный legacy на новых Communicator
-   *   - "method not found" — JSON-RPC не знает наш метод
-   *   - connection refused / 404 — порт закрыт (на машине нет такого endpoint)
-   *
-   * НЕ fallback'им (это другая категория ошибок, исправляется юзером):
-   *   - WRONG_TOKEN
-   *   - illegal argument
-   *   - 401/403
-   *   - бизнес-ошибки от ОФД
-   */
-  const isFallbackWorthy = (err: unknown): boolean => {
-    const msg = String(err instanceof Error ? err.message : err).toUpperCase()
-    return (
-      msg.includes('NO_SUCH_METHOD_AVAILABLE') ||
-      msg.includes('NO_SUCH_METHOD') ||
-      msg.includes('METHOD NOT FOUND') ||
-      msg.includes('CONNECTION REFUSED') ||
-      msg.includes('CONNECT ERROR') ||
-      msg.includes('ECONNREFUSED') ||
-      msg.includes('NETWORK ERROR') ||
-      msg.includes('HTTP 404')
-    )
-  }
-
-  const callPrimary = isJsonRpcPrimary
-    ? () => fiscalizeJsonRpc(eposUrl, build, receivedCash, receivedCard)
-    : () => fiscalizeLegacy(eposUrl, eposToken, build, opts, receivedCash, receivedCard)
-  const callFallback = isJsonRpcPrimary
-    ? () => fiscalizeLegacy(fallbackUrl, eposToken, build, opts, receivedCash, receivedCard)
-    : () => fiscalizeJsonRpc(fallbackUrl, build, receivedCash, receivedCard)
-
+  // 4. Фискализация — только JSON-RPC `/rpc/api`. Legacy /uzpos удалён в
+  // 0.10.13 (актуальные Communicator 3.20+ legacy урезали, всё работает
+  // через JSON-RPC). Auto-fallback тоже удалён за ненадобностью.
   let fiscal: FiscalReceiptInfo
   let requestJson: string
-  let usedUrl = eposUrl
-
   try {
-    let result
-    try {
-      result = await callPrimary()
-    } catch (primaryErr) {
-      if (!isFallbackWorthy(primaryErr)) throw primaryErr
-      await log.warn(
-        'fiscalize',
-        `Primary URL ${eposUrl} вернул "${primaryErr instanceof Error ? primaryErr.message : primaryErr}". Пробую fallback на ${fallbackUrl}`,
-        { primaryUrl: eposUrl, fallbackUrl },
-      )
-      try {
-        result = await callFallback()
-        usedUrl = fallbackUrl
-        // Auto-save рабочий URL.
-        await setSetting(SettingKey.EposCommunicatorUrl, fallbackUrl)
-        await log.info(
-          'fiscalize',
-          `✅ Fallback на ${fallbackUrl} сработал. URL автоматически обновлён в Settings.`,
-          { newUrl: fallbackUrl },
-        )
-      } catch (fallbackErr) {
-        await log.error(
-          'fiscalize',
-          `❌ Оба URL не работают. Primary: ${primaryErr instanceof Error ? primaryErr.message : primaryErr}. Fallback: ${fallbackErr instanceof Error ? fallbackErr.message : fallbackErr}`,
-          {
-            primaryUrl: eposUrl,
-            primaryError: primaryErr instanceof Error ? primaryErr.message : String(primaryErr),
-            fallbackUrl,
-            fallbackError: fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr),
-          },
-        )
-        throw primaryErr
-      }
-    }
+    const result = await fiscalizeJsonRpc(eposUrl, build, receivedCash, receivedCard)
     fiscal = result.fiscal
     requestJson = result.requestJson
   } catch (eposErr) {
@@ -280,8 +191,6 @@ export async function fiscalize(
     const eposExtra = eposErr as { code?: number; data?: unknown }
     await log.error('fiscalize', `❌ Чек НЕ пробился: ${errMsg}`, {
       eposUrl,
-      usedUrl,
-      protocol: isJsonRpcPrimary ? 'json-rpc' : 'legacy',
       communicatorVersion,
       jsonRpcCode: eposExtra.code,
       jsonRpcData: eposExtra.data,
@@ -675,35 +584,8 @@ async function fiscalizeJsonRpc(
   receivedCash: number,
   receivedCard: number,
 ): Promise<{ fiscal: FiscalReceiptInfo; requestJson: string }> {
-  // Жёсткий guard: ИКПУ + код упаковки обязательны.
-  //
-  // Без MXIK ОФД не начисляет покупателю кешбэк и ГНК штрафует магазин
-  // на 1% от суммы (постановление ВМ-255 от 12.05.2022 п.20 ч.5).
-  //
-  // Throw здесь — последний рубеж защиты. UI Receipt должен ДО клика
-  // «Фискализировать» показать кассиру баннер «Невозможно — N товаров
-  // без ИКПУ» и заблокировать кнопку. Если каким-то образом этот guard
-  // всё-таки сработает — значит UI не догадался, и у нас bug.
-  //
-  // matcher работает только из source='remote' (товары из mytoolbox), так
-  // что обычно ИКПУ есть. Этот guard страхует от дозаполнения админом
-  // приходов с пустыми колонками MXIK в Excel.
-  const noIkpuItems: string[] = []
-  for (const pm of build.positions) {
-    for (const c of pm.candidates) {
-      if (!c.esfItem.class_code || !c.esfItem.package_code) {
-        noIkpuItems.push(c.esfItem.name)
-      }
-    }
-  }
-  if (noIkpuItems.length > 0) {
-    throw new Error(
-      `Нельзя фискализировать: у ${noIkpuItems.length} товаров отсутствует ИКПУ. ` +
-        `Дозаполните в mytoolbox админке → Inventory → Приходы. ` +
-        `Товары: ${noIkpuItems.slice(0, 3).join(', ')}` +
-        (noIkpuItems.length > 3 ? ` и ещё ${noIkpuItems.length - 3}` : ''),
-    )
-  }
+  // Guard ИКПУ перенесён на верхний уровень `fiscalize()` (см. там же,
+  // он срабатывает ДО резервации). Здесь — точка построения JSON-RPC payload.
 
   const items = build.positions.flatMap((pm) =>
     pm.candidates.map((c) => ({
@@ -715,21 +597,12 @@ async function fiscalizeJsonRpc(
       VAT: c.vatTiyin,
       Name: c.esfItem.name,
       Other: 0,
-      // 🎯 0.10.12: НАЙДЕНО ИМЯ через docs.epos.uz/ru/mobile-api/receipts-sale —
-      // E-POS Mobile API использует поле `spic` для MXIK (НЕ classCode и
-      // НЕ Mxik). Communicator desktop docs пока "coming soon", но
-      // компания скорее всего унифицирует имена → пробуем `spic`.
-      // Также шлём backup-алиасы в случае несовпадения.
+      // 🎯 ИМЯ ПОЛЕЙ ПОДТВЕРЖДЕНО реальной фискализацией с TerminalID
+      // VG343420011189 в 0.10.12: spic = MXIK, packageCode = код упаковки.
+      // Источник имени `spic`: docs.epos.uz/ru/mobile-api/receipts-sale.
+      // НЕ менять без проверки — иначе MXIK перестанет доходить до ОФД.
       spic: c.esfItem.class_code,
       packageCode: c.esfItem.package_code,
-      // Backup-алиасы (Communicator проигнорирует то что не знает):
-      ClassCode: c.esfItem.class_code,
-      PackageCode: c.esfItem.package_code,
-      classCode: c.esfItem.class_code,
-      Mxik: c.esfItem.class_code,
-      mxik: c.esfItem.class_code,
-      MxikCode: c.esfItem.class_code,
-      mxikCode: c.esfItem.class_code,
       VATPercent: c.esfItem.vat_percent,
       OwnerType: c.esfItem.owner_type,
     })),
@@ -794,92 +667,6 @@ async function fiscalizeJsonRpc(
     QRCodeURL: answer.QRCodeURL,
   }
   return { fiscal, requestJson }
-}
-
-// ── Реализация для legacy :8347/uzpos ─────────────────────────────────
-
-async function fiscalizeLegacy(
-  eposUrl: string,
-  eposToken: string,
-  build: BuildMatchResult,
-  opts: FiscalizeOptions,
-  receivedCash: number,
-  receivedCard: number,
-): Promise<{ fiscal: FiscalReceiptInfo; requestJson: string }> {
-  const company = await readCompanySettings()
-  const printerSize = ((await getSetting(SettingKey.PrinterSize)) === '58' ? 58 : 80) as 58 | 80
-  const staffName =
-    opts.staffName ?? (await getSetting(SettingKey.MoyskladEmployeeName)) ?? undefined
-
-  const items: CommunicatorItem[] = build.positions.flatMap((pm) =>
-    pm.candidates.map((c) => ({
-      price: c.priceTiyin,           // до скидки
-      discount: c.discountTiyin,     // размер скидки
-      barcode: c.esfItem.barcode ?? '0',
-      amount: c.quantity,
-      vatPercent: c.esfItem.vat_percent,
-      vat: c.vatTiyin,               // уже пересчитан от (price - discount)
-      name: c.esfItem.name,
-      classCode: c.esfItem.class_code,
-      packageCode: c.esfItem.package_code,
-      other: 0,
-      ownerType: c.esfItem.owner_type,
-    })),
-  )
-
-  const params: CommunicatorParams = {
-    items,
-    paycheckNumber: build.receipt.name || undefined,
-    receivedCash,
-    receivedCard,
-    extraInfos: { 'Модель виртуальной кассы': 'E-POS' },
-  }
-
-  const request: CommunicatorSaleRequest = {
-    token: eposToken,
-    method: opts.fast ? 'fastSale' : 'sale',
-    companyName: company.name,
-    companyAddress: company.address,
-    companyINN: company.inn,
-    staffName,
-    printerSize,
-    phoneNumber: company.phone || undefined,
-    companyPhoneNumber: company.phone || undefined,
-    params,
-    epsInfo: { transactionId: '' },
-    extraInfo: {
-      tin: opts.clientTin,
-      pinfl: opts.clientPinfl,
-      cardType: opts.cardType ?? 2,
-    },
-  }
-
-  const client = new EposClient({ url: eposUrl, token: eposToken })
-
-  // Полный дамп запроса перед отправкой, чтобы можно было отладить ошибки
-  // Communicator (NO_SUCH_METHOD_AVAILABLE / illegal argument) по полям.
-  await log.info('fiscalize', 'Отправляю sale в EPOS (legacy /uzpos)', {
-    eposUrl,
-    request,
-    itemsCount: items.length,
-  })
-
-  try {
-    await client.call(request)
-  } catch (e) {
-    await log.error('fiscalize', 'EPOS Communicator (legacy) вернул ошибку', {
-      error: e instanceof Error ? e.message : String(e),
-      eposUrl,
-      request,
-    })
-    throw e
-  }
-
-  const fiscal = await client.getLastRegisteredReceipt()
-  await log.info('fiscalize', 'Legacy EPOS успешно ответил', {
-    fiscal,
-  })
-  return { fiscal, requestJson: JSON.stringify(request) }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────

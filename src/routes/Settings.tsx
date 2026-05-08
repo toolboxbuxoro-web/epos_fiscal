@@ -7,7 +7,7 @@ import {
   type MsEmployee,
   type MsRetailStore,
 } from '@/lib/moysklad'
-import { EposClient, JsonRpcEposClient } from '@/lib/epos'
+import { JsonRpcEposClient } from '@/lib/epos'
 import { applyUpdate, checkForUpdate } from '@/lib/updater'
 import { log } from '@/lib/log'
 import {
@@ -440,137 +440,33 @@ export default function Settings() {
 
   async function testEpos() {
     setEposTest('Проверяю…')
-
     await log.info('epos', '=== Начинаю проверку EPOS Communicator ===', {
       url: form.eposCommunicatorUrl,
-      token: form.eposToken,
-    })
-
-    // Сначала пробуем JSON-RPC :3448/rpc/api (актуальный API).
-    const rpcUrl = form.eposCommunicatorUrl.includes('/rpc/')
-      ? form.eposCommunicatorUrl
-      : 'http://localhost:8347/uzpos'
-
-    await log.info('epos', `[1/2] Пробую JSON-RPC API: ${rpcUrl}`, {
-      url: rpcUrl,
-      method: 'Api.Status',
     })
 
     try {
-      const rpc = new JsonRpcEposClient({ url: rpcUrl })
+      const rpc = new JsonRpcEposClient({ url: form.eposCommunicatorUrl })
       const status = await rpc.status()
       const term = Object.keys(status.Sender?.TotalFilesSent ?? {})[0] ?? '—'
       const sent = Object.values(status.Sender?.TotalFilesSent ?? {}).reduce(
         (s, v) => s + v,
         0,
       )
-      setEposTest(`OK — JSON-RPC (terminal ${term}, в ОФД: ${sent})`)
-      await log.info('epos', `✓ JSON-RPC отвечает: terminal ${term}, отправлено ${sent} файлов в ОФД`, {
-        url: rpcUrl,
+      setEposTest(`OK — JSON-RPC (terminal ${term}, в ОФД отправлено ${sent} файлов)`)
+      await log.info('epos', `✓ Communicator отвечает: terminal ${term}, ${sent} файлов в ОФД`, {
+        url: form.eposCommunicatorUrl,
         terminalId: term,
         filesSent: sent,
         status,
       })
-      return
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
-      await log.warn('epos', `JSON-RPC не отвечает: ${msg}`, {
-        url: rpcUrl,
+      setEposTest(`Ошибка: ${msg}`)
+      await log.error('epos', `✗ Communicator не отвечает: ${msg}`, {
+        url: form.eposCommunicatorUrl,
         error: msg,
       })
     }
-
-    await log.info('epos', `[2/2] Пробую legacy /uzpos: ${form.eposCommunicatorUrl}`, {
-      url: form.eposCommunicatorUrl,
-    })
-
-    const c = new EposClient({ url: form.eposCommunicatorUrl, token: form.eposToken })
-
-    // Стратегия: probe-методы делятся на два класса.
-    //
-    // 1. «Служебные» (getVersion, checkStatus, getDeviceId, getZReportCount) —
-    //    могут отсутствовать в старых сборках Communicator (NO_SUCH_METHOD_AVAILABLE).
-    // 2. «Базовые» (getReceiptCount, getZreportInfo с zReportId=0, openZreport) —
-    //    есть в любой версии. Возвращают либо успех, либо «Z уже открыт» / «Z не открыт» —
-    //    но не NO_SUCH_METHOD_AVAILABLE.
-    //
-    // Идём служебными → потом базовыми. Базовые ошибки типа «Z уже открыт» считаем
-    // подтверждением что Communicator живой.
-    const probes: Array<{
-      method: string
-      payload?: Record<string, unknown>
-      describe: (r: unknown) => string
-      acceptableErrors?: RegExp[]
-    }> = [
-      // Эмпирически: на «холодном» Communicator (без активной сессии Cashdesk)
-      // работает только getUnsentCount. Ставим первым.
-      {
-        method: 'getUnsentCount',
-        describe: (r) => {
-          const c = (r as { Count?: number })?.Count ?? '?'
-          return `неотправленных в ОФД: ${c}`
-        },
-      },
-      { method: 'getVersion', describe: (r) => `версия ${String(r)}` },
-      { method: 'checkStatus', describe: () => 'checkStatus OK' },
-      { method: 'getDeviceId', describe: (r) => `device ${String(r)}` },
-      { method: 'getZReportCount', describe: (r) => `Z-отчётов ${String(r)}` },
-      { method: 'getReceiptCount', describe: (r) => `чеков в ФМ: ${String(r)}` },
-      {
-        method: 'getZreportInfo',
-        payload: { printerSize: 80, zReportId: 0 },
-        describe: () => 'getZreportInfo OK',
-        acceptableErrors: [/Z\s*отчет/i, /Zreport/i, /not open/i],
-      },
-    ]
-
-    let firstNoMethodError: unknown = null
-    for (const probe of probes) {
-      await log.debug('epos', `→ Пробую legacy метод: ${probe.method}`, {
-        method: probe.method,
-        payload: probe.payload,
-      })
-      try {
-        const result = await c.call({
-          method: probe.method as never,
-          ...(probe.payload ?? {}),
-        } as never)
-        setEposTest(`OK — ${probe.describe(result)}`)
-        await log.info('epos', `✓ Legacy метод ${probe.method} ответил`, {
-          url: form.eposCommunicatorUrl,
-          method: probe.method,
-          result,
-        })
-        return
-      } catch (e) {
-        const errMsg = e instanceof Error ? e.message : String(e)
-        if (probe.acceptableErrors?.some((re) => re.test(errMsg))) {
-          setEposTest(`OK — Communicator отвечает (${errMsg.slice(0, 80)})`)
-          await log.info(
-            'epos',
-            `✓ Communicator живой, ${probe.method} вернул ожидаемую ошибку`,
-            { url: form.eposCommunicatorUrl, method: probe.method, errMsg },
-          )
-          return
-        }
-        await log.debug('epos', `← ${probe.method}: ${errMsg}`, {
-          method: probe.method,
-          errMsg,
-        })
-        if (!firstNoMethodError && /NO_SUCH_METHOD/i.test(errMsg)) {
-          firstNoMethodError = e
-        }
-      }
-    }
-
-    const finalMsg = firstNoMethodError
-      ? 'Ни один из служебных методов не распознан Communicator. Проверьте версию.'
-      : 'Communicator не отвечает. Проверьте URL и что служба запущена.'
-    setEposTest('Ошибка: ' + finalMsg)
-    await log.error('epos', `✗ Проверка завершилась ошибкой: ${finalMsg}`, {
-      url: form.eposCommunicatorUrl,
-      tried: probes.map((p) => p.method),
-    })
   }
 
   async function checkUpdate() {
@@ -835,18 +731,10 @@ export default function Settings() {
             placeholder="http://localhost:3448/rpc/api"
           />
           <div className="mt-1 text-xs text-ink-muted">
-            Legacy /uzpos (рекомендуется): <code className="bg-surface-hover px-1 rounded">http://localhost:8347/uzpos</code>
+            JSON-RPC API: <code className="bg-surface-hover px-1 rounded">http://localhost:3448/rpc/api</code>
             <br />
-            Новый JSON-RPC: <code className="bg-surface-hover px-1 rounded">http://localhost:3448/rpc/api</code>
-            <br />
-            <span className="text-ink-muted/80">Legacy проверен на Communicator 3.23.4 — корректно передаёт ИКПУ в ОФД.</span>
+            <span className="text-ink-muted/80">Подтверждён рабочим в 0.10.12 — корректно передаёт ИКПУ в ОФД, кешбэк начисляется.</span>
           </div>
-        </Field>
-        <Field label="Токен">
-          <Input
-            value={form.eposToken}
-            onChange={(e) => setField('eposToken', e.target.value)}
-          />
         </Field>
         <Field label="Ширина чековой ленты">
           <Select

@@ -73,34 +73,65 @@ fiscal_receipts (TerminalID, ReceiptSeq, FiscalSign, QRCodeURL)
 точке продаж (`SettingKey.MoyskladRetailStoreId`), иначе магазин 1
 фискализировал бы чеки магазина 3 через свою USB.
 
-## EPOS Communicator: ДВА API
+## EPOS Communicator: JSON-RPC API
 
-E-POS Communicator на Win одновременно слушает на двух портах с разными
-протоколами. Это **критически важно понять**:
+Используем **только JSON-RPC** на `http://localhost:3448/rpc/api`. Legacy
+`/uzpos` удалён в 0.10.13 потому что на актуальных версиях Communicator
+(3.20+) он урезан — `NO_SUCH_METHOD_AVAILABLE` на `sale`/`fastSale`.
 
-### Legacy `:8347/uzpos`
-- Документация: `docs/external-apis/universal-communicator.md` (Postman от E-POS).
-- Формат запроса: плоский `{token, method, ...сразу поля чека}`.
-- Token фиксированный: `DXJFX32CN1296678504F2`.
-- На **новых установках** Communicator у этого endpoint **урезан набор методов** — отвечает `NO_SUCH_METHOD_AVAILABLE` на большинство.
-- В нашем коде: `src/lib/epos/client.ts`.
+### Формат
 
-### JSON-RPC `:3448/rpc/api` (актуальный)
-- Открыт через reverse-engineering декомпилированного F-Lab Market 6 (`izzatbek1988/TestMarket`).
-- Формат JSON-RPC 2.0: `{jsonrpc, id, method, params}`.
-- Методы: `Api.OpenZReport`, `Api.CloseZReport`, `Api.SendSaleReceipt`, `Api.SendRefundReceipt`, `Api.GetReceiptCount`, `Api.GetUnsentCount`, `Api.Status`.
-- Token не нужен.
-- Возвращает `Api.Status` со связью с ОФД, terminalId, кол-вом отправленных файлов.
-- В нашем коде: `src/lib/epos/jsonrpc-client.ts`.
+JSON-RPC 2.0: `{jsonrpc: "2.0", id, method, params}`. Token не нужен.
 
-### Авто-выбор протокола
-В `fiscalize.ts`:
+Методы: `Api.SendSaleReceipt`, `Api.SendRefundReceipt`, `Api.OpenZReport`,
+`Api.CloseZReport`, `Api.GetReceiptCount`, `Api.GetUnsentCount`,
+`Api.Status`.
+
+### ⚠️ Критичные имена полей в `params.Receipt.Items[]`
+
 ```ts
-const isJsonRpc = /\/rpc\/?(?:api)?$/i.test(eposUrl) || eposUrl.includes(':3448')
+{
+  Name: string,           // название товара
+  Price: number,          // цена в тийинах за всё quantity (до скидки)
+  Discount: number,       // размер скидки в тийинах (0 если нет)
+  Amount: number,         // 1 шт = 1000 (миллидоли)
+  Barcode: string,        // штрих-код или "0"
+  VAT: number,            // сумма НДС в тийинах
+  VATPercent: number,     // 0, 12, 15
+  Other: number,          // 0
+  OwnerType: 0|1|2,       // 0=перепродажа, 1=производитель, 2=услуга
+  spic: string,           // ⭐ ИКПУ (17 цифр) — ИМЕННО `spic`, не classCode!
+  packageCode: string,    // код упаковки из getICPCPackage(spic)
+}
 ```
-Если URL с `:3448` или содержит `/rpc/` → JSON-RPC. Иначе legacy.
 
-Settings показывает оба URL как hint, по умолчанию ставится `:3448/rpc/api`.
+**`spic`** — ключевое поле для MXIK. Имя найдено через
+`docs.epos.uz/ru/mobile-api/receipts-sale` (E-POS Mobile API того же
+производителя). Подтверждено реальной фискализацией с TerminalID
+`VG343420011189` в 0.10.12 — MXIK дошёл до ОФД, кешбэк начислился.
+
+**Не менять имя `spic` без проверки!** Communicator JSON-RPC игнорирует
+любые альтернативные имена (`classCode`, `Mxik`, `IKPU`, etc) — мы
+проверили в 0.10.5–0.10.11 через shotgun-стратегию, ни одно не сработало.
+
+### `params.Receipt` верхний уровень
+
+```ts
+{
+  Time: string,           // Go-style "2026-05-08 10:57:46" (с пробелом!)
+  Items: JsonRpcItem[],
+  ReceivedCash: number,   // тийины
+  ReceivedCard: number,
+  Cashier?: string,       // ФИО — попадает на бумажный чек
+}
+```
+
+Реквизиты компании (название/ИНН/адрес/телефон) **НЕ передаём** — Communicator
+берёт их с физического USB-фискального модуля, привязанного к ГНК.
+
+### В нашем коде
+- `src/lib/epos/jsonrpc-client.ts` — типы и клиент
+- `src/lib/epos/fiscalize.ts` — построение payload и отправка
 
 ## МойСклад API — критичные детали
 
@@ -411,7 +442,8 @@ docs/
 | HTTP 415 на `/security/token` | Нет `Accept-Encoding: gzip` | Включена feature `gzip` в reqwest, не трогать |
 | HTTP 400 на `/security/token` | Tauri http странно шлёт POST body | Используем Basic Auth напрямую на каждый запрос |
 | `Body is disturbed or locked` | Двойной `res.json()` после fail `res.text()` | Читаем `text()` один раз, потом `JSON.parse` |
-| `NO_SUCH_METHOD_AVAILABLE` на legacy | У этой установки только JSON-RPC API | URL должен быть `http://localhost:3448/rpc/api` |
+| `NO_SUCH_METHOD_AVAILABLE` на `/uzpos` | На Communicator 3.20+ legacy урезан | Использовать только JSON-RPC `http://localhost:3448/rpc/api` (legacy удалён в 0.10.13) |
+| MXIK = "0" в чеке ОФД, «MXIK kodi xato» | Поле в payload называется неправильно (`classCode`, `Mxik` etc) | Шлём `spic` (camelCase). Подтверждено на TerminalID VG343420011189 |
 | Communicator не отвечает в Tauri, но curl работает | Capability blocking порта | Не сужать `http:default` allow |
 | Receipt позиции пустые | МС в list-запросе не возвращает inline rows | Lazy-load в Receipt.tsx через GET одиночный |
 | Auto-update «Could not fetch latest.json» | Репо приватный или нет `latest.json` | Сделать репо public + `bundle.createUpdaterArtifacts: true` |
@@ -426,7 +458,6 @@ docs/
 
 ## Открытые вопросы
 
-- **Формат ИКПУ в JSON-RPC**: декомпиляция GBS Market не показывает поле ИКПУ в `Item`. Возможно у новой версии Communicator оно нужно — добавили опционально как `ClassCode`/`PackageCode` в ItemRequest. Если сервер игнорирует — будет ошибка штрафа от ГНК.
 - **VAT-формула**: по умолчанию `vat = total * percent / (100 + percent)` (НДС включён в цену). Если у магазина НДС начисляется сверху — нужно поменять `vatIncluded` → `vatAddedOn` в `matcher/strategies.ts`.
 - **Ключи подписи**: `~/.tauri/epos-fiscal.key` живёт только на одной машине разработчика. Если потеряем — нужно перевыпустить и заново публиковать клиентам (auto-update сломается). Бэкап ключа — обязательно.
 

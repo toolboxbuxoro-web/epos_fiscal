@@ -41,6 +41,12 @@ pub fn run() {
             sql: include_str!("../migrations/006_revert_legacy_url.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 7,
+            description: "force_jsonrpc_url",
+            sql: include_str!("../migrations/007_force_jsonrpc_url.sql"),
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()
