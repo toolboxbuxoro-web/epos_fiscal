@@ -133,6 +133,10 @@ JSON-RPC 2.0: `{jsonrpc: "2.0", id, method, params}`. Token не нужен.
 - `src/lib/epos/jsonrpc-client.ts` — типы и клиент
 - `src/lib/epos/fiscalize.ts` — построение payload и отправка
 
+### Документация
+- `docs/external-apis/universal-communicator.md` — Communicator API (legacy + JSON-RPC)
+- `docs/external-apis/epos-mobile-api.md` — E-POS Mobile API (источник имён `spic`, `packageCode`)
+
 ## МойСклад API — критичные детали
 
 ### `Accept-Encoding: gzip` обязателен
