@@ -88,6 +88,23 @@ pub fn print_fiscal_receipt(
     print_raw(&printer_name, &bytes)
 }
 
+/// Печать X- или Z-отчёта на термопринтере.
+///
+/// `data.is_close = false` → X-hisobot (промежуточный, смена остаётся открытой).
+/// `data.is_close = true`  → Z-hisobot (закрытие смены, отправлено в ОФД).
+///
+/// Layout повторяет бумажный X-отчёт от E-POS Cashdesk: шапка с компанией,
+/// блок CHEKLAR (числа), блок TO'LOVLAR (по продажам), блок QAYTARUVLAR
+/// (по возвратам), JAMI (итого).
+#[tauri::command]
+pub fn print_z_report(
+    printer_name: String,
+    data: ZReportPrintData,
+) -> Result<u64, String> {
+    let bytes = build_z_report(&data);
+    print_raw(&printer_name, &bytes)
+}
+
 // ── Структуры данных для команды (приходят с фронта) ─────────────
 
 #[derive(Deserialize, Debug)]
@@ -120,6 +137,44 @@ pub struct CompanyInfo {
     pub address: String,
     pub phone: String,
     pub inn: String,
+}
+
+/// Данные для печати X/Z-отчёта.
+///
+/// Все денежные суммы — уже отформатированные строки (типа "1 198 714.29").
+/// TS сторона форматирует через `formatTiyinForPrint` так же как для чеков.
+#[derive(Deserialize, Debug)]
+pub struct ZReportPrintData {
+    /// `false` = X-hisobot (промежуточный), `true` = Z-hisobot (закрытие).
+    pub is_close: bool,
+    pub company: CompanyInfo,
+    /// Город / филиал — печатается под названием компании.
+    pub city: String,
+    /// Номер X- или Z-отчёта.
+    pub report_number: i64,
+    pub terminal_id: String,
+    /// "YYYY-MM-DD HH:MM:SS" — открытие смены.
+    pub open_time: String,
+    /// Пустая строка для X, дата+время для Z.
+    #[serde(default)]
+    pub close_time: String,
+    pub total_count: i64,
+    pub sale_count: i64,
+    pub refund_count: i64,
+    pub first_seq: String,
+    pub last_seq: String,
+    pub sale_cash_str: String,
+    pub sale_card_str: String,
+    pub sale_sum_str: String,
+    pub sale_vat_str: String,
+    pub refund_cash_str: String,
+    pub refund_card_str: String,
+    pub refund_sum_str: String,
+    pub refund_vat_str: String,
+    pub total_cash_str: String,
+    pub total_card_str: String,
+    pub total_sum_str: String,
+    pub total_vat_str: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -302,6 +357,125 @@ fn build_receipt(d: &ReceiptData) -> Vec<u8> {
     }
 
     // 11. ── Хвост и обрезка ────────────────────────────────
+    buf.extend_from_slice(&[0x0A, 0x0A, 0x0A, 0x0A]);
+    buf.extend_from_slice(&[0x1D, 0x56, 0x01]); // GS V 1 — partial cut
+
+    buf
+}
+
+/// Собрать ESC/POS байты для X- или Z-отчёта (по образцу бумажного отчёта
+/// E-POS Cashdesk). Используются те же helper'ы что и для чека продажи.
+fn build_z_report(d: &ZReportPrintData) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::with_capacity(2048);
+
+    // 1. Init + кодовая страница.
+    buf.extend_from_slice(&[0x1B, 0x40]);     // ESC @ — init
+    buf.extend_from_slice(&[0x1B, 0x74, 17]); // ESC t 17 — CP866 (PC866)
+
+    let title = if d.is_close { "Z-hisobot raqami:" } else { "X-hisobot raqami:" };
+
+    // 2. ── Шапка ────────────────────────────────────────────
+    center(&mut buf);
+    bold_on(&mut buf);
+    write_line(&mut buf, &d.company.name);
+    bold_off(&mut buf);
+    if !d.city.is_empty() {
+        write_line(&mut buf, &d.city);
+    }
+    divider(&mut buf);
+
+    // 3. ── Реквизиты смены ──────────────────────────────────
+    left(&mut buf);
+    write_line(&mut buf, &two_cols(title, &d.report_number.to_string()));
+    write_line(&mut buf, &two_cols("FM raqami:", &d.terminal_id));
+    write_line(&mut buf, &two_cols("Ochilish sanasi:", &d.open_time));
+    if d.is_close && !d.close_time.is_empty() {
+        write_line(&mut buf, &two_cols("Yopilish sanasi:", &d.close_time));
+    }
+
+    // 4. ── CHEKLAR ──────────────────────────────────────────
+    center(&mut buf);
+    write_line(&mut buf, "CHEKLAR");
+    left(&mut buf);
+    divider(&mut buf);
+    write_line(&mut buf, &two_cols("Jami cheklar soni:", &d.total_count.to_string()));
+    write_line(&mut buf, &two_cols("Sotuv cheklari soni:", &d.sale_count.to_string()));
+    write_line(&mut buf, &two_cols("Qaytarilgan cheklar soni:", &d.refund_count.to_string()));
+    if !d.first_seq.is_empty() {
+        write_line(&mut buf, &two_cols("Birinchi chek No:", &d.first_seq));
+    }
+    if !d.last_seq.is_empty() {
+        write_line(&mut buf, &two_cols("Oxirgi chek No:", &d.last_seq));
+    }
+
+    // 5. ── TO'LOVLAR (продажи) ──────────────────────────────
+    center(&mut buf);
+    write_line(&mut buf, "TO'LOVLAR");
+    left(&mut buf);
+    divider(&mut buf);
+    write_line(
+        &mut buf,
+        &two_cols("Umumiy naqd pul miqdori:", &format!("{} so'm", d.sale_cash_str)),
+    );
+    write_line(
+        &mut buf,
+        &two_cols("Umumiy karta summasi:", &format!("{} so'm", d.sale_card_str)),
+    );
+    write_line(&mut buf, "");
+    write_line(
+        &mut buf,
+        &two_cols("Umumiy summa:", &format!("{} so'm", d.sale_sum_str)),
+    );
+    write_line(
+        &mut buf,
+        &two_cols("Umumiy QQS miqdori:", &format!("{} so'm", d.sale_vat_str)),
+    );
+
+    // 6. ── QAYTARUVLAR (возвраты) ───────────────────────────
+    center(&mut buf);
+    write_line(&mut buf, "QAYTARUVLAR");
+    left(&mut buf);
+    divider(&mut buf);
+    write_line(
+        &mut buf,
+        &two_cols("Umumiy naqd pul miqdori:", &format!("{} so'm", d.refund_cash_str)),
+    );
+    write_line(
+        &mut buf,
+        &two_cols("Umumiy karta miqdori:", &format!("{} so'm", d.refund_card_str)),
+    );
+    write_line(
+        &mut buf,
+        &two_cols("Umumiy summa:", &format!("{} so'm", d.refund_sum_str)),
+    );
+    write_line(
+        &mut buf,
+        &two_cols("Umumiy QQS miqdori:", &format!("{} so'm", d.refund_vat_str)),
+    );
+
+    // 7. ── JAMI (итого) ─────────────────────────────────────
+    center(&mut buf);
+    write_line(&mut buf, "JAMI");
+    left(&mut buf);
+    divider(&mut buf);
+    write_line(
+        &mut buf,
+        &two_cols("Umumiy naqd pul miqdori:", &format!("{} so'm", d.total_cash_str)),
+    );
+    write_line(
+        &mut buf,
+        &two_cols("Umumiy karta miqdori:", &format!("{} so'm", d.total_card_str)),
+    );
+    write_line(
+        &mut buf,
+        &two_cols("Umumiy summa:", &format!("{} so'm", d.total_sum_str)),
+    );
+    write_line(
+        &mut buf,
+        &two_cols("Umumiy QQS miqdori:", &format!("{} so'm", d.total_vat_str)),
+    );
+
+    // 8. ── Хвост и обрезка ──────────────────────────────────
     buf.extend_from_slice(&[0x0A, 0x0A, 0x0A, 0x0A]);
     buf.extend_from_slice(&[0x1D, 0x56, 0x01]); // GS V 1 — partial cut
 

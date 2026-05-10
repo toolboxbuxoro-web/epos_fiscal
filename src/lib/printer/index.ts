@@ -101,6 +101,57 @@ export async function printFiscalReceipt(
   return invoke<number>('print_fiscal_receipt', { printerName, data })
 }
 
+/**
+ * Данные для печати X- или Z-отчёта на термопринтере.
+ * Все денежные суммы — уже отформатированные строки (через `formatTiyinForPrint`).
+ *
+ * Структура должна **точно** совпадать с `ZReportPrintData` в
+ * `src-tauri/src/printer.rs`. Поля ниже в snake_case потому что Tauri
+ * передаёт их как есть в Rust serde Deserialize.
+ */
+export interface ZReportPrintData {
+  /** false = X-hisobot (промежуточный), true = Z-hisobot (закрытие) */
+  is_close: boolean
+  company: { name: string; address: string; phone: string; inn: string }
+  /** Город / филиал — печатается под названием компании */
+  city: string
+  report_number: number
+  terminal_id: string
+  /** "YYYY-MM-DD HH:MM:SS" */
+  open_time: string
+  /** Пустая для X, дата+время для Z */
+  close_time: string
+  total_count: number
+  sale_count: number
+  refund_count: number
+  first_seq: string
+  last_seq: string
+  sale_cash_str: string
+  sale_card_str: string
+  sale_sum_str: string
+  sale_vat_str: string
+  refund_cash_str: string
+  refund_card_str: string
+  refund_sum_str: string
+  refund_vat_str: string
+  total_cash_str: string
+  total_card_str: string
+  total_sum_str: string
+  total_vat_str: string
+}
+
+/**
+ * Печать X- или Z-отчёта на термопринтере.
+ * Layout повторяет бумажный X-отчёт от E-POS Cashdesk (CHEKLAR / TO'LOVLAR /
+ * QAYTARUVLAR / JAMI блоки).
+ */
+export async function printZReport(
+  printerName: string,
+  data: ZReportPrintData,
+): Promise<number> {
+  return invoke<number>('print_z_report', { printerName, data })
+}
+
 // ── Хелперы форматирования (общие для fiscalize и History) ─────
 
 /** Тийины → "1 234.56" с пробелами как разделителями тысяч. */

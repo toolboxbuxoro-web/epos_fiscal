@@ -62,6 +62,7 @@ pub fn run() {
             printer::list_printers,
             printer::print_test_qr,
             printer::print_fiscal_receipt,
+            printer::print_z_report,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

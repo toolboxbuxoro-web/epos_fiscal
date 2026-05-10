@@ -11,6 +11,11 @@ import { JsonRpcEposClient, type JsonRpcZReportInfo } from '@/lib/epos'
 import { getSetting, SettingKey } from '@/lib/db'
 import { tiyinToSumDisplay } from '@/lib/format'
 import { log } from '@/lib/log'
+import {
+  formatTiyinForPrint,
+  printZReport,
+  type ZReportPrintData,
+} from '@/lib/printer'
 
 /**
  * Раздел «Смена ККМ» — данные текущего X/Z-отчёта от Communicator.
@@ -93,13 +98,26 @@ export default function Zreport() {
     setBusy(true)
     setError(null)
     try {
+      // Сохраняем info ДО закрытия (после Communicator может вернуть пустой
+      // или другую смену) — нам нужно для печати Z-отчёта с теми же тоталами.
+      const closingInfo = info
       const client = await getClient()
       await client.closeZReport()
-      await log.info('epos', `Смена ${info.Number} закрыта (Z-отчёт)`, {
-        zReportNumber: info.Number,
-        receipts: info.TotalSaleCount,
-        totalSale: info.TotalSaleCash + info.TotalSaleCard,
+      await log.info('epos', `Смена ${closingInfo.Number} закрыта (Z-отчёт)`, {
+        zReportNumber: closingInfo.Number,
+        receipts: closingInfo.TotalSaleCount,
+        totalSale: closingInfo.TotalSaleCash + closingInfo.TotalSaleCard,
       })
+
+      // Auto-печать Z-отчёта на термопринтер. Не ломаем закрытие если
+      // печать упала — смена уже закрыта в ОФД, главное.
+      try {
+        await printReport(true)
+      } catch (printErr) {
+        const msg = printErr instanceof Error ? printErr.message : String(printErr)
+        await log.warn('epos', `Z-отчёт не распечатался: ${msg}`)
+      }
+
       await refresh()
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
@@ -110,17 +128,77 @@ export default function Zreport() {
     }
   }
 
-  async function printXReport() {
+  /** "DD.MM.YYYY HH:MM:SS" текущее локальное время — для close_time если ФМ не вернул */
+  function formatNowUz(): string {
+    const d = new Date()
+    const pad = (n: number) => n.toString().padStart(2, '0')
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+  }
+
+  /**
+   * Распечатать X- или Z-отчёт на термопринтере магазина.
+   *
+   * Communicator JSON-RPC API НЕ имеет метода печати X-отчёта (проверено
+   * curl'ом 4 кандидатов: Api.PrintXReport / PrintZReport / PrintCurrentZReport /
+   * PrintZReportInfo — все вернули NO_SUCH_METHOD). Поэтому формируем
+   * ESC/POS байты сами через нашу Rust-команду `print_z_report`.
+   *
+   * @param close `true` = Z-отчёт (после закрытия смены), `false` = X-отчёт.
+   */
+  async function printReport(close: boolean) {
+    if (!info) return
     setBusy(true)
     setError(null)
     try {
-      const client = await getClient()
-      await client.printXReport()
-      await log.info('epos', `X-отчёт распечатан (смена ${info?.Number})`)
+      const printerName = (await getSetting(SettingKey.PrinterName)) ?? ''
+      if (!printerName) {
+        throw new Error(
+          'Не настроен принтер чеков. Настройки → Печать чека → Принтер.',
+        )
+      }
+      const company = {
+        name: (await getSetting(SettingKey.CompanyName)) ?? '',
+        address: (await getSetting(SettingKey.CompanyAddress)) ?? '',
+        phone: (await getSetting(SettingKey.CompanyPhone)) ?? '',
+        inn: (await getSetting(SettingKey.CompanyInn)) ?? '',
+      }
+      const totalSaleSum = info.TotalSaleCash + info.TotalSaleCard
+      const totalRefundSum = info.TotalRefundCash + info.TotalRefundCard
+      const data: ZReportPrintData = {
+        is_close: close,
+        company,
+        city: (await getSetting(SettingKey.MoyskladRetailStoreName)) ?? '',
+        report_number: info.Number,
+        terminal_id: info.TerminalID,
+        open_time: info.OpenTime,
+        close_time: close ? info.CloseTime || formatNowUz() : '',
+        total_count: info.TotalSaleCount + info.TotalRefundCount,
+        sale_count: info.TotalSaleCount,
+        refund_count: info.TotalRefundCount,
+        first_seq: info.FirstReceiptSeq || '',
+        last_seq: info.LastReceiptSeq || '',
+        sale_cash_str: formatTiyinForPrint(info.TotalSaleCash),
+        sale_card_str: formatTiyinForPrint(info.TotalSaleCard),
+        sale_sum_str: formatTiyinForPrint(totalSaleSum),
+        sale_vat_str: formatTiyinForPrint(info.TotalSaleVAT),
+        refund_cash_str: formatTiyinForPrint(info.TotalRefundCash),
+        refund_card_str: formatTiyinForPrint(info.TotalRefundCard),
+        refund_sum_str: formatTiyinForPrint(totalRefundSum),
+        refund_vat_str: formatTiyinForPrint(info.TotalRefundVAT),
+        total_cash_str: formatTiyinForPrint(info.TotalSaleCash - info.TotalRefundCash),
+        total_card_str: formatTiyinForPrint(info.TotalSaleCard - info.TotalRefundCard),
+        total_sum_str: formatTiyinForPrint(totalSaleSum - totalRefundSum),
+        total_vat_str: formatTiyinForPrint(info.TotalSaleVAT - info.TotalRefundVAT),
+      }
+      await printZReport(printerName, data)
+      await log.info(
+        'epos',
+        `${close ? 'Z' : 'X'}-отчёт распечатан (смена ${info.Number})`,
+      )
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
-      setError(`Не удалось распечатать X-отчёт: ${msg}`)
-      await log.error('epos', `printXReport failed: ${msg}`)
+      setError(`Не удалось распечатать ${close ? 'Z' : 'X'}-отчёт: ${msg}`)
+      await log.error('epos', `printZReport failed: ${msg}`)
     } finally {
       setBusy(false)
     }
@@ -313,13 +391,12 @@ export default function Zreport() {
             <Button
               variant="secondary"
               size="lg"
-              onClick={() => void printXReport()}
+              onClick={() => void printReport(false)}
               disabled={busy}
               icon={<Printer size={18} />}
               title="Распечатать X-отчёт"
               aria-label="Распечатать X-отчёт"
             >
-              {/* только иконка */}
               <span className="sr-only">Распечатать X-отчёт</span>
             </Button>
           </div>
