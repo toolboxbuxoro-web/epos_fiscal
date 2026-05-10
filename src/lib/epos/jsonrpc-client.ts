@@ -280,6 +280,41 @@ export class JsonRpcEposClient {
     return this.call('Api.CloseZReport')
   }
 
+  /**
+   * Распечатать X-отчёт на термопринтере подключенном к Communicator.
+   *
+   * Точное имя метода в JSON-RPC API не задокументировано. Пробуем
+   * несколько имён: `Api.PrintXReport`, `Api.PrintCurrentZReport`,
+   * `Api.PrintZReport`, `Api.PrintReceipt`. Тот что не вернёт
+   * NO_SUCH_METHOD — будет работать.
+   *
+   * Если ни один не сработает — UI должен fallback'нуться на нашу
+   * собственную печать через `src-tauri/src/printer.rs`.
+   */
+  async printXReport(): Promise<unknown> {
+    const candidates = [
+      'Api.PrintXReport',
+      'Api.PrintCurrentZReport',
+      'Api.PrintZReport',
+      'Api.PrintZReportInfo',
+    ]
+    let lastErr: unknown = null
+    for (const method of candidates) {
+      try {
+        return await this.call(method)
+      } catch (e) {
+        const msg = String(e instanceof Error ? e.message : e).toLowerCase()
+        if (msg.includes("can't find method") || msg.includes('no_such_method')) {
+          lastErr = e
+          continue // пробуем следующий
+        }
+        // другая ошибка (напр. «принтер не подключен») — пробрасываем
+        throw e
+      }
+    }
+    throw lastErr ?? new Error('Ни один из методов печати X-отчёта не доступен в Communicator')
+  }
+
   /** Отправить чек продажи. Возвращает фискальный признак. */
   sendSaleReceipt(receipt: JsonRpcReceipt): Promise<JsonRpcFiscalAnswer> {
     return this.call('Api.SendSaleReceipt', { Receipt: receipt })

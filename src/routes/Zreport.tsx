@@ -1,14 +1,12 @@
 import { useEffect, useState } from 'react'
 import {
   AlertCircle,
-  Banknote,
-  CreditCard,
   Lock,
   PlayCircle,
+  Printer,
   RefreshCw,
-  Send,
 } from 'lucide-react'
-import { Button, Card, EmptyState, PageHeader, StatusBadge } from '@/components/ui'
+import { Button, Card, EmptyState, PageHeader } from '@/components/ui'
 import { JsonRpcEposClient, type JsonRpcZReportInfo } from '@/lib/epos'
 import { getSetting, SettingKey } from '@/lib/db'
 import { tiyinToSumDisplay } from '@/lib/format'
@@ -17,12 +15,13 @@ import { log } from '@/lib/log'
 /**
  * Раздел «Смена ККМ» — данные текущего X/Z-отчёта от Communicator.
  *
+ * UI повторяет стиль E-POS Cashdesk: 4 блока в сетке 2×2 (Z-отчёт/ФМ
+ * слева сверху, чеки справа сверху, продажи слева снизу, возвраты справа
+ * снизу) + большая кнопка «Закрыть смену» с кнопкой печати X-отчёта.
+ *
  * Источник истины — Communicator (`Api.GetZReportInfo`). Поэтому здесь
  * мы НЕ дублируем счётчики в локальной DB — просто читаем live с ФМ
  * каждые 30 сек.
- *
- * Если смена закрыта (CloseTime непустой или метод вернул null) —
- * показываем баннер «Откройте смену» с одной кнопкой.
  *
  * Все денежные суммы приходят от Communicator в тийинах (× 100 от бумажного).
  */
@@ -32,14 +31,18 @@ export default function Zreport() {
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
 
+  async function getClient() {
+    const url =
+      (await getSetting(SettingKey.EposCommunicatorUrl)) ??
+      'http://localhost:3448/rpc/api'
+    return new JsonRpcEposClient({ url })
+  }
+
   async function refresh() {
     setLoading(true)
     setError(null)
     try {
-      const url =
-        (await getSetting(SettingKey.EposCommunicatorUrl)) ??
-        'http://localhost:3448/rpc/api'
-      const client = new JsonRpcEposClient({ url })
+      const client = await getClient()
       const data = await client.getZReportInfo()
       setInfo(data)
     } catch (e) {
@@ -51,7 +54,6 @@ export default function Zreport() {
 
   useEffect(() => {
     void refresh()
-    // Обновляем каждые 30 сек чтобы цифры не протухали
     const id = setInterval(() => void refresh(), 30_000)
     return () => clearInterval(id)
   }, [])
@@ -60,10 +62,7 @@ export default function Zreport() {
     setBusy(true)
     setError(null)
     try {
-      const url =
-        (await getSetting(SettingKey.EposCommunicatorUrl)) ??
-        'http://localhost:3448/rpc/api'
-      const client = new JsonRpcEposClient({ url })
+      const client = await getClient()
       await client.openZReport()
       await log.info('epos', 'Смена открыта (X-отчёт стартовал)')
       await refresh()
@@ -78,7 +77,11 @@ export default function Zreport() {
 
   async function closeShift() {
     if (!info) return
-    const totalSum = info.TotalSaleCash + info.TotalSaleCard - info.TotalRefundCash - info.TotalRefundCard
+    const totalSum =
+      info.TotalSaleCash +
+      info.TotalSaleCard -
+      info.TotalRefundCash -
+      info.TotalRefundCard
     const ok = confirm(
       `Закрыть смену? Будет напечатан Z-отчёт и отправлен в ОФД.\n\n` +
         `Чеков: ${info.TotalSaleCount} продаж, ${info.TotalRefundCount} возвратов\n` +
@@ -90,10 +93,7 @@ export default function Zreport() {
     setBusy(true)
     setError(null)
     try {
-      const url =
-        (await getSetting(SettingKey.EposCommunicatorUrl)) ??
-        'http://localhost:3448/rpc/api'
-      const client = new JsonRpcEposClient({ url })
+      const client = await getClient()
       await client.closeZReport()
       await log.info('epos', `Смена ${info.Number} закрыта (Z-отчёт)`, {
         zReportNumber: info.Number,
@@ -110,11 +110,27 @@ export default function Zreport() {
     }
   }
 
+  async function printXReport() {
+    setBusy(true)
+    setError(null)
+    try {
+      const client = await getClient()
+      await client.printXReport()
+      await log.info('epos', `X-отчёт распечатан (смена ${info?.Number})`)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setError(`Не удалось распечатать X-отчёт: ${msg}`)
+      await log.error('epos', `printXReport failed: ${msg}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   return (
     <div className="space-y-4">
       <PageHeader
         title="Смена ККМ"
-        subtitle="Данные текущего X/Z-отчёта от EPOS Communicator"
+        subtitle="Текущий X/Z-отчёт от EPOS Communicator"
         action={
           <Button
             variant="ghost"
@@ -136,17 +152,14 @@ export default function Zreport() {
         </Card>
       )}
 
-      {/* Смена не открыта — кнопка открытия */}
+      {/* Смена не открыта */}
       {!loading && !info && !error && (
         <Card>
           <Card.Body>
             <EmptyState
               icon={<Lock size={48} />}
               title="Смена не открыта"
-              description={
-                'Чтобы пробивать чеки — откройте смену. Communicator зарегистрирует ' +
-                'X-отчёт, после чего фискализация заработает.'
-              }
+              description="Чтобы пробивать чеки — откройте смену. Communicator зарегистрирует X-отчёт, после чего фискализация заработает."
               action={
                 <Button
                   variant="primary"
@@ -162,93 +175,91 @@ export default function Zreport() {
         </Card>
       )}
 
-      {/* Смена открыта — полный дашборд */}
+      {/* Смена открыта — дашборд */}
       {info && (
         <>
-          <Card>
-            <Card.Header>
-              <div className="flex items-start justify-between gap-4 flex-wrap">
-                <div>
-                  <div className="flex items-center gap-2">
-                    <StatusBadge status="success">Смена открыта</StatusBadge>
-                    <span className="text-caption text-ink-muted">
-                      X-отчёт № {info.Number}
-                    </span>
-                  </div>
-                  <div className="mt-2 text-caption text-ink-muted space-y-0.5">
-                    <div>
-                      <span className="text-ink-subtle">TerminalID:</span>{' '}
-                      <span className="font-mono">{info.TerminalID}</span>
-                    </div>
-                    <div>
-                      <span className="text-ink-subtle">Открыта:</span>{' '}
-                      {info.OpenTime}
-                    </div>
-                    {info.FirstReceiptSeq && (
-                      <div>
-                        <span className="text-ink-subtle">Чеки №:</span>{' '}
-                        {info.FirstReceiptSeq} — {info.LastReceiptSeq}
-                      </div>
-                    )}
-                  </div>
-                </div>
-                <Button
-                  variant="danger"
-                  onClick={() => void closeShift()}
-                  loading={busy}
-                  icon={!busy ? <Send size={14} /> : undefined}
-                >
-                  Закрыть смену
-                </Button>
-              </div>
-            </Card.Header>
-          </Card>
+          {/* Заголовок-баннер */}
+          <div className="text-center py-2">
+            <h2 className="text-heading text-ink">
+              Смена открыта{' '}
+              <span className="font-medium">{formatHeaderDate(info.OpenTime)}</span>
+            </h2>
+          </div>
 
-          {/* Сводка по продажам */}
+          {/* Сетка 2×2: инфо | чеки / продажи | возвраты */}
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            {/* Информация о смене */}
+            <Card>
+              <Card.Body className="space-y-3">
+                <Row label="Номер текущего Z-отчёта" value={info.Number.toString()} bold />
+                <Row label="Номер фискального модуля" value={info.TerminalID} mono />
+                <Row label="Время открытия смены" value={formatRowDate(info.OpenTime)} />
+                <Row
+                  label="Время закрытия смены"
+                  value={info.CloseTime ? formatRowDate(info.CloseTime) : '—'}
+                  muted={!info.CloseTime}
+                />
+              </Card.Body>
+            </Card>
+
+            {/* Чеки */}
             <Card>
               <Card.Header>
-                <Card.Title>Продажи</Card.Title>
-                <Card.Description>За текущую смену</Card.Description>
+                <div className="flex items-center justify-between">
+                  <Card.Title>Чеки</Card.Title>
+                  <span className="text-heading font-semibold text-ink tabular-nums">
+                    {info.TotalSaleCount + info.TotalRefundCount}
+                  </span>
+                </div>
               </Card.Header>
               <Card.Body className="space-y-3">
-                <Stat
-                  label="Чеков"
-                  value={info.TotalSaleCount.toString()}
+                <Row
+                  label="Номер первого чека"
+                  value={info.FirstReceiptSeq || '—'}
+                  mono
                 />
-                <Stat
-                  label={
-                    <span className="inline-flex items-center gap-1.5">
-                      <Banknote size={14} /> Наличные
-                    </span>
-                  }
+                <Row
+                  label="Номер последнего чека"
+                  value={info.LastReceiptSeq || '—'}
+                  mono
+                />
+                <Row
+                  label="Количество возвращённых чеков"
+                  value={info.TotalRefundCount.toString()}
+                />
+              </Card.Body>
+            </Card>
+
+            {/* Продажи */}
+            <Card>
+              <Card.Header>
+                <div className="flex items-center justify-between">
+                  <Card.Title>Продажи</Card.Title>
+                  <span className="text-heading font-semibold text-ink tabular-nums">
+                    {info.TotalSaleCount}
+                  </span>
+                </div>
+              </Card.Header>
+              <Card.Body className="space-y-3">
+                <Row
+                  label="Общая сумма (наличные)"
                   value={`${tiyinToSumDisplay(info.TotalSaleCash)} сум`}
                 />
-                <Stat
-                  label={
-                    <span className="inline-flex items-center gap-1.5">
-                      <CreditCard size={14} /> Карта
-                    </span>
-                  }
+                <Row
+                  label="Общая сумма (карта)"
                   value={`${tiyinToSumDisplay(info.TotalSaleCard)} сум`}
                 />
                 <div className="border-t border-border pt-3">
-                  <Stat
-                    label={<span className="font-medium">ИТОГО</span>}
-                    value={
-                      <span className="font-semibold text-lg">
-                        {tiyinToSumDisplay(info.TotalSaleCash + info.TotalSaleCard)} сум
-                      </span>
-                    }
+                  <Row
+                    label="Общая сумма"
+                    value={`${tiyinToSumDisplay(info.TotalSaleCash + info.TotalSaleCard)} сум`}
+                    bold
                   />
                 </div>
-                <Stat
-                  label={<span className="text-ink-muted">в т.ч. НДС</span>}
-                  value={
-                    <span className="text-ink-muted">
-                      {tiyinToSumDisplay(info.TotalSaleVAT)} сум
-                    </span>
-                  }
+                <Row
+                  label="Общая сумма НДС"
+                  value={`${tiyinToSumDisplay(info.TotalSaleVAT)} сум`}
+                  muted
                 />
               </Card.Body>
             </Card>
@@ -256,74 +267,65 @@ export default function Zreport() {
             {/* Возвраты */}
             <Card>
               <Card.Header>
-                <Card.Title>Возвраты</Card.Title>
-                <Card.Description>За текущую смену</Card.Description>
+                <div className="flex items-center justify-between">
+                  <Card.Title>Возвраты</Card.Title>
+                  <span className="text-heading font-semibold text-ink tabular-nums">
+                    {info.TotalRefundCount}
+                  </span>
+                </div>
               </Card.Header>
               <Card.Body className="space-y-3">
-                <Stat
-                  label="Чеков"
-                  value={info.TotalRefundCount.toString()}
-                />
-                <Stat
-                  label={
-                    <span className="inline-flex items-center gap-1.5">
-                      <Banknote size={14} /> Наличные
-                    </span>
-                  }
+                <Row
+                  label="Общая сумма (наличные)"
                   value={`${tiyinToSumDisplay(info.TotalRefundCash)} сум`}
                 />
-                <Stat
-                  label={
-                    <span className="inline-flex items-center gap-1.5">
-                      <CreditCard size={14} /> Карта
-                    </span>
-                  }
+                <Row
+                  label="Общая сумма (карта)"
                   value={`${tiyinToSumDisplay(info.TotalRefundCard)} сум`}
                 />
                 <div className="border-t border-border pt-3">
-                  <Stat
-                    label={<span className="font-medium">ИТОГО</span>}
-                    value={
-                      <span className="font-semibold text-lg">
-                        {tiyinToSumDisplay(info.TotalRefundCash + info.TotalRefundCard)} сум
-                      </span>
-                    }
+                  <Row
+                    label="Общая сумма"
+                    value={`${tiyinToSumDisplay(info.TotalRefundCash + info.TotalRefundCard)} сум`}
+                    bold
                   />
                 </div>
-                <Stat
-                  label={<span className="text-ink-muted">в т.ч. НДС</span>}
-                  value={
-                    <span className="text-ink-muted">
-                      {tiyinToSumDisplay(info.TotalRefundVAT)} сум
-                    </span>
-                  }
+                <Row
+                  label="Общая сумма НДС"
+                  value={`${tiyinToSumDisplay(info.TotalRefundVAT)} сум`}
+                  muted
                 />
               </Card.Body>
             </Card>
           </div>
 
-          {/* Чистая выручка */}
-          <Card className="bg-canvas">
-            <Card.Body>
-              <Stat
-                label={<span className="font-medium text-body">Чистая выручка за смену</span>}
-                value={
-                  <span className="font-semibold text-heading text-success">
-                    {tiyinToSumDisplay(
-                      info.TotalSaleCash +
-                        info.TotalSaleCard -
-                        info.TotalRefundCash -
-                        info.TotalRefundCard,
-                    )}{' '}
-                    сум
-                  </span>
-                }
-              />
-            </Card.Body>
-          </Card>
+          {/* Кнопки внизу — большая «Закрыть смену» + иконка принтера */}
+          <div className="flex items-center gap-3 pt-2">
+            <Button
+              variant="primary"
+              size="lg"
+              className="flex-1"
+              onClick={() => void closeShift()}
+              loading={busy}
+            >
+              Закрыть смену
+            </Button>
+            <Button
+              variant="secondary"
+              size="lg"
+              onClick={() => void printXReport()}
+              disabled={busy}
+              icon={<Printer size={18} />}
+              title="Распечатать X-отчёт"
+              aria-label="Распечатать X-отчёт"
+            >
+              {/* только иконка */}
+              <span className="sr-only">Распечатать X-отчёт</span>
+            </Button>
+          </div>
 
           <div className="text-caption text-ink-muted text-center">
-            Данные автоматически обновляются каждые 30 секунд от Communicator.
+            Данные обновляются каждые 30 сек напрямую из Communicator.
           </div>
         </>
       )}
@@ -331,17 +333,61 @@ export default function Zreport() {
   )
 }
 
-function Stat({
+/**
+ * Строка-таблица: «label …………… value» с tabular-nums для денежных чисел.
+ */
+function Row({
   label,
   value,
+  bold = false,
+  muted = false,
+  mono = false,
 }: {
-  label: React.ReactNode
-  value: React.ReactNode
+  label: string
+  value: string
+  bold?: boolean
+  muted?: boolean
+  mono?: boolean
 }) {
   return (
-    <div className="flex items-center justify-between gap-4">
-      <span className="text-body text-ink-muted">{label}</span>
-      <span className="text-body text-ink tabular-nums">{value}</span>
+    <div className="flex items-baseline justify-between gap-3">
+      <span className={`text-body ${muted ? 'text-ink-muted' : 'text-ink-muted'}`}>
+        {label}
+      </span>
+      <span
+        className={`text-body tabular-nums ${
+          mono ? 'font-mono text-caption' : ''
+        } ${bold ? 'font-semibold text-ink' : muted ? 'text-ink-subtle' : 'text-ink'}`}
+      >
+        {value}
+      </span>
     </div>
   )
+}
+
+/**
+ * "2026-05-10 08:57:23" → "10 мая 2026 08:57"
+ */
+function formatHeaderDate(s: string): string {
+  if (!s) return '—'
+  const m = s.match(/(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/)
+  if (!m) return s
+  const [, y, mm, dd, h, min] = m
+  const months = [
+    'января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
+    'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря',
+  ]
+  const monthIdx = parseInt(mm!, 10) - 1
+  return `${parseInt(dd!, 10)} ${months[monthIdx]} ${y} ${h}:${min}`
+}
+
+/**
+ * "2026-05-10 08:57:23" → "10.05.2026 08:57" (для блока с инфо).
+ */
+function formatRowDate(s: string): string {
+  if (!s) return '—'
+  const m = s.match(/(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/)
+  if (!m) return s
+  const [, y, mm, dd, h, min] = m
+  return `${dd}.${mm}.${y} ${h}:${min}`
 }
