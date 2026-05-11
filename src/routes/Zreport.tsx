@@ -72,9 +72,12 @@ export default function Zreport() {
       await log.info('epos', 'Смена открыта (X-отчёт стартовал)')
       await refresh()
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      setError(`Не удалось открыть смену: ${msg}`)
-      await log.error('epos', `openZReport failed: ${msg}`)
+      const errMsg = formatEposError(e, 'openZReport')
+      setError(`Не удалось открыть смену: ${errMsg}`)
+      await log.error('epos', `openZReport failed: ${errMsg}`, {
+        raw: e instanceof Error ? e.message : String(e),
+        json: JSON.stringify(e),
+      })
     } finally {
       setBusy(false)
     }
@@ -120,12 +123,31 @@ export default function Zreport() {
 
       await refresh()
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      setError(`Не удалось закрыть смену: ${msg}`)
-      await log.error('epos', `closeZReport failed: ${msg}`)
+      const errMsg = formatEposError(e, 'closeZReport')
+      setError(`Не удалось закрыть смену: ${errMsg}`)
+      await log.error('epos', `closeZReport failed: ${errMsg}`, {
+        raw: e instanceof Error ? e.message : String(e),
+        json: JSON.stringify(e),
+      })
     } finally {
       setBusy(false)
     }
+  }
+
+  /**
+   * Достать максимум информации из ошибки Communicator. Если у JSON-RPC
+   * ответа поле `message` пустое — возвращаем `code: N, data: <...>` чтобы
+   * в UI и логах была видна хоть какая-то идентификация.
+   */
+  function formatEposError(e: unknown, ctx: string): string {
+    if (!(e instanceof Error)) return String(e) || `${ctx}: неизвестная ошибка`
+    const parts: string[] = []
+    if (e.message) parts.push(e.message)
+    const x = e as { code?: number; data?: unknown }
+    if (typeof x.code === 'number') parts.push(`code=${x.code}`)
+    if (x.data != null) parts.push(`data=${JSON.stringify(x.data)}`)
+    if (parts.length === 0) return `${ctx}: пустой ответ от Communicator`
+    return parts.join(' · ')
   }
 
   /** "DD.MM.YYYY HH:MM:SS" текущее локальное время — для close_time если ФМ не вернул */
