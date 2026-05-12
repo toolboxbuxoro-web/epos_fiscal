@@ -46,15 +46,28 @@ export default function Zreport() {
   async function refresh() {
     setLoading(true)
     setError(null)
-    try {
-      const client = await getClient()
-      const data = await client.getZReportInfo()
-      setInfo(data)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setLoading(false)
+    // Retry до 3 раз — Communicator иногда занят отправкой чека в ОФД и
+    // отвечает с timeout. Если упасть с первой попытки → юзер увидит
+    // «не открыта» и жмёт Open, что только ухудшит ситуацию.
+    let lastErr: unknown = null
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const client = await getClient()
+        const data = await client.getZReportInfo()
+        setInfo(data)
+        setError(null)
+        setLoading(false)
+        return
+      } catch (e) {
+        lastErr = e
+        if (attempt < 3) {
+          // Экспоненциальный back-off: 300ms → 900ms
+          await new Promise((r) => setTimeout(r, 300 * attempt * attempt))
+        }
+      }
     }
+    setError(formatEposError(lastErr, 'getZReportInfo'))
+    setLoading(false)
   }
 
   useEffect(() => {
@@ -68,6 +81,23 @@ export default function Zreport() {
     setError(null)
     try {
       const client = await getClient()
+
+      // Защита от двойного открытия: перед `openZReport` проверяем что
+      // смена реально закрыта. Если Communicator сейчас отдаёт открытую
+      // смену — просто обновляем UI и выходим. Это решает кейс когда
+      // первый getZReportInfo упал по timeout, UI показал «не открыта»,
+      // юзер нажал «Открыть» → Communicator справедливо ругается что
+      // смена и так открыта (с пустым сообщением).
+      const existing = await client.getZReportInfo()
+      if (existing && existing.CloseTime === '') {
+        await log.info(
+          'epos',
+          `Смена ${existing.Number} уже открыта — пропускаю openZReport`,
+        )
+        setInfo(existing)
+        return
+      }
+
       await client.openZReport()
       await log.info('epos', 'Смена открыта (X-отчёт стартовал)')
       await refresh()

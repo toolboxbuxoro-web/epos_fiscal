@@ -57,10 +57,18 @@ Matcher (3 стратегии: passthrough / price-bucket / multi-item)
 matches + match_items (план: чем подменить)
        │
        ▼
-fiscalize() → EposClient (legacy /uzpos) ИЛИ JsonRpcEposClient (rpc/api)
+fiscalize() → JsonRpcEposClient.sendSaleReceipt (Api.SendSaleReceipt)
        │
        ▼
 fiscal_receipts (TerminalID, ReceiptSeq, FiscalSign, QRCodeURL)
+       │
+       ▼
+printer.rs::print_fiscal_receipt (ESC/POS на Xprinter)
+
+Параллельная ветка — смена ККМ (роут /zreport):
+   getZReportInfo (раз в 30 сек) → UI данные
+   openShift → Api.OpenZReport
+   closeShift → Api.CloseZReport → printer.rs::print_z_report (Z auto)
 ```
 
 ## Multi-shop
@@ -86,6 +94,11 @@ JSON-RPC 2.0: `{jsonrpc: "2.0", id, method, params}`. Token не нужен.
 Методы: `Api.SendSaleReceipt`, `Api.SendRefundReceipt`, `Api.OpenZReport`,
 `Api.CloseZReport`, `Api.GetReceiptCount`, `Api.GetUnsentCount`,
 `Api.Status`, `Api.GetZReportInfo` (текущий X/Z-отчёт со всеми тоталами).
+
+**Чего НЕТ в Communicator JSON-RPC:** методов печати X/Z-отчёта. Проверили
+4 кандидата (`Api.PrintXReport` / `Api.PrintZReport` / `Api.PrintCurrentZReport` /
+`Api.PrintZReportInfo`) — все вернули `NO_SUCH_METHOD_AVAILABLE`. Поэтому
+X/Z-отчёт печатаем сами через ESC/POS в `printer.rs` → см. секцию «Z-отчёт ККМ».
 
 ### ⚠️ Критичные имена полей в `params.Receipt.Items[]`
 
@@ -312,6 +325,61 @@ Matcher выбирает товары так, чтобы суммарно сов
 
 В тестовом режиме вместо TerminalID/FiscalSign — заглушка.
 
+## Z-отчёт ККМ
+
+Раздел «Смена» (роут `/zreport`, пункт «Смена» в сайдбаре с иконкой
+`ClipboardList`). UI повторяет E-POS Cashdesk: 2×2 сетка (инфо смены /
+чеки / продажи / возвраты) + большая кнопка «Закрыть смену» + иконка
+принтера для X-отчёта. Auto-refresh каждые 30 сек.
+
+### Архитектура: данные от Communicator, печать сами
+
+Communicator JSON-RPC даёт **только данные** (`Api.GetZReportInfo`,
+`Api.OpenZReport`, `Api.CloseZReport`). Метода печати X/Z **нет** —
+проверено curl'ом 4 кандидатов, см. Pitfalls.
+
+Поэтому:
+- **Данные**: `JsonRpcEposClient.getZReportInfo()` → `JsonRpcZReportInfo`
+  с тоталами (TotalSaleCount/Cash/Card/VAT, TotalRefundCount/..., FirstReceiptSeq,
+  LastReceiptSeq, OpenTime, CloseTime, TerminalID, Number).
+- **Печать**: своя Rust-команда `print_z_report` в `src-tauri/src/printer.rs`
+  — формирует ESC/POS байты по тому же шаблону что бумажный X-отчёт от
+  E-POS Cashdesk (CHEKLAR / TO'LOVLAR / QAYTARUVLAR / JAMI блоки), пишет
+  кириллицу в CP866 как и чек.
+
+### Открытие смены: guard от двойного открытия
+
+`openShift()` сначала зовёт `getZReportInfo()`. Если ответ есть и `CloseTime
+=== ''` → смена уже открыта, просто обновляем UI и выходим **без** вызова
+`openZReport`. Это решает кейс когда первый `getZReportInfo` упал по timeout,
+UI показал «Смена не открыта», юзер нажал «Открыть» → Communicator справедливо
+ругается что смена и так открыта (с пустым `message`, см. формат ошибок ниже).
+
+### Retry в `refresh()`
+
+Communicator иногда занят отправкой чека в ОФД и отвечает timeout. До 3
+попыток с exp backoff (300ms → 900ms). Если упасть с первой — юзер увидел
+бы пустой стейт и нажал бы «Открыть», что только запутало бы всё.
+
+### Auto-print Z при закрытии смены
+
+После успешного `closeZReport` тихо вызывается `printReport(true)`. Если
+печать упала (нет принтера, оффлайн) — пишем warn в логи, **не** ломаем
+закрытие. Смена уже закрыта в ОФД, это главное.
+
+### Формат ошибок Communicator
+
+JSON-RPC Communicator иногда возвращает `code/data` без `message`. Поэтому
+в `formatEposError()` мы аккумулируем всё что есть: `message · code=N ·
+data=<json>`. Иначе в UI выводилось бы пустое «Не удалось закрыть смену:».
+
+### В нашем коде
+
+- `src/routes/Zreport.tsx` — UI, refresh, openShift с guard'ом, closeShift с auto-print
+- `src/lib/printer/index.ts` — `printZReport(printerName, data)` + `ZReportPrintData` интерфейс (mirror Rust-структуры)
+- `src-tauri/src/printer.rs` — `print_z_report` Tauri-команда + `build_z_report` (ESC/POS байты) + struct `ZReportPrintData`
+- `src/lib/epos/jsonrpc-client.ts` — `getZReportInfo()`, `openZReport()`, `closeZReport()` + интерфейс `JsonRpcZReportInfo`
+
 ## Релизы и Auto-update
 
 ```
@@ -397,9 +465,17 @@ src-tauri/
   capabilities/default.json ← localhost broad, HTTPS точечно
   src/
     printer.rs            ← raw ESC/POS + CP866 + native QR (GS ( k)
+                            + build_receipt + build_z_report (X/Z layout)
+    lib.rs                ← Tauri handlers: print_test_qr / print_fiscal_receipt
+                            / print_z_report / list_printers + migrations
   migrations/
     001_initial.sql       ← 7 таблиц (settings, esf_items, ms_receipts, ...)
     002_logs.sql          ← логи диагностики
+    003_inventory_sync.sql ← inventory remote-конфиг (mytoolbox)
+    004_drop_legacy_items.sql ← очистка legacy excel_items таблицы
+    005_drop_legacy_epos_url.sql ← сброс старого uzpos URL
+    006_revert_legacy_url.sql ← (откат после прерывания 0.10.8)
+    007_force_jsonrpc_url.sql ← форсим http://localhost:3448/rpc/api
 src/
   lib/
     db/                   ← SQLite, типы и DAO (SettingKey enum)
@@ -411,17 +487,31 @@ src/
       index.ts            ← buildMatch + distributeDiscount + distributeBump
       types.ts            ← MatchCandidate (price/discount/vat) + MatcherOptions
     epos/
-      client.ts           ← LEGACY /uzpos
-      jsonrpc-client.ts   ← НОВЫЙ /rpc/api + formatGoTime  ← фискализация идёт через него
-      fiscalize.ts        ← главный flow + auto-detect протокола + payment split
-    printer/              ← JS-обёртка над Tauri-командой print_receipt
+      jsonrpc-client.ts   ← /rpc/api + formatGoTime + JsonRpcZReportInfo
+                            методы: SendSaleReceipt, OpenZReport, CloseZReport,
+                            GetZReportInfo, GetReceiptCount, GetUnsentCount, Status
+      fiscalize.ts        ← главный flow + payment split + spic поле
+    printer/              ← JS-обёртка: printFiscalReceipt + printZReport
+                            + ZReportPrintData (mirror Rust-структуры)
     log.ts                ← запись в logs таблицу
     updater.ts            ← autoApplyOnStartup
-  routes/                 ← 6 экранов: Dashboard / Receipt / Catalog / History / Logs / Settings
+  routes/                 ← 7 экранов:
+                            Dashboard / Receipt / Zreport / History
+                            / Catalog / Logs / Settings
+  components/
+    Layout.tsx            ← sidebar: 6 пунктов (Касса/Смена/Чеки/Справочник/
+                            Настройки/Логи) — пункт «Смена» с ClipboardList
 docs/
-  external-apis/universal-communicator.md  ← API legacy /uzpos (Postman)
+  external-apis/
+    universal-communicator.md  ← Communicator API (JSON-RPC + legacy историч.)
+    epos-mobile-api.md         ← E-POS Mobile API snapshot (источник `spic`)
+    fiscal-drive-service.md    ← FiscalDriveService (alt путь на :3449/rpc)
 .github/workflows/release.yml  ← CI: Win+Mac (без Linux), releaseDraft:false
 ```
+
+**Примечание про legacy:** `src/lib/epos/client.ts` (legacy /uzpos клиент)
+был удалён в 0.10.13 после подтверждения что `spic` работает через JSON-RPC.
+В коде остался только `jsonrpc-client.ts`.
 
 ## Чек-лист первого запуска у магазина
 
@@ -438,8 +528,10 @@ docs/
    - Скидка для точной суммы (default ВКЛ, max 2000 сум)
    - **Тестовый режим: ВКЛ** на первое время — чтобы проверить подбор без отправки в ОФД
 4. Справочник → Импорт Excel с приходами от бухгалтерии.
-5. Очередь — приходят чеки из МС. Открыть чек → проверить подбор → Фискализировать.
-6. Когда тест прошёл успешно (печать корректна, суммы совпадают) — выключить тестовый режим в Настройках. Дальше всё уходит в ОФД реально.
+5. **Смена** → «Открыть смену» (запускает X-отчёт в Communicator). Без открытой смены фискализация не работает.
+6. Касса — приходят чеки из МС. Открыть чек → проверить подбор → Фискализировать.
+7. В конце рабочего дня: **Смена** → «Закрыть смену». Z-отчёт автоматически уходит в ОФД и печатается на термопринтере.
+8. Когда тест прошёл успешно (печать корректна, суммы совпадают) — выключить тестовый режим в Настройках. Дальше всё уходит в ОФД реально.
 
 ## Известные подводные камни
 
@@ -461,17 +553,23 @@ docs/
 | Тестовый режим выключал печать | Возврат до `maybePrintReceipt` | Печатать с `is_test=true`, шапка «ТЕСТ — НЕ ФИСКАЛЬНЫЙ ЧЕК» |
 | `discountForExactSum` дефолт не применялся | `null === 'true'` = false для never-saved setting | `discRaw == null ? true : discRaw === 'true'` |
 | matched=789, rd.sum=790, услуги=0 | МС-позиция «service» (имя кассира) ломала подбор | Фильтр `assortment.meta.type === 'service'` в `extractPositions` |
+| `Api.PrintXReport` / `PrintZReport` / `PrintCurrentZReport` / `PrintZReportInfo` = NO_SUCH_METHOD | Communicator JSON-RPC API не умеет печатать X/Z | Печатаем сами через `print_z_report` (ESC/POS) — Rust+printer.rs |
+| «Не удалось открыть смену» с пустым сообщением | Communicator вернул JSON-RPC error без `message`, только `code/data`; смена уже была открыта | В `openShift()` сначала `getZReportInfo()` — если `CloseTime===''`, просто обновляем UI. `formatEposError()` показывает `code+data` если `message` пуст |
+| `getZReportInfo` рандомные timeout-ы | Communicator занят отправкой чека в ОФД | Retry до 3 раз с exp backoff (300→900ms) в `refresh()` Zreport.tsx |
+| «Не настроен принтер чеков» при печати Z | `SettingKey.PrinterName` пустой | Настройки → Печать чека → выбрать принтер |
 
 ## Открытые вопросы
 
 - **VAT-формула**: по умолчанию `vat = total * percent / (100 + percent)` (НДС включён в цену). Если у магазина НДС начисляется сверху — нужно поменять `vatIncluded` → `vatAddedOn` в `matcher/strategies.ts`.
 - **Ключи подписи**: `~/.tauri/epos-fiscal.key` живёт только на одной машине разработчика. Если потеряем — нужно перевыпустить и заново публиковать клиентам (auto-update сломается). Бэкап ключа — обязательно.
 
-## Текущее состояние (на 2026-05-04)
+## Текущее состояние (на 2026-05-12, версия 0.10.18)
 
 - ✅ MVP функционально полный
 - ✅ Auto-update работает с подписью (Win + Mac)
 - ✅ Multi-shop архитектура (фильтр по точке продаж)
+- ✅ **MXIK доходит до ОФД** — поле `spic` в JSON-RPC payload, подтверждено реальным чеком и кешбэком клиенту (0.10.12)
+- ✅ Legacy /uzpos удалён в 0.10.13 — остался только JSON-RPC `/rpc/api`
 - ✅ JSON-RPC поддержка для актуального Communicator + Go-style date format
 - ✅ Импорт Excel: per-row try/catch вместо broken-транзакции (819 из 819 строк)
 - ✅ Matcher по дефолту vatStrict=false + tolerance 100k тийинов (без этого 0 матчей на реальных чеках)
@@ -484,6 +582,8 @@ docs/
 - ✅ Печать QR на термопринтер Xprinter XP-80 (CP866, ESC/POS native QR)
 - ✅ Тестовый режим без отправки в ОФД (но с печатью «ТЕСТ»)
 - ✅ Перформанс matcher: один пул на чек вместо N×5000 запросов
+- ✅ **Z-отчёт ККМ** — раздел `/zreport` в стиле E-POS Cashdesk, открытие/закрытие смены через Communicator, X/Z-печать своя (ESC/POS), auto-print Z при закрытии (0.10.14–0.10.16)
+- ✅ **Retry+guard для Communicator** — `refresh()` ретраит при timeout, `openShift()` не дублирует открытие если смена уже есть (0.10.18)
+- ✅ Полная документация в `docs/external-apis/` — Communicator API, E-POS Mobile API, FiscalDriveService
 - ✅ CI 7–10 мин (Win + Mac, без Linux)
-- ⏳ Реальная фискализация end-to-end ещё не проверена (ждём пробный чек)
-- ⏳ Реверс-инжиниринг точного формата `Receipt` для JSON-RPC API
+- ⏳ Реальная фискализация end-to-end **проверена** (MXIK + кешбэк ✅), но edge cases с возвратами и mixed-payment ещё не тестировались на проде
