@@ -11,7 +11,8 @@
     "build:vite": "tsc -b && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "typecheck": "tsc -b --noEmit"
+    "typecheck": "tsc -b --noEmit",
+    "release:dev": "gh workflow run dev-build.yml && echo 'Запущено. gh run watch — следить за прогрессом. gh run download <id> --name toolbox-fiscal-dev-* — скачать .exe (~4 мин)'"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",
