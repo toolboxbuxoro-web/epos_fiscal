@@ -44,11 +44,15 @@ jobs:
       - name: Install npm deps
         run: npm ci
 
-      - name: Build (without bundle signing)
+      - name: Build & sign
         run: npm run tauri -- build
-        # Без TAURI_SIGNING_* env vars — bundler пропустит подпись.
-        # Auto-updater не сработает (нет signature.sig), но для ручной
-        # установки .exe это не нужно.
+        env:
+          # tauri.conf.json содержит updater.pubkey → bundler требует
+          # соответствующий private key, иначе exit 1 в конце сборки
+          # (см. https://v2.tauri.app/plugin/updater/). Используем те же
+          # секреты что и в release.yml — безопасно, хранятся в GitHub Secrets.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       - name: Upload .exe artifact
         uses: actions/upload-artifact@v4
