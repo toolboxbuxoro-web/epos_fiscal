@@ -1,4 +1,5 @@
 import { listEsfItems, type EsfItemWithAvailable } from '@/lib/db'
+import { log } from '@/lib/log'
 import type {
   MatchCandidate,
   MatcherOptions,
@@ -252,23 +253,52 @@ export function tryLinkedMsVariant(
 ): PositionMatch | null {
   void opts
   if (pos.totalTiyin <= 0) return null
-  if (!pos.linkedBuhName) return null
+  if (!pos.linkedBuhName) {
+    void log.debug('matcher', `[linked-ms] skip "${pos.name}" — нет linkedBuhName`)
+    return null
+  }
 
   // Находим всех кандидатов в пуле по имени
   const candidates = findLinkedCandidates(pos.linkedBuhName, pool)
-  if (candidates.length === 0) return null
+  if (candidates.length === 0) {
+    void log.warn(
+      'matcher',
+      `[linked-ms] "${pos.linkedBuhName}" → 0 кандидатов в пуле`,
+      { pos_name: pos.name, looking_for: pos.linkedBuhName, pool_size: pool.items.length },
+    )
+    return null
+  }
 
   // Фильтруем по остатку: должно хватить на нашу quantity
   const withStock = candidates.filter(
     (p) => p.item.qty_received - p.item.qty_consumed >= pos.quantity,
   )
-  if (withStock.length === 0) return null
+  if (withStock.length === 0) {
+    void log.warn(
+      'matcher',
+      `[linked-ms] "${pos.linkedBuhName}" → найдено ${candidates.length} но нет остатка`,
+      {
+        candidates: candidates.slice(0, 3).map((p) => ({
+          name: p.item.name,
+          available: p.item.qty_received - p.item.qty_consumed,
+          needed: pos.quantity,
+        })),
+      },
+    )
+    return null
+  }
 
   // FIFO — самый старый приход
   const chosen = [...withStock].sort(
     (a, b) => a.item.received_at - b.item.received_at,
   )[0]
   if (!chosen) return null
+
+  void log.info(
+    'matcher',
+    `[linked-ms] ✓ "${pos.linkedBuhName}" → "${chosen.item.name}" (ИКПУ ${chosen.item.class_code})`,
+    { ms_qty: pos.quantity, available: chosen.item.qty_received - chosen.item.qty_consumed },
+  )
 
   // ВАЖНО: цена 1-в-1 как в чеке МС (не пересчитываем sellingPrice)
   const candidate = makeCandidate(chosen.item, pos.quantity, pos.totalTiyin)

@@ -6,6 +6,7 @@ import {
   type MsRetailDemand,
   type MsRetailDemandPosition,
 } from '@/lib/moysklad/types'
+import { log } from '@/lib/log'
 import type { NormalizedPosition } from './types'
 
 /** Имена атрибутов МойСклад, в которых обычно хранят ИКПУ. */
@@ -56,7 +57,16 @@ function pickBarcode(a: MsAssortment): string | null {
 function readLinkedBuhName(
   characteristics: MsAssortment['characteristics'],
   searchName: string,
+  itemNameForLog?: string,
 ): string | null {
+  // DEBUG: лог всех приходящих характеристик для диагностики
+  void log.debug('matcher', `[linked-ms] позиция "${itemNameForLog ?? '?'}"`, {
+    has_characteristics: !!characteristics,
+    chars_count: characteristics?.length ?? 0,
+    chars: characteristics?.map((c) => ({ name: c.name, value: c.value })) ?? [],
+    looking_for: searchName,
+  })
+
   if (!characteristics || characteristics.length === 0) return null
   const lookup = searchName.toLowerCase().trim()
   for (const c of characteristics) {
@@ -107,7 +117,11 @@ export function normalizePosition(
     packageCode: assortment ? readAttr(assortment.attributes, PACKAGE_ATTR_NAMES) : null,
     barcode: assortment ? pickBarcode(assortment) : null,
     linkedBuhName: assortment
-      ? readLinkedBuhName(assortment.characteristics, linkCharacteristicName)
+      ? readLinkedBuhName(
+          assortment.characteristics,
+          linkCharacteristicName,
+          assortment.name,
+        )
       : null,
   }
 }
