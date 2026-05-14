@@ -172,6 +172,23 @@ export interface MsAttribute {
   value: string | number | boolean | { name: string } | null
 }
 
+/**
+ * Модификация товара (variant).
+ *
+ * Получается через `GET /entity/variant?filter=productid=<id>`.
+ * Используется в matcher для подтягивания characteristics когда в чеке
+ * пришёл базовый товар, а связку с приходом бухгалтер положил
+ * в характеристику модификации.
+ */
+export interface MsVariant {
+  meta: MsMeta
+  id: string
+  name: string
+  code?: string
+  externalCode?: string
+  characteristics?: Array<{ id: string; name: string; value: string }>
+}
+
 // ── helpers ─────────────────────────────────────────────────────
 
 /** Получить inline-позиции, если они expand-нуты. */
@@ -191,6 +208,79 @@ export function inlineAssortment(
   const a = pos.assortment as Partial<MsAssortment> & MsRef
   if ('id' in a && 'name' in a) return a as MsAssortment
   return null
+}
+
+/**
+ * Обогатить чек МС характеристиками модификаций.
+ *
+ * Сценарий: бухгалтер создал у товара модификацию с характеристикой
+ * «Бухгалтерское наименование», но кассир в МС пробил **базовый товар**,
+ * а не модификацию. В чеке `assortment.meta.type === 'product'`, без
+ * characteristics → matcher не находит связку.
+ *
+ * Эта функция:
+ *   1. Находит все product-позиции без characteristics
+ *   2. Параллельно тянет модификации для каждого через `GET /entity/variant`
+ *   3. Если у товара РОВНО ОДНА модификация — копирует её characteristics
+ *      в `assortment.characteristics` (мутация inline)
+ *   4. Если 0 или >1 модификаций — пропускает (нельзя угадать какую)
+ *
+ * Результат: matcher видит characteristics даже когда чек на product.
+ * Бухгалтер заполняет связку 1 раз в модификации, кассир продаёт как
+ * обычно. Самый удобный path of use.
+ *
+ * @param rd чек МС (мутируется inline — добавляются characteristics)
+ * @param fetchVariants функция тянущая модификации по productId
+ *   (передаётся `client.listVariantsByProduct` чтобы не плодить deps)
+ */
+export async function enrichWithVariants(
+  rd: MsRetailDemand,
+  fetchVariants: (productId: string) => Promise<MsVariant[]>,
+): Promise<{ enrichedCount: number; productsChecked: number }> {
+  const positions = inlinePositions(rd)
+  if (!positions) return { enrichedCount: 0, productsChecked: 0 }
+
+  const productIds = new Set<string>()
+  for (const pos of positions) {
+    const a = inlineAssortment(pos)
+    if (!a) continue
+    if (a.meta?.type !== 'product') continue
+    if (a.characteristics && a.characteristics.length > 0) continue
+    productIds.add(a.id)
+  }
+
+  if (productIds.size === 0) {
+    return { enrichedCount: 0, productsChecked: 0 }
+  }
+
+  // Параллельно тянем модификации каждого товара
+  const productToVariants = new Map<string, MsVariant[]>()
+  await Promise.all(
+    [...productIds].map(async (productId) => {
+      try {
+        const variants = await fetchVariants(productId)
+        productToVariants.set(productId, variants)
+      } catch {
+        // Сетевая ошибка — пропускаем, fallback на passthrough
+      }
+    }),
+  )
+
+  // Применяем: если у товара ровно 1 модификация — переносим её
+  // characteristics в product.characteristics (matcher будет читать)
+  let enrichedCount = 0
+  for (const pos of positions) {
+    const a = inlineAssortment(pos)
+    if (!a || a.meta?.type !== 'product') continue
+    const variants = productToVariants.get(a.id)
+    if (!variants || variants.length !== 1) continue
+    const v = variants[0]
+    if (!v?.characteristics || v.characteristics.length === 0) continue
+    a.characteristics = v.characteristics
+    enrichedCount++
+  }
+
+  return { enrichedCount, productsChecked: productIds.size }
 }
 
 /**

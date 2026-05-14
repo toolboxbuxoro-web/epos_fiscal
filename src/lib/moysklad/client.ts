@@ -6,6 +6,7 @@ import {
   type MsRetailDemand,
   type MsRetailShift,
   type MsRetailStore,
+  type MsVariant,
 } from './types'
 
 const BASE_URL = 'https://api.moysklad.ru/api/remap/1.2'
@@ -149,6 +150,26 @@ export class MoyskladClient {
     return this.request<MsRetailDemand>(
       `/entity/retaildemand/${id}?${params.toString()}`,
     )
+  }
+
+  /**
+   * Получить все модификации (variants) товара.
+   *
+   * Используется в `enrichWithVariants` для linked-ms: если в чеке пришёл
+   * базовый товар (product) без characteristics, тянем модификации товара
+   * и если ровно одна — берём её characteristics. Это даёт связку для
+   * товаров где бухгалтер создал «карточку-обёртку» из 1 модификации.
+   *
+   * Лимит 100 — достаточно для типичного товара (модификаций обычно ≤20).
+   */
+  async listVariantsByProduct(productId: string): Promise<MsVariant[]> {
+    const params = new URLSearchParams()
+    params.set('filter', `productid=${productId}`)
+    params.set('limit', '100')
+    const res = await this.request<MsListResponse<MsVariant>>(
+      `/entity/variant?${params.toString()}`,
+    )
+    return res.rows
   }
 
   /** Проверка валидности credentials. Возвращает информацию о текущем пользователе. */

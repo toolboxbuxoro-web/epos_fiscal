@@ -36,7 +36,13 @@ import {
 } from '@/lib/matcher'
 import type { MatcherOptions } from '@/lib/matcher/types'
 import { fiscalize, InventoryConflictError } from '@/lib/epos'
-import { MoyskladClient, inlinePositions, type MsRetailDemand } from '@/lib/moysklad'
+import {
+  MoyskladClient,
+  enrichWithVariants,
+  inlinePositions,
+  type MsRetailDemand,
+} from '@/lib/moysklad'
+import { log } from '@/lib/log'
 import {
   Badge,
   Button,
@@ -160,26 +166,50 @@ export default function Receipt() {
 
       // МС в list-запросе не отдаёт inline positions. Если их нет —
       // одиночный GET с expand, обновляем raw_json в БД.
-      if (!inlinePositions(parsed)) {
-        const basic = await getSetting(SettingKey.MoyskladCredentials)
-        const token = basic ? null : await getSetting(SettingKey.MoyskladToken)
-        if (basic || token) {
-          try {
-            const client = new MoyskladClient(
-              basic ? { basic } : { token: token! },
+      // Также используем тот же client для enrichWithVariants ниже.
+      const basic = await getSetting(SettingKey.MoyskladCredentials)
+      const token = basic ? null : await getSetting(SettingKey.MoyskladToken)
+      const msClient =
+        basic || token
+          ? new MoyskladClient(basic ? { basic } : { token: token! })
+          : null
+
+      if (!inlinePositions(parsed) && msClient) {
+        try {
+          const full = await msClient.getRetailDemand(parsed.id)
+          const newRawJson = JSON.stringify(full)
+          const db = await getDb()
+          await db.execute(
+            'UPDATE ms_receipts SET raw_json = $1, updated_at = $2 WHERE id = $3',
+            [newRawJson, now(), r.id],
+          )
+          parsed = full
+          setReceipt({ ...r, raw_json: newRawJson })
+        } catch (fetchErr) {
+          console.warn('Не удалось дозагрузить позиции чека:', fetchErr)
+        }
+      }
+
+      // Обогащение characteristics из модификаций (linked-ms fallback).
+      // Если в чеке базовый товар (product) без characteristics — пытаемся
+      // найти его модификации и взять characteristics единственной модификации.
+      // Это позволяет matcher'у найти связку даже когда кассир пробил
+      // базовый товар, а бухгалтер заполнил «Бухгалтерское наименование»
+      // в характеристике единственной модификации. См. enrichWithVariants.
+      if (msClient && inlinePositions(parsed)) {
+        try {
+          const { enrichedCount, productsChecked } = await enrichWithVariants(
+            parsed,
+            (productId) => msClient.listVariantsByProduct(productId),
+          )
+          if (enrichedCount > 0) {
+            await log.info(
+              'matcher',
+              `[linked-ms] обогащено ${enrichedCount} из ${productsChecked} product-позиций characteristics модификации`,
             )
-            const full = await client.getRetailDemand(parsed.id)
-            const newRawJson = JSON.stringify(full)
-            const db = await getDb()
-            await db.execute(
-              'UPDATE ms_receipts SET raw_json = $1, updated_at = $2 WHERE id = $3',
-              [newRawJson, now(), r.id],
-            )
-            parsed = full
-            setReceipt({ ...r, raw_json: newRawJson })
-          } catch (fetchErr) {
-            console.warn('Не удалось дозагрузить позиции чека:', fetchErr)
           }
+        } catch (enrichErr) {
+          console.warn('enrichWithVariants failed:', enrichErr)
         }
       }
 
