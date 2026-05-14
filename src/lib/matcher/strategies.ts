@@ -165,12 +165,15 @@ function meaningfulTokens(name: string): string[] {
  *
  * Стратегия (от самого надёжного к мягкому):
  *   1. **Exact** — нормализованные имена совпадают полностью.
- *   2. **Substring** — одно имя содержится в другом (бух мог написать
- *      сокращённое имя).
+ *   2. **Substring** — одно имя содержится в другом. Работает ТОЛЬКО при
+ *      target ≥ 15 символов (защита от false-positive: бух-имя "Сварочный
+ *      аппарат" — родовое слово, substring сматчит десятки разных welder'ов).
+ *      Также: при substring match требуется наличие model-token (буква+цифра
+ *      длиной ≥4) в общем подстроке — иначе тоже отвергаем.
  *   3. **Token-fuzzy** — ≥50% значимых токенов совпали И ≥1 model-token.
  *
- * Возвращает массив подходящих pool-items, отсортированных по убыванию
- * качества совпадения. Caller потом фильтрует по остатку и делает FIFO.
+ * Если найдено несколько кандидатов — caller (`tryLinkedMsVariant`) делает
+ * FIFO по `received_at`.
  */
 function findLinkedCandidates(
   buhName: string,
@@ -179,21 +182,30 @@ function findLinkedCandidates(
   const target = normalizeForLink(buhName)
   if (!target) return []
 
-  // 1. Exact match
+  // 1. Exact match — самый надёжный путь. Бухгалтер скопировал точное имя
+  // из бух-файла в характеристику МС.
   const exact = pool.items.filter(
     (p) => normalizeForLink(p.item.name) === target,
   )
   if (exact.length > 0) return exact
 
-  // 2. Substring match (любая сторона содержит другую)
-  const substr = pool.items.filter((p) => {
-    const inv = normalizeForLink(p.item.name)
-    return inv.includes(target) || target.includes(inv)
-  })
-  if (substr.length > 0) return substr
+  // 2. Substring match — только если target достаточно длинный (≥15 символов)
+  // И содержит хотя бы один model-token. Без этих защит короткое значение
+  // типа "Сварочный аппарат" сматчит десятки разных позиций.
+  const MIN_SUBSTR_LEN = 15
+  const targetTokens = new Set(meaningfulTokens(buhName))
+  const targetHasModel = [...targetTokens].some(
+    (t) => /\d/.test(t) && /[a-zа-я]/i.test(t) && t.replace(/\D/g, '').length >= 2,
+  )
+  if (target.length >= MIN_SUBSTR_LEN && targetHasModel) {
+    const substr = pool.items.filter((p) => {
+      const inv = normalizeForLink(p.item.name)
+      return inv.includes(target) || target.includes(inv)
+    })
+    if (substr.length > 0) return substr
+  }
 
   // 3. Token-based fuzzy: ≥50% совпадение И есть model-token
-  const targetTokens = new Set(meaningfulTokens(buhName))
   if (targetTokens.size === 0) return []
 
   const scored = pool.items
