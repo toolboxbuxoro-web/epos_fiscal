@@ -210,12 +210,21 @@ export default function Receipt() {
           : 2000
       const maxDiscountPerItemTiyin = maxDiscountSum * 100
 
+      // Имя характеристики модификации МС для связки с приходом
+      // (см. matcher/extract.ts::readLinkedBuhName). Default —
+      // 'Бухгалтерское наименование'. Бухгалтер может назвать иначе через
+      // Settings → «Имя характеристики связки».
+      const linkCharRaw = await getSetting(SettingKey.MsLinkCharacteristicName)
+      const linkCharacteristicName =
+        linkCharRaw && linkCharRaw.trim() ? linkCharRaw.trim() : 'Бухгалтерское наименование'
+
       const opts: MatcherOptions = {
         toleranceTiyin: tolerance,
         markupPercent,
         roundUpToSum,
         discountForExactSum: discountEnabled,
         maxDiscountPerItemTiyin,
+        linkCharacteristicName,
         excludeServerItemIds: excludedServerIds.length > 0 ? excludedServerIds : undefined,
       }
       const result = await buildMatch(parsed, opts)
@@ -588,6 +597,7 @@ export default function Receipt() {
 function strategyLabel(s: string): string {
   return (
     {
+      'linked-ms': '🔗 связка из МС',
       passthrough: 'как есть',
       'price-bucket': 'замена по цене',
       'multi-item': 'набор из нескольких',

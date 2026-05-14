@@ -115,6 +115,167 @@ export async function loadMatcherPool(opts: MatcherOptions = {}): Promise<Matche
   }
 }
 
+// ── Smart-search helpers для linked-ms ──────────────────────────────────
+
+/**
+ * Нормализация для сравнения имён:
+ *   - lowercase
+ *   - ё → е
+ *   - множественные пробелы → один пробел
+ *   - trim
+ *
+ * НЕ удаляем знаки препинания — они часто различают модели
+ * («HR-2470» vs «HR 2470» — отличаются только дефисом, но это та же модель,
+ * а вот «ТЭПК-3000K» vs «ТЭПК-3000» — разные). Поэтому только
+ * пробельная нормализация.
+ */
+function normalizeForLink(s: string): string {
+  return s.toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ').trim()
+}
+
+/**
+ * Значимые токены имени (для fuzzy fallback):
+ *   - длина >= 3
+ *   - либо буква+цифра (model: HR2641, ARC-200)
+ *   - либо просто слово >= 4 букв (тип товара: «перфоратор», «дрель»)
+ *
+ * Игнорируем bare 4-digit numbers (типа «400г», «2000вт») — это спецификации,
+ * а не идентификаторы.
+ */
+function meaningfulTokens(name: string): string[] {
+  const lower = normalizeForLink(name)
+  const tokens = new Set<string>()
+  // Model-tokens: смешение букв и цифр, длина >=4
+  const reModel = /[a-zа-я]+[-]?\d+[a-zа-я\d-]*|\d+[-]?[a-zа-я]+[a-zа-я\d-]*/gi
+  let m: RegExpExecArray | null
+  while ((m = reModel.exec(lower)) !== null) {
+    const t = m[0].replace(/[^a-zа-я\d-]/g, '')
+    if (t.length >= 4) tokens.add(t)
+  }
+  // Type-words: чисто буквенные >= 4 символа
+  const reWord = /[а-яa-z]{4,}/gi
+  while ((m = reWord.exec(lower)) !== null) {
+    tokens.add(m[0])
+  }
+  return [...tokens]
+}
+
+/**
+ * Найти в пуле приходов inv_item чьё имя соответствует `linkedBuhName`.
+ *
+ * Стратегия (от самого надёжного к мягкому):
+ *   1. **Exact** — нормализованные имена совпадают полностью.
+ *   2. **Substring** — одно имя содержится в другом (бух мог написать
+ *      сокращённое имя).
+ *   3. **Token-fuzzy** — ≥50% значимых токенов совпали И ≥1 model-token.
+ *
+ * Возвращает массив подходящих pool-items, отсортированных по убыванию
+ * качества совпадения. Caller потом фильтрует по остатку и делает FIFO.
+ */
+function findLinkedCandidates(
+  buhName: string,
+  pool: MatcherPool,
+): PoolItem[] {
+  const target = normalizeForLink(buhName)
+  if (!target) return []
+
+  // 1. Exact match
+  const exact = pool.items.filter(
+    (p) => normalizeForLink(p.item.name) === target,
+  )
+  if (exact.length > 0) return exact
+
+  // 2. Substring match (любая сторона содержит другую)
+  const substr = pool.items.filter((p) => {
+    const inv = normalizeForLink(p.item.name)
+    return inv.includes(target) || target.includes(inv)
+  })
+  if (substr.length > 0) return substr
+
+  // 3. Token-based fuzzy: ≥50% совпадение И есть model-token
+  const targetTokens = new Set(meaningfulTokens(buhName))
+  if (targetTokens.size === 0) return []
+
+  const scored = pool.items
+    .map((p) => {
+      const itemTokens = meaningfulTokens(p.item.name)
+      const overlap = itemTokens.filter((t) => targetTokens.has(t))
+      const hasModelToken = overlap.some(
+        (t) => /\d/.test(t) && /[a-zа-я]/i.test(t) && t.replace(/\D/g, '').length >= 2,
+      )
+      return { p, score: overlap.length, hasModelToken }
+    })
+    .filter((s) => {
+      const minOverlap = Math.max(2, Math.floor(targetTokens.size * 0.5))
+      return s.score >= minOverlap && s.hasModelToken
+    })
+    .sort((a, b) => b.score - a.score)
+    .map((s) => s.p)
+
+  return scored
+}
+
+/**
+ * Стратегия 0 (приоритет 1): linked-ms.
+ *
+ * Бухгалтер в МС у товара создаёт **модификацию** и в характеристике
+ * (`SettingKey.MsLinkCharacteristicName`, default «Бухгалтерское наименование»)
+ * записывает имя как в нашей `esf_items`. Tauri читает это значение и через
+ * smart-search находит конкретный приход.
+ *
+ * Ключевая фишка: **цена в фискальном чеке = цена из чека МС** (`pos.totalTiyin`),
+ * НЕ пересчитывается через markup×VAT. Это «реальная закупка с реальной маржой».
+ *
+ * Возвращает null если:
+ *   - в позиции нет `linkedBuhName` (товар без модификации/характеристики)
+ *   - smart-search не нашёл inv_item с этим именем
+ *   - найдено, но нет остатка (qty_received - consumed < pos.quantity)
+ *
+ * В fallback кейсах matcher пойдёт дальше по pipeline: passthrough → price-bucket.
+ */
+export function tryLinkedMsVariant(
+  pos: NormalizedPosition,
+  pool: MatcherPool,
+  opts: MatcherOptions = {},
+): PositionMatch | null {
+  void opts
+  if (pos.totalTiyin <= 0) return null
+  if (!pos.linkedBuhName) return null
+
+  // Находим всех кандидатов в пуле по имени
+  const candidates = findLinkedCandidates(pos.linkedBuhName, pool)
+  if (candidates.length === 0) return null
+
+  // Фильтруем по остатку: должно хватить на нашу quantity
+  const withStock = candidates.filter(
+    (p) => p.item.qty_received - p.item.qty_consumed >= pos.quantity,
+  )
+  if (withStock.length === 0) return null
+
+  // FIFO — самый старый приход
+  const chosen = [...withStock].sort(
+    (a, b) => a.item.received_at - b.item.received_at,
+  )[0]
+  if (!chosen) return null
+
+  // ВАЖНО: цена 1-в-1 как в чеке МС (не пересчитываем sellingPrice)
+  const candidate = makeCandidate(chosen.item, pos.quantity, pos.totalTiyin)
+
+  return {
+    source: pos,
+    candidates: [candidate],
+    strategy: 'linked-ms',
+    diffTiyin: 0, // цена та же что и в МС — разницы нет
+    warnings: [],
+    swappable: false, // связь явная — нет смысла менять
+    alternatives: [],
+    selectedAlternativeIndex: -1,
+    splitLevel: 1,
+    canSplitMore: false,
+    splittable: false,
+  }
+}
+
 /**
  * Стратегия 1: passthrough.
  *

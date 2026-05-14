@@ -128,6 +128,21 @@ export const SettingKey = {
    * dev-режима в Settings (login=admin + password=admin + PIN).
    */
   AdminPinHash: 'admin.pin_hash',
+  /**
+   * Имя характеристики **модификации** в МойСкладе, куда бухгалтер пишет
+   * «бухгалтерское наименование» (= точное имя как в нашей `esf_items`).
+   *
+   * По умолчанию `'Бухгалтерское наименование'`. Если бухгалтер назвал
+   * характеристику иначе — поменять здесь.
+   *
+   * Применяется в `matcher/extract.ts` при парсинге чека МС: для каждой
+   * позиции читается `assortment.characteristics`, ищется характеристика
+   * с этим именем (substring + case-insensitive), её значение попадает в
+   * `NormalizedPosition.linkedBuhName`. Далее `matcher/strategies.ts::
+   * tryLinkedMsVariant` использует это значение для smart-search в пуле
+   * приходов.
+   */
+  MsLinkCharacteristicName: 'matcher.ms_link_characteristic_name',
 } as const
 
 export type SettingKey = (typeof SettingKey)[keyof typeof SettingKey]
@@ -200,7 +215,12 @@ export type NewMsReceipt = Omit<MsReceiptRow, 'id' | 'updated_at' | 'status'> & 
 
 // ── matches & match_items ────────────────────────────────────────
 
-export type MatchStrategy = 'passthrough' | 'price-bucket' | 'multi-item' | 'manual'
+export type MatchStrategy =
+  | 'linked-ms'        // через «Бухгалтерское наименование» в характеристике модификации МС
+  | 'passthrough'      // ИКПУ из атрибутов МС совпал с inv_item.class_code
+  | 'price-bucket'     // подобрано по цене (с подменой ИКПУ)
+  | 'multi-item'       // набор товаров на сумму
+  | 'manual'
 
 export interface MatchRow {
   id: number

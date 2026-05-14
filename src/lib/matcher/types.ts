@@ -16,6 +16,21 @@ export interface NormalizedPosition {
   /** Code упаковки, если найден. */
   packageCode: string | null
   barcode: string | null
+  /**
+   * «Бухгалтерское наименование» из характеристик модификации МС.
+   *
+   * Бухгалтер в МС у товара создаёт модификацию и в характеристике пишет
+   * точное имя как в нашей `esf_items` (например «Тепловая электрическая пушка
+   * ТЭПК-3000K (керам.нагревательный элемент,круглая) Ресанта»). Tauri читает
+   * это значение и ищет в локальной БД через smart-search.
+   *
+   * Имя характеристики настраивается через `SettingKey.MsLinkCharacteristicName`
+   * (default «Бухгалтерское наименование»). См. `extract.ts::readLinkedBuhName`
+   * и `strategies.ts::tryLinkedMsVariant`.
+   *
+   * `null` если позиция — обычный товар (не модификация) или характеристики нет.
+   */
+  linkedBuhName: string | null
 }
 
 export interface MatchCandidate {
@@ -169,4 +184,11 @@ export interface MatcherOptions {
    * от расчётной.
    */
   maxDiscountPerItemTiyin?: number
+  /**
+   * Имя характеристики **модификации** МС, в которой бухгалтер пишет
+   * связку с приходом (`esf_items.name`). По умолчанию
+   * `'Бухгалтерское наименование'`. Используется в `extractPositions`
+   * и `tryLinkedMsVariant`.
+   */
+  linkCharacteristicName?: string
 }

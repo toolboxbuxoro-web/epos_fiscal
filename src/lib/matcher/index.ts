@@ -3,6 +3,7 @@ import { extractPositions } from './extract'
 import {
   costWithVat,
   loadMatcherPool,
+  tryLinkedMsVariant,
   tryMultiItem,
   tryMultiItemForce,
   tryPassthrough,
@@ -38,7 +39,9 @@ export async function buildMatch(
   receipt: MsRetailDemand,
   opts: MatcherOptions = {},
 ): Promise<BuildMatchResult> {
-  const rawPositions = extractPositions(receipt)
+  // Имя характеристики модификации МС для связки с приходом — из настроек.
+  // Если не передано в opts, парсер использует default 'Бухгалтерское наименование'.
+  const rawPositions = extractPositions(receipt, opts.linkCharacteristicName)
   const matches: PositionMatch[] = []
   const warnings: string[] = []
 
@@ -101,7 +104,13 @@ export async function buildMatch(
     // в чек не попадает: фискальный чек не должен содержать пустых строк.
     if (pos.totalTiyin <= 0) continue
 
+    // Pipeline стратегий: от самой надёжной к мягкой.
+    // 1. linked-ms — через явную связку «Бухгалтерское наименование» в модификации МС
+    // 2. passthrough — ИКПУ из атрибутов МС совпал
+    // 3. price-bucket — подбор по цене с подменой ИКПУ
+    // 4. multi-item — набор товаров на сумму
     const m =
+      tryLinkedMsVariant(pos, pool, opts) ??
       tryPassthrough(pos, pool, opts) ??
       tryPriceBucket(pos, pool, opts) ??
       tryMultiItem(pos, pool, opts)
@@ -140,10 +149,11 @@ export async function buildMatch(
   // Преобладающая стратегия — самая «слабая» из применённых.
   const overallStrategy = pickOverallStrategy(matches.map((m) => m.strategy))
 
-  // canAutoFiscalize: все позиции passthrough и нет warnings и diff = 0
+  // canAutoFiscalize: все позиции linked-ms или passthrough, нет warnings, diff = 0.
+  // linked-ms — явная связка от бухгалтера, ещё надёжнее чем passthrough.
   const canAutoFiscalize =
     matches.length === positions.length &&
-    matches.every((m) => m.strategy === 'passthrough') &&
+    matches.every((m) => m.strategy === 'linked-ms' || m.strategy === 'passthrough') &&
     warnings.length === 0 &&
     totalDiff === 0
 
@@ -348,17 +358,18 @@ export function rebuildPositionWithSplit(
 }
 
 const STRATEGY_RANK: Record<MatchStrategy, number> = {
-  passthrough: 0,
-  'price-bucket': 1,
-  'multi-item': 2,
-  manual: 3,
+  'linked-ms': 0,      // самая надёжная (явная связка из МС)
+  passthrough: 1,
+  'price-bucket': 2,
+  'multi-item': 3,
+  manual: 4,
 }
 
 function pickOverallStrategy(strategies: MatchStrategy[]): MatchStrategy {
   if (strategies.length === 0) return 'manual'
   return strategies.reduce<MatchStrategy>(
     (acc, s) => (STRATEGY_RANK[s] > STRATEGY_RANK[acc] ? s : acc),
-    'passthrough',
+    'linked-ms',
   )
 }
 

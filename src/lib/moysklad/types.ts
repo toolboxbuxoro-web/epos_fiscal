@@ -155,6 +155,13 @@ export interface MsAssortment {
   uom?: MsRef
   /** Кастомные атрибуты — там часто хранят ИКПУ. */
   attributes?: MsAttribute[]
+  /**
+   * Характеристики **модификации** (только если `meta.type === 'variant'`).
+   * Бухгалтер записывает «Бухгалтерское наименование» как характеристику —
+   * Tauri читает её и связывает позицию МС с конкретным приходом в `esf_items`.
+   * См. `matcher/strategies.ts::tryLinkedMsVariant`.
+   */
+  characteristics?: Array<{ id: string; name: string; value: string }>
 }
 
 export interface MsAttribute {
