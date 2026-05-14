@@ -106,7 +106,16 @@ export class MoyskladClient {
    *   чеки этой точки (важно для multi-shop: каждый магазин ставит свой
    *   retailStoreId, чтобы не пытаться фискализировать чужие чеки через
    *   свою USB-карту).
-   * @param limit — максимум 1000 за запрос
+   * @param limit — максимум **100** за запрос (см. ограничение МС API ниже).
+   *
+   * ⚠️ МС API: expand разрешён только при `limit ≤ 100`. Если передать
+   * больше — expand молча проигнорируется, и `positions.assortment` придёт
+   * как `meta-reference` (без inline-данных: name/attributes/characteristics).
+   * Тогда matcher не получит ни ИКПУ, ни «Бухгалтерское наименование», и
+   * каждая позиция fallback'нется на price-bucket с худшей точностью.
+   * Поэтому жёстко клампим в 100. Если когда-то накопится >100 чеков (после
+   * простоя/сбоя) — poller итерирует через `updatedFrom` за несколько
+   * проходов, по 100 за раз.
    */
   async listRecentRetailDemands(
     updatedFrom: number,
@@ -123,7 +132,8 @@ export class MoyskladClient {
     }
     params.set('filter', filters.join(';'))
     params.set('order', 'updated,asc')
-    params.set('limit', String(Math.min(limit, 1000)))
+    // ВАЖНО: клампим в 100 чтобы expand работал. См. comment выше.
+    params.set('limit', String(Math.min(limit, 100)))
     params.set('expand', 'positions.assortment')
 
     const res = await this.request<MsListResponse<MsRetailDemand>>(
@@ -192,6 +202,9 @@ export class MoyskladClient {
    *
    * Используется при включённом «фильтре по смене»: вместо `updated>cursor`
    * подтягиваем чеки точно этой retailShift. Эффективно для дашборда смены.
+   *
+   * ⚠️ Лимит ≤100 (см. `listRecentRetailDemands` про expand-лимит МС API).
+   * Если в смене >100 чеков — нужно paginate'ить через `offset`.
    */
   async listShiftReceipts(
     retailShiftId: string,
@@ -203,7 +216,7 @@ export class MoyskladClient {
       `retailShift=https://api.moysklad.ru/api/remap/1.2/entity/retailshift/${retailShiftId}`,
     )
     params.set('order', 'moment,desc')
-    params.set('limit', String(Math.min(limit, 1000)))
+    params.set('limit', String(Math.min(limit, 100)))
     params.set('expand', 'positions.assortment')
 
     const res = await this.request<MsListResponse<MsRetailDemand>>(
