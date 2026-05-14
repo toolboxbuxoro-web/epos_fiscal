@@ -55,30 +55,61 @@ function pickBarcode(a: MsAssortment): string | null {
  * слово.
  */
 function readLinkedBuhName(
-  characteristics: MsAssortment['characteristics'],
+  assortment: MsAssortment,
   searchName: string,
-  itemNameForLog?: string,
 ): string | null {
-  // DEBUG: лог всех приходящих характеристик для диагностики
-  void log.debug('matcher', `[linked-ms] позиция "${itemNameForLog ?? '?'}"`, {
+  const characteristics = assortment.characteristics
+  const attributes = assortment.attributes
+  // DEBUG: лог что приходит от МС — характеристики (variant) И атрибуты (product)
+  // Связка может быть в обоих местах:
+  //   - characteristics у модификации (variant)
+  //   - attributes у базового товара (product) — доп. поле «Бухгалтерское наименование»
+  // Бухгалтер сам выбирает где удобнее заполнить.
+  void log.debug('matcher', `[linked-ms] позиция "${assortment.name}"`, {
     has_characteristics: !!characteristics,
     chars_count: characteristics?.length ?? 0,
     chars: characteristics?.map((c) => ({ name: c.name, value: c.value })) ?? [],
+    has_attributes: !!attributes,
+    attrs_count: attributes?.length ?? 0,
+    attrs: attributes?.map((a) => ({ name: a.name, value: a.value })) ?? [],
     looking_for: searchName,
   })
 
-  if (!characteristics || characteristics.length === 0) return null
   const lookup = searchName.toLowerCase().trim()
-  for (const c of characteristics) {
-    if (!c.name) continue
-    const cName = c.name.toLowerCase().trim()
-    if (cName === lookup || cName.includes(lookup)) {
-      const v = c.value
-      if (v == null) return null
-      const s = String(v).trim()
-      return s || null
+
+  // 1. Сначала смотрим в characteristics (variant)
+  if (characteristics && characteristics.length > 0) {
+    for (const c of characteristics) {
+      if (!c.name) continue
+      const cName = c.name.toLowerCase().trim()
+      if (cName === lookup || cName.includes(lookup)) {
+        const v = c.value
+        if (v != null) {
+          const s = String(v).trim()
+          if (s) return s
+        }
+      }
     }
   }
+
+  // 2. Fallback на attributes (product) — доп. поля товара.
+  // Это поддерживает кейс когда бухгалтер не создаёт модификацию,
+  // а заполняет «Бухгалтерское наименование» прямо на базовом товаре.
+  if (attributes && attributes.length > 0) {
+    for (const a of attributes) {
+      if (!a.name) continue
+      const aName = a.name.toLowerCase().trim()
+      if (aName === lookup || aName.includes(lookup)) {
+        const v = a.value
+        if (v == null) continue
+        // attributes.value может быть string/number/object{name}
+        if (typeof v === 'string') return v.trim() || null
+        if (typeof v === 'number') return String(v)
+        if (typeof v === 'object' && 'name' in v) return String(v.name).trim() || null
+      }
+    }
+  }
+
   return null
 }
 
@@ -117,11 +148,7 @@ export function normalizePosition(
     packageCode: assortment ? readAttr(assortment.attributes, PACKAGE_ATTR_NAMES) : null,
     barcode: assortment ? pickBarcode(assortment) : null,
     linkedBuhName: assortment
-      ? readLinkedBuhName(
-          assortment.characteristics,
-          linkCharacteristicName,
-          assortment.name,
-        )
+      ? readLinkedBuhName(assortment, linkCharacteristicName)
       : null,
   }
 }
