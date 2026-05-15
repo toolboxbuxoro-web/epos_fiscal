@@ -35,6 +35,12 @@ export interface PendingConfirmRow {
   last_error: string | null
   created_at: number
   updated_at: number
+  /**
+   * Тип операции: 'confirm' (списание после продажи, legacy default) |
+   * 'unconsume' (возврат остатка после refund). Колонка добавлена
+   * миграцией 008, DEFAULT 'confirm'. На старых строках может быть NULL.
+   */
+  op_type: 'confirm' | 'unconsume' | null
 }
 
 /** Новая запись после /reserve. Один INSERT на каждое reservation_id чека. */
@@ -99,13 +105,50 @@ export async function recordAttemptFailure(
   )
 }
 
-/** Все записи статуса 'fiscal-ok' (готовы к /confirm). */
+/**
+ * Записи 'fiscal-ok' готовые к /confirm.
+ *
+ * ВАЖНО: фильтруем `op_type = 'confirm'` (или legacy NULL — миграция 008
+ * ставит DEFAULT 'confirm', но старые строки до неё могли быть NULL).
+ * Иначе этот retry схватил бы unconsume-строки (op_type='unconsume')
+ * и попытался бы их confirm'ить с синтетическим reservation_id — мусор.
+ * Unconsume-очередь обрабатывает отдельный `retryUnconsumePending()`.
+ */
 export async function listFiscalOk(): Promise<PendingConfirmRow[]> {
   const db = await getDb()
   return db.select<PendingConfirmRow[]>(
     `SELECT * FROM inv_pending_confirms
      WHERE status = 'fiscal-ok'
+       AND (op_type = 'confirm' OR op_type IS NULL)
      ORDER BY created_at ASC`,
+  )
+}
+
+/**
+ * Записи op_type='unconsume' ожидающие отправки на сервер.
+ *
+ * Создаются в `refund.ts::queueUnconsumePending` когда /unconsume
+ * недоступен (404 — endpoint не задеплоен, или сеть). ms_receipt_id
+ * имеет формат `refund-<refundDbId>`, fiscal_sign = FiscalSign возврата.
+ * Реальные items реконструируются в retry из fiscal_refunds + match_items.
+ */
+export async function listUnconsumePending(): Promise<PendingConfirmRow[]> {
+  const db = await getDb()
+  return db.select<PendingConfirmRow[]>(
+    `SELECT * FROM inv_pending_confirms
+     WHERE status = 'fiscal-ok' AND op_type = 'unconsume'
+     ORDER BY created_at ASC`,
+  )
+}
+
+/** Удалить pending-строки по их id (после успешного unconsume). */
+export async function deletePendingByIds(ids: number[]): Promise<void> {
+  if (ids.length === 0) return
+  const db = await getDb()
+  const ph = ids.map((_, i) => `$${i + 1}`).join(',')
+  await db.execute(
+    `DELETE FROM inv_pending_confirms WHERE id IN (${ph})`,
+    ids,
   )
 }
 

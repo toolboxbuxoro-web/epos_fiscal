@@ -35,6 +35,7 @@ export {
 export type { PendingConfirmRow, PendingConfirmStatus } from './pending-confirms'
 export {
   retryFiscalOkPending,
+  retryUnconsumePending,
   releaseStaleReserved,
   runInventoryHousekeeping,
 } from './retry'

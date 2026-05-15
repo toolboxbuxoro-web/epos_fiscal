@@ -149,6 +149,8 @@ export interface UnconsumeRequest {
 
 export interface UnconsumeResponse {
   ok: boolean
+  /** true если этот refund_fiscal_sign уже разворачивали (no-op replay). */
+  idempotent_replay?: boolean
   /** Какие inv_item'ы реально были «откачены» (qty_consumed -= quantity). */
   items?: Array<{
     id: number
@@ -156,8 +158,20 @@ export interface UnconsumeResponse {
     qty_consumed: MilliQty
     available: MilliQty
   }>
-  /** Код ошибки если ok=false. */
-  code?: 'NOT_FOUND' | 'ALREADY_UNCONSUMED' | 'INSUFFICIENT_CONSUMED'
+  /** Код если ok=false. */
+  code?:
+    | 'NOT_FOUND'
+    | 'ALREADY_UNCONSUMED'
+    | 'INSUFFICIENT_CONSUMED'
+    | 'NO_ITEMS'
+    | 'NO_FISCAL_SIGN'
+  /** Список позиций которые не прошли (INSUFFICIENT_CONSUMED). */
+  failed?: Array<{
+    inv_item_id: number
+    requested: MilliQty
+    consumed: MilliQty
+    reason: string
+  }>
 }
 
 /** Конфигурация магазина для inventory клиента. */

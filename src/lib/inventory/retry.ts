@@ -12,11 +12,14 @@
  *     чек уже в ОФД, мы знаем что списание было легитимным)
  */
 
+import { getDb } from '@/lib/db/client'
 import { log } from '@/lib/log'
 import {
+  deletePendingByIds,
   deletePendingByReservations,
   listFiscalOk,
   listStaleReserved,
+  listUnconsumePending,
   markFailed,
   recordAttemptFailure,
 } from './pending-confirms'
@@ -87,6 +90,125 @@ export async function retryFiscalOkPending(): Promise<{
 }
 
 /**
+ * Догнать отвисшие /unconsume после refund.
+ *
+ * Когда refund прошёл в ОФД но `/unconsume` на сервер не доставился
+ * (endpoint не задеплоен / сеть) — `refund.ts` кладёт строки в
+ * inv_pending_confirms с op_type='unconsume', ms_receipt_id=`refund-<id>`,
+ * fiscal_sign = FiscalSign возврата. Здесь добиваем.
+ *
+ * Items реконструируем из локальной БД (источник правды для этого —
+ * оригинальный продажный чек): fiscal_refunds → fiscal_receipts.match_id
+ * → match_items → esf_items.server_item_id. То же что считал refund.ts,
+ * но устойчиво к рестарту (не зависит от того что лежало в pending-строке).
+ *
+ * Идемпотентность: сервер дедупит по refund_fiscal_sign — повторный
+ * вызов = no-op replay, поэтому слать безопасно даже если предыдущая
+ * попытка на самом деле дошла но ответ потерялся.
+ */
+export async function retryUnconsumePending(): Promise<{
+  unconsumed: number
+  failed: number
+}> {
+  const client = await getInventoryClient()
+  if (!client) return { unconsumed: 0, failed: 0 }
+
+  const pending = await listUnconsumePending()
+  if (pending.length === 0) return { unconsumed: 0, failed: 0 }
+
+  // Группируем по refund (ms_receipt_id = `refund-<refundDbId>`).
+  const byRefund = new Map<number, { rowIds: number[]; fiscalSign: string }>()
+  for (const row of pending) {
+    const m = /^refund-(\d+)$/.exec(row.ms_receipt_id)
+    if (!m || !row.fiscal_sign) continue
+    const refundDbId = parseInt(m[1]!, 10)
+    const g = byRefund.get(refundDbId) ?? {
+      rowIds: [],
+      fiscalSign: row.fiscal_sign,
+    }
+    g.rowIds.push(row.id)
+    byRefund.set(refundDbId, g)
+  }
+
+  const db = await getDb()
+  let unconsumed = 0
+  let failed = 0
+
+  for (const [refundDbId, g] of byRefund.entries()) {
+    try {
+      // Реконструируем items из match_items оригинального чека.
+      const items = await db.select<
+        Array<{ inv_item_id: number; quantity: number }>
+      >(
+        `SELECT ei.server_item_id AS inv_item_id, mi.quantity AS quantity
+           FROM fiscal_refunds fr
+           JOIN fiscal_receipts orig ON orig.id = fr.original_fiscal_id
+           JOIN match_items mi       ON mi.match_id = orig.match_id
+           JOIN esf_items ei         ON ei.id = mi.esf_item_id
+          WHERE fr.id = $1 AND ei.server_item_id IS NOT NULL`,
+        [refundDbId],
+      )
+      if (items.length === 0) {
+        // Нечего возвращать (legacy excel / нет match) — снимаем из очереди.
+        await deletePendingByIds(g.rowIds)
+        await log.info(
+          'inventory.retry',
+          `unconsume refund-${refundDbId}: 0 items (нет server_item_id), снято с очереди`,
+        )
+        continue
+      }
+
+      const resp = await client.unconsume({
+        items,
+        refund_fiscal_sign: g.fiscalSign,
+        idempotency_key: `refund-${refundDbId}`,
+      })
+
+      if (resp.ok) {
+        await deletePendingByIds(g.rowIds)
+        unconsumed += g.rowIds.length
+        await log.info(
+          'inventory.retry',
+          `unconsume OK refund-${refundDbId} (${items.length} позиций)` +
+            (resp.code === 'ALREADY_UNCONSUMED' ? ' [replay]' : ''),
+        )
+      } else {
+        failed += g.rowIds.length
+        for (const id of g.rowIds) {
+          // recordAttemptFailure ожидает reservation_id; у нас синтетический.
+          // Пишем по нему — у unconsume-строк reservation_id уникален.
+          await db
+            .execute(
+              `UPDATE inv_pending_confirms
+                 SET attempts = attempts + 1, last_error = $1, updated_at = $2
+               WHERE id = $3`,
+              [`unconsume code=${resp.code}`, Math.floor(Date.now() / 1000), id],
+            )
+            .catch(() => {})
+        }
+        await log.warn(
+          'inventory.retry',
+          `unconsume refund-${refundDbId} failed code=${resp.code}`,
+        )
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      failed += g.rowIds.length
+      // 404 = endpoint всё ещё не задеплоен на сервере. Не спамим error —
+      // это ожидаемо пока backend не выкатили. info-уровень.
+      const notDeployed =
+        msg.includes('404') || (e as { status?: number }).status === 404
+      await log[notDeployed ? 'info' : 'warn'](
+        'inventory.retry',
+        `unconsume refund-${refundDbId} ${notDeployed ? 'endpoint не задеплоен (404), оставляю в очереди' : `threw: ${msg}`}`,
+      )
+    }
+  }
+
+  return { unconsumed, failed }
+}
+
+/**
  * Пройтись по записям 'reserved' старше STALE_RESERVED_TIMEOUT_SEC.
  * Это значит «зарезервировали но EPOS даже не начал» — вероятно сбой,
  * освобождаем резерв чтобы товар вернулся в общий пул.
@@ -148,6 +270,12 @@ export async function runInventoryHousekeeping(): Promise<void> {
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     await log.warn('inventory.housekeeping', `retryFiscalOkPending: ${msg}`)
+  }
+  try {
+    await retryUnconsumePending()
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    await log.warn('inventory.housekeeping', `retryUnconsumePending: ${msg}`)
   }
   try {
     await releaseStaleReserved()
