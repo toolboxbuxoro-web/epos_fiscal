@@ -6,10 +6,11 @@ import {
 } from '@/lib/db'
 import { Button, Card, toast } from '@/components/ui'
 import { Input } from '@/components/ui/Input'
-import { CloudUpload, Loader2 } from 'lucide-react'
+import { CloudUpload, Loader2, RefreshCw } from 'lucide-react'
 import {
   getMigrationStats,
   migrateLocalToServer,
+  syncFromServer,
   type MigrationProgress,
 } from '@/lib/inventory'
 import {
@@ -30,6 +31,10 @@ export default function Catalog() {
   const [migrationProgress, setMigrationProgress] = useState<MigrationProgress | null>(
     null,
   )
+  // Полная пересинхронизация с сервером (forceFull + reconcile удаляет
+  // призраков). Сервер — источник правды; Справочник всегда показывает
+  // ровно то что на сервере.
+  const [syncing, setSyncing] = useState(false)
 
   async function load() {
     setLoading(true)
@@ -53,8 +58,50 @@ export default function Catalog() {
     }
   }
 
+  /**
+   * Полная пересинхронизация: тянем ПОЛНЫЙ снимок сервера + reconcile
+   * (удаляем локальные приходы которых на сервере уже нет — TRUNCATE,
+   * удаление прихода бухгалтером и т.п.). После — перечитываем список.
+   *
+   * Вызывается:
+   *   - автоматически при открытии экрана (см. useEffect ниже) — чтобы
+   *     кассир ВСЕГДА видел актуальный серверный пул, а не застрявший кэш
+   *   - вручную кнопкой «Обновить с сервера»
+   */
+  async function fullResync(manual: boolean) {
+    setSyncing(true)
+    setError(null)
+    try {
+      const r = await syncFromServer({ forceFull: true })
+      if (manual) {
+        toast.success(
+          `Синхронизировано: ${r.synced} приходов` +
+            (r.deleted > 0 ? `, удалено призраков: ${r.deleted}` : '') +
+            (r.errors > 0 ? `, ошибок: ${r.errors}` : ''),
+          { duration: 4000 },
+        )
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      // Не блокируем — покажем что есть в кэше + предупреждение.
+      setError(`Не удалось синхронизироваться с сервером: ${msg}. Показан локальный кэш.`)
+    } finally {
+      setSyncing(false)
+    }
+    await load()
+  }
+
+  // При открытии экрана — сразу форс-ресинк с сервера (источник правды),
+  // потом load() внутри fullResync покажет актуальные данные.
+  useEffect(() => {
+    void fullResync(false)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Поиск — только перечитать локально (sync уже прошёл при открытии).
   useEffect(() => {
     void load()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [search])
 
   async function startMigration() {
@@ -97,9 +144,19 @@ export default function Catalog() {
           <h1 className="text-2xl font-semibold tracking-tight">Справочник приходов</h1>
           <p className="mt-1 text-sm text-ink-muted">
             Приходы с ИКПУ из общего пула. Загружает бухгалтер через mytoolbox админку —
-            здесь только просмотр.
+            здесь только просмотр. Данные берутся <strong>с сервера</strong>.
           </p>
         </div>
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={() => void fullResync(true)}
+          loading={syncing}
+          icon={!syncing ? <RefreshCw size={14} /> : undefined}
+          title="Полная пересинхронизация: тянет актуальный снимок сервера и убирает приходы которых там больше нет"
+        >
+          {syncing ? 'Синхронизация…' : 'Обновить с сервера'}
+        </Button>
       </div>
 
       {/* Migration banner — есть непереданные локальные приходы (с 0.8.x). */}
@@ -146,6 +203,12 @@ export default function Catalog() {
           className="max-w-md"
         />
         <span className="text-xs text-ink-muted">Всего записей: {total}</span>
+        {syncing && (
+          <span className="text-xs text-info inline-flex items-center gap-1">
+            <Loader2 size={12} className="animate-spin" />
+            Синхронизация с сервером…
+          </span>
+        )}
         {migrating && (
           <span className="text-xs text-info inline-flex items-center gap-1">
             <Loader2 size={12} className="animate-spin" />

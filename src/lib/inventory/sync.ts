@@ -67,9 +67,9 @@ export async function getInventoryClient(): Promise<InventoryServerClient | null
  */
 export async function syncFromServer(opts: {
   forceFull?: boolean
-} = {}): Promise<{ synced: number; errors: number }> {
+} = {}): Promise<{ synced: number; errors: number; deleted: number }> {
   const client = await getInventoryClient()
-  if (!client) return { synced: 0, errors: 0 }
+  if (!client) return { synced: 0, errors: 0, deleted: 0 }
 
   const lastSyncStr = opts.forceFull
     ? null
@@ -80,6 +80,15 @@ export async function syncFromServer(opts: {
   let errors = 0
   let offset = 0
   const limit = 1000
+
+  // forceFull = полный снимок сервера → собираем ВСЕ виденные server_item_id,
+  // чтобы потом удалить локальные строки которых на сервере больше нет
+  // (TRUNCATE / ручное удаление прихода / снятие с учёта).
+  //
+  // При delta-sync (updated_since) этот Set НЕПОЛНЫЙ — сервер вернул только
+  // изменённые с момента курсора. Поэтому reconcile-удаление делаем ТОЛЬКО
+  // при forceFull, иначе снесли бы валидные неизменённые приходы.
+  const seenServerIds = new Set<number>()
 
   // Запоминаем server_time от первого ответа — это будет наш cursor
   // для следующего delta-sync. Ставим до начала цикла, чтобы не пропустить
@@ -107,6 +116,7 @@ export async function syncFromServer(opts: {
     for (const remote of resp.items) {
       try {
         await upsertRemoteItem(remote)
+        seenServerIds.add(remote.id)
         synced++
       } catch (e) {
         errors++
@@ -122,6 +132,20 @@ export async function syncFromServer(opts: {
     offset += limit
   }
 
+  // ── Reconcile: убрать локальные строки которых на сервере нет ──────────
+  // Только при forceFull (полный снимок). Сервер = источник правды:
+  // если прихода нет на сервере — его не должно быть и в локальном кэше,
+  // иначе matcher подберёт «призрак» которого фактически нет на складе.
+  let deleted = 0
+  if (opts.forceFull) {
+    try {
+      deleted = await reconcileDeletedItems(seenServerIds)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      await log.warn('inventory.sync', `reconcile failed: ${msg}`)
+    }
+  }
+
   if (firstServerTime) {
     // Стораджим как unix-сек чтобы согласовываться с другими timestamp'ами в БД.
     const epochSec = Math.floor(new Date(firstServerTime).getTime() / 1000)
@@ -130,9 +154,83 @@ export async function syncFromServer(opts: {
 
   await log.info(
     'inventory.sync',
-    `Sync complete: ${synced} items, ${errors} errors`,
+    `Sync complete: ${synced} items, ${errors} errors, ${deleted} удалено (reconcile)`,
   )
-  return { synced, errors }
+  return { synced, errors, deleted }
+}
+
+/**
+ * Удалить из локального кэша `esf_items` (source='remote') строки которых
+ * НЕТ в свежем снимке сервера (`seenServerIds`).
+ *
+ * Защита fiscal-истории: `match_items.esf_item_id` имеет FK
+ * `ON DELETE RESTRICT`. Строку на которую ссылается прошлая фискализация
+ * нельзя физически удалить (PG/SQLite кинет ошибку, sync упал бы). Поэтому:
+ *
+ *   - orphan БЕЗ ссылок из match_items → DELETE (чистое удаление)
+ *   - orphan СО ссылкой из match_items → не удаляем, но обнуляем доступный
+ *     остаток (qty_received := qty_consumed) + помечаем notes, чтобы matcher
+ *     его больше НИКОГДА не подбирал, а аудит истории сохранился.
+ *
+ * Чанкуем по 500 — обход лимита переменных SQLite в IN(...).
+ */
+async function reconcileDeletedItems(
+  seenServerIds: Set<number>,
+): Promise<number> {
+  const db = await getDb()
+  // Все локальные remote-строки + флаг «используется в match_items».
+  const rows = await db.select<
+    Array<{ id: number; server_item_id: number | null; used: number }>
+  >(
+    `SELECT e.id,
+            e.server_item_id,
+            EXISTS(
+              SELECT 1 FROM match_items mi WHERE mi.esf_item_id = e.id
+            ) AS used
+       FROM esf_items e
+      WHERE e.source = 'remote'`,
+  )
+
+  const hardDelete: number[] = []
+  const softVoid: number[] = []
+  for (const r of rows) {
+    // server_item_id == null — legacy excel-импорт, не трогаем (он не из
+    // серверного пула, reconcile к нему неприменим).
+    if (r.server_item_id == null) continue
+    if (seenServerIds.has(r.server_item_id)) continue // ещё живой на сервере
+    if (r.used) softVoid.push(r.id)
+    else hardDelete.push(r.id)
+  }
+
+  const ts = now()
+  // Soft-void: остаток в ноль + пометка. Matcher фильтрует available>=1000,
+  // так что 0 остаток = товар исчезает из подбора, но строка цела для аудита.
+  for (let i = 0; i < softVoid.length; i += 500) {
+    const chunk = softVoid.slice(i, i + 500)
+    const ph = chunk.map((_, j) => `$${j + 2}`).join(',')
+    await db.execute(
+      `UPDATE esf_items
+         SET qty_received = qty_consumed,
+             imported_at = $1,
+             notes = '[удалён на сервере — сохранён для истории фискализаций]'
+       WHERE id IN (${ph})`,
+      [ts, ...chunk],
+    )
+  }
+  // Hard-delete: чистое удаление осиротевших без истории.
+  for (let i = 0; i < hardDelete.length; i += 500) {
+    const chunk = hardDelete.slice(i, i + 500)
+    const ph = chunk.map((_, j) => `$${j + 1}`).join(',')
+    await db.execute(`DELETE FROM esf_items WHERE id IN (${ph})`, chunk)
+  }
+
+  if (softVoid.length > 0) {
+    await log.info(
+      'inventory.sync',
+      `reconcile: ${softVoid.length} приходов обнулены (есть история фискализаций, не удаляем физически)`,
+    )
+  }
+  return hardDelete.length + softVoid.length
 }
 
 /**

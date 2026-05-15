@@ -67,12 +67,15 @@ export async function ensureInventoryRuntime(): Promise<void> {
     await log.warn('inventory.housekeeping', `startup pass failed: ${msg}`)
   }
 
-  // 2. Bootstrap full sync приходов в кэш (если ещё не было).
+  // 2. Bootstrap sync — forceFull (полный снимок + reconcile). Сервер =
+  // источник правды: на старте гарантируем что локальный кэш ТОЧНО
+  // соответствует серверу (включая удалённые приходы). Иначе призраки из
+  // прошлых сессий жили бы вечно (delta-sync их не удаляет).
   try {
-    const r = await syncFromServer()
+    const r = await syncFromServer({ forceFull: true })
     await log.info(
       'inventory.sync',
-      `Bootstrap sync: ${r.synced} items, ${r.errors} errors`,
+      `Bootstrap sync: ${r.synced} items, ${r.errors} errors, ${r.deleted} удалено`,
     )
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
@@ -90,10 +93,15 @@ export async function ensureInventoryRuntime(): Promise<void> {
     },
   })
 
-  // 4. Periodic incremental sync (fallback если SSE отвалился — догоним).
+  // 4. Periodic sync — тоже forceFull+reconcile. Так кэш САМОЗАЛЕЧИВАЕТСЯ:
+  // даже если SSE отвалился и приходы удалили на сервере, на следующем
+  // тике локальная копия приведётся к серверу 1-в-1 (включая удаления).
+  // Полный pull ≤5000 строк раз в N мин — копеечный трафик, корректность
+  // важнее экономии (бухгалтер удаляет/правит приходы — это обязано
+  // отражаться, а не висеть призраком в подборе).
   syncTimer = setInterval(
     () => {
-      void syncFromServer().catch((e) =>
+      void syncFromServer({ forceFull: true }).catch((e) =>
         log
           .warn(
             'inventory.sync',
