@@ -1,6 +1,9 @@
 import { useEffect, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { Undo2 } from 'lucide-react'
 import {
   getAllSettings,
+  getRefundedFiscalIds,
   listFiscalReceipts,
   SettingKey,
   type FiscalReceiptRow,
@@ -16,7 +19,9 @@ import {
 import { Button } from '@/components/ui/Button'
 
 export default function History() {
+  const nav = useNavigate()
   const [rows, setRows] = useState<FiscalReceiptRow[]>([])
+  const [refundedIds, setRefundedIds] = useState<Set<number>>(new Set())
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   /** id чека → сообщение результата перепечати (для inline-фидбека). */
@@ -34,6 +39,9 @@ export default function History() {
     try {
       const list = await listFiscalReceipts(200)
       setRows(list)
+      // Bulk-проверка какие чеки уже возвращены — чтобы дисэйблить кнопку.
+      const refunded = await getRefundedFiscalIds(list.map((r) => r.id))
+      setRefundedIds(refunded)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -116,23 +124,26 @@ export default function History() {
               <Th>Фискальный признак</Th>
               <Th>QR</Th>
               <Th>Печать</Th>
+              <Th>Возврат</Th>
             </tr>
           </thead>
           <tbody className="divide-y divide-border">
             {loading && rows.length === 0 ? (
               <tr>
-                <td className="px-3 py-8 text-center text-sm text-ink-muted" colSpan={6}>
+                <td className="px-3 py-8 text-center text-sm text-ink-muted" colSpan={7}>
                   Загрузка…
                 </td>
               </tr>
             ) : rows.length === 0 ? (
               <tr>
-                <td className="px-3 py-8 text-center text-sm text-ink-muted" colSpan={6}>
+                <td className="px-3 py-8 text-center text-sm text-ink-muted" colSpan={7}>
                   Пока нет ни одного фискализированного чека.
                 </td>
               </tr>
             ) : (
-              rows.map((r) => (
+              rows.map((r) => {
+                const isRefunded = refundedIds.has(r.id)
+                return (
                 <tr key={r.id} className="hover:bg-canvas">
                   <Td>{formatDateTime(parseFiscalDateTime(r.fiscal_datetime) || r.fiscalized_at)}</Td>
                   <Td className="font-mono text-xs">{r.terminal_id}</Td>
@@ -171,8 +182,26 @@ export default function History() {
                       )}
                     </div>
                   </Td>
+                  <Td>
+                    {isRefunded ? (
+                      <span className="inline-flex items-center gap-1 rounded-md bg-danger-soft px-2 py-0.5 text-xs text-danger">
+                        <Undo2 size={11} />
+                        Возвращён
+                      </span>
+                    ) : (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        icon={<Undo2 size={12} />}
+                        onClick={() => nav(`/refund/${r.id}`)}
+                      >
+                        Возврат
+                      </Button>
+                    )}
+                  </Td>
                 </tr>
-              ))
+                )
+              })
             )}
           </tbody>
         </table>

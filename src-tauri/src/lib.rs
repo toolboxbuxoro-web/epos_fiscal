@@ -47,6 +47,12 @@ pub fn run() {
             sql: include_str!("../migrations/007_force_jsonrpc_url.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 8,
+            description: "refunds",
+            sql: include_str!("../migrations/008_refunds.sql"),
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()

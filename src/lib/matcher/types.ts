@@ -191,4 +191,21 @@ export interface MatcherOptions {
    * и `tryLinkedMsVariant`.
    */
   linkCharacteristicName?: string
+  /**
+   * Принудительная ставка НДС для **продаж** (в процентах).
+   *
+   * Если указана — `loadMatcherPool` override'ит `inv_item.vat_percent`
+   * на это значение для всех товаров пула. Это значит:
+   *   - расчётная продажная цена всегда = `unit_price × (1+markup/100) × (1+default_vat/100)`
+   *   - НДС в фискальном чеке всегда = default_vat
+   *   - VATPercent в payload Communicator всегда = default_vat
+   *
+   * Зачем: учётный `vat_percent` отражает ставку **поставщика** (упрощенцы = 0%).
+   * Но **магазин** на общем режиме обязан продавать с НДС 12% всегда —
+   * независимо от того что указал поставщик. Default = 12 в РУз.
+   *
+   * Если не указано (undefined) — используется `inv_item.vat_percent` как раньше
+   * (legacy режим — для магазинов на упрощёнке или для тестов).
+   */
+  defaultVatPercent?: number
 }

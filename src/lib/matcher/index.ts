@@ -306,9 +306,11 @@ export function rebuildPositionWithSplit(
   let newMatch: PositionMatch | null
   if (newSplitLevel === 1) {
     // Возврат к одиночному товару — пробуем те же стратегии что и в buildMatch
-    // (passthrough → priceBucket; multi-item не зовём, он сам бы тоже не дал
-    // splitLevel=1).
+    // в том же приоритете: linked-ms (если МС-позиция имеет linkedBuhName) →
+    // passthrough → priceBucket. Без linked-ms кассир бы потерял явную
+    // связку из МС при возврате после split.
     newMatch =
+      tryLinkedMsVariant(target.source, pool, opts) ??
       tryPassthrough(target.source, pool, opts) ??
       tryPriceBucket(target.source, pool, opts)
   } else {
@@ -354,6 +356,103 @@ export function rebuildPositionWithSplit(
     positions: newPositions,
     matchedTotalTiyin: matchedTotal,
     totalDiffTiyin: matchedTotal - target_sum,
+  }
+}
+
+/**
+ * Заменить позицию вручную выбранным приходом (manual picker).
+ *
+ * Использование: кассир в UI кликает «Подобрать вручную» → открывается
+ * модалка → выбирает inv_item из всего пула → вызывается эта функция.
+ *
+ * Семантика:
+ *   - Цена = `pos.totalTiyin` (1:1 как в чеке МС — клиент уже заплатил эту
+ *     сумму, фискализируем именно её, без markup×VAT пересчёта)
+ *   - НДС = `vatIncluded(totalTiyin, vat_percent выбранного inv_item)`
+ *   - Strategy = `'manual'`
+ *   - Swappable / splittable = false (ручной выбор — фиксируем)
+ *   - Применяется distributeDiscount/Bump чтобы сумма чека сошлась
+ *
+ * Защита: проверяем что у inv_item достаточно остатка под `pos.quantity`.
+ * Если нет — возвращаем result без изменений (UI должен показать toast).
+ *
+ * Чистая функция — оригинальный `result` не мутируется.
+ *
+ * @returns обновлённый BuildMatchResult или null если manual pick невозможен
+ */
+export function replacePositionManual(
+  result: BuildMatchResult,
+  positionIndex: number,
+  esfItem: import('@/lib/db').EsfItemWithAvailable,
+  opts: MatcherOptions = {},
+): BuildMatchResult | null {
+  if (positionIndex < 0 || positionIndex >= result.positions.length) return null
+  const target = result.positions[positionIndex]!
+  const pos = target.source
+
+  const available = esfItem.qty_received - esfItem.qty_consumed
+  if (available < pos.quantity) return null
+
+  // Создаём candidate с ценой 1:1 из чека МС
+  const candidate = {
+    esfItem,
+    quantity: pos.quantity,
+    priceTiyin: pos.totalTiyin,
+    discountTiyin: 0,
+    vatTiyin: vatIncluded(pos.totalTiyin, esfItem.vat_percent),
+  }
+
+  // Клон позиций: только целевую меняем, остальные сбрасываем discount.
+  const newPositions: PositionMatch[] = result.positions.map((p, i) => {
+    if (i !== positionIndex) {
+      return {
+        ...p,
+        candidates: p.candidates.map((c) => ({
+          ...c,
+          discountTiyin: 0,
+          vatTiyin: vatIncluded(c.priceTiyin, c.esfItem.vat_percent),
+        })),
+      }
+    }
+    return {
+      ...p,
+      candidates: [candidate],
+      strategy: 'manual' as MatchStrategy,
+      swappable: false,
+      alternatives: [],
+      selectedAlternativeIndex: -1,
+      splittable: false,
+      splitLevel: 1,
+      canSplitMore: false,
+      warnings: [],
+    }
+  })
+
+  // Distribute discount/bump чтобы сумма чека сошлась 1-в-1
+  const target_sum = result.receipt.sum
+  const manualOpts: MatcherOptions = {
+    ...opts,
+    maxDiscountPerItemTiyin: Math.max(
+      opts.maxDiscountPerItemTiyin ?? 200_000,
+      500_000,
+    ),
+  }
+  distributeDiscount(newPositions, target_sum, manualOpts)
+  distributeBump(newPositions, target_sum, manualOpts)
+
+  const matchedTotal = newPositions.reduce(
+    (s, m) =>
+      s + m.candidates.reduce((cs, c) => cs + c.priceTiyin - c.discountTiyin, 0),
+    0,
+  )
+
+  return {
+    ...result,
+    positions: newPositions,
+    matchedTotalTiyin: matchedTotal,
+    totalDiffTiyin: matchedTotal - target_sum,
+    overallStrategy: pickOverallStrategy(newPositions.map((p) => p.strategy)),
+    canAutoFiscalize: false, // manual = ручная проверка, отключаем auto
   }
 }
 

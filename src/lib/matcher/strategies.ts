@@ -92,9 +92,50 @@ export async function loadMatcherPool(opts: MatcherOptions = {}): Promise<Matche
     opts.excludeServerItemIds && opts.excludeServerItemIds.length > 0
       ? new Set(opts.excludeServerItemIds)
       : null
-  const raw = excludeSet
+  const rawFiltered = excludeSet
     ? rawAll.filter((i) => i.server_item_id == null || !excludeSet.has(i.server_item_id))
     : rawAll
+  // **Критически важно**: исключаем товары без ИКПУ или кода упаковки —
+  // Без ИКПУ их нельзя фискализировать: ОФД не начисляет кешбэк + ГНК
+  // штраф 1% за пустой/чужой MXIK (ВМ-255 от 12.05.2022). E-POS Mobile API
+  // подтверждает: `spic` (ИКПУ) — обязательное поле (E-013).
+  //
+  // ВАЖНО: `package_code` НЕ требуем. По таблице валидации E-POS Mobile API
+  // (docs/external-apis/epos-mobile-api.md стр.140) packageCode помечен
+  // ❌ = опциональное. E-014 срабатывает только если передан НЕВЕРНЫЙ
+  // packageCode для данного ИКПУ, а не если его нет. Подтверждено
+  // эмпирически — фискализация работала с приходами без package_code.
+  // Поэтому фильтруем только по наличию ИКПУ, package_code best-effort.
+  const rawWithIkpu = rawFiltered.filter(
+    (i) => i.class_code && i.class_code.trim() !== '',
+  )
+  const skippedNoIkpu = rawFiltered.length - rawWithIkpu.length
+  if (skippedNoIkpu > 0) {
+    // Не блокирует подбор, просто info для админа — показывает что в склад
+    // загружены товары без ИКПУ и они не используются matcher'ом.
+    void import('@/lib/log').then(({ log }) =>
+      log.info(
+        'matcher',
+        `[pool] пропущено ${skippedNoIkpu} товаров без ИКПУ — дозаполните в mytoolbox`,
+      ),
+    )
+  }
+  // Override НДС: магазин на общем режиме продаёт всё с одной ставкой
+  // (default 12%) независимо от того что указал поставщик в ЭСФ
+  // (упрощенцы шлют 0%). Это override на уровне пула — все downstream
+  // расчёты (selling price, candidate, vatTiyin, fiscalize payload, печать)
+  // используют `item.vat_percent` и автоматически подхватят новую ставку.
+  //
+  // Если opts.defaultVatPercent не задан — используем учётный vat (legacy
+  // режим для магазинов на упрощёнке или для тестов).
+  const overrideVat =
+    typeof opts.defaultVatPercent === 'number' && opts.defaultVatPercent >= 0
+      ? opts.defaultVatPercent
+      : null
+  const raw =
+    overrideVat !== null
+      ? rawWithIkpu.map((i) => ({ ...i, vat_percent: overrideVat }))
+      : rawWithIkpu
   const markup = opts.markupPercent ?? DEFAULT_MARKUP
   const roundUp = opts.roundUpToSum ?? DEFAULT_ROUND_UP_SUM
   let minSellingPrice = Number.POSITIVE_INFINITY
@@ -288,20 +329,36 @@ export function tryLinkedMsVariant(
     return null
   }
 
-  // FIFO — самый старый приход
-  const chosen = [...withStock].sort(
+  // FIFO — самые старые приходы вначале (типичный учётный порядок).
+  // Берём все батчи с остатком как альтернативы для swap-стрелок:
+  // например бухгалтер импортнул две партии «Сварочный аппарат ARC-220
+  // ALTECO» с разными received_at — кассир переключается между ними ←/→.
+  const sorted = [...withStock].sort(
     (a, b) => a.item.received_at - b.item.received_at,
-  )[0]
-  if (!chosen) return null
+  )
+  const chosen = sorted[0]!
 
   void log.info(
     'matcher',
     `[linked-ms] ✓ "${pos.linkedBuhName}" → "${chosen.item.name}" (ИКПУ ${chosen.item.class_code})`,
-    { ms_qty: pos.quantity, available: chosen.item.qty_received - chosen.item.qty_consumed },
+    {
+      ms_qty: pos.quantity,
+      available: chosen.item.qty_received - chosen.item.qty_consumed,
+      alternatives: sorted.length,
+    },
   )
 
   // ВАЖНО: цена 1-в-1 как в чеке МС (не пересчитываем sellingPrice)
   const candidate = makeCandidate(chosen.item, pos.quantity, pos.totalTiyin)
+
+  // Альтернативы для swap — все batches того же linkedBuhName с остатком.
+  // Цена всегда = pos.totalTiyin (linked-ms смысл — 1:1 цена МС независимо
+  // от батча), поэтому swap фактически меняет только source_doc/received_at/
+  // partial id, но это нужно для FIFO-учёта складского остатка.
+  const ALT_LIMIT = 10
+  const alternatives: MatchCandidate[] = sorted
+    .slice(0, ALT_LIMIT)
+    .map((alt) => makeCandidate(alt.item, pos.quantity, pos.totalTiyin))
 
   return {
     source: pos,
@@ -309,12 +366,18 @@ export function tryLinkedMsVariant(
     strategy: 'linked-ms',
     diffTiyin: 0, // цена та же что и в МС — разницы нет
     warnings: [],
-    swappable: false, // связь явная — нет смысла менять
-    alternatives: [],
-    selectedAlternativeIndex: -1,
+    // Swap включён если есть >1 батч под одно бух-имя — кассир выбирает
+    // партию (например для FIFO learning или если хочет другой received_at).
+    swappable: alternatives.length > 1,
+    alternatives,
+    selectedAlternativeIndex: 0,
     splitLevel: 1,
-    canSplitMore: false,
-    splittable: false,
+    // Split включён — позволяет кассиру при необходимости отказаться от
+    // линковки и набрать набор из нескольких товаров (например если хочет
+    // распределить нагрузку на склад). rebuildPositionWithSplit при возврате
+    // на level=1 заново пробует tryLinkedMsVariant.
+    canSplitMore: canSplitToLevel(pos, pool, opts, 2),
+    splittable: true,
   }
 }
 

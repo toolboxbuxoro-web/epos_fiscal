@@ -7,6 +7,7 @@ import {
   Check,
   ChevronLeft,
   ChevronRight,
+  Hand,
   Minus,
   Plus,
   Scissors,
@@ -31,14 +32,17 @@ import {
   loadMatcherPool,
   recalculateAfterSwap,
   rebuildPositionWithSplit,
+  replacePositionManual,
   type BuildMatchResult,
   type MatcherPool,
 } from '@/lib/matcher'
 import type { MatcherOptions } from '@/lib/matcher/types'
+import { ManualPickerModal } from './Receipt/ManualPickerModal'
 import { fiscalize, InventoryConflictError } from '@/lib/epos'
 import {
   MoyskladClient,
   enrichWithVariants,
+  getCachedVariants,
   inlinePositions,
   type MsRetailDemand,
 } from '@/lib/moysklad'
@@ -74,6 +78,8 @@ export default function Receipt() {
   const [pool, setPool] = useState<MatcherPool | null>(null)
   // Тост для UX «не получилось раздробить» / «нет альтернатив».
   const [splitToast, setSplitToast] = useState<string | null>(null)
+  // Индекс позиции для которой открыта модалка ручного подбора (null = закрыта).
+  const [manualPickerForPos, setManualPickerForPos] = useState<number | null>(null)
   const [busy, setBusy] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [fiscalizing, setFiscalizing] = useState(false)
@@ -100,12 +106,13 @@ export default function Receipt() {
   }, [rd])
 
   /**
-   * Список товаров в подборе у которых пустой ИКПУ или код упаковки.
+   * Список товаров в подборе у которых пустой ИКПУ.
    *
    * Без MXIK ОФД не начисляет покупателю кешбэк и магазин рискует штрафом
    * 1% от суммы (постановление ВМ-255 от 12.05.2022 п.20 ч.5). Поэтому
    * фискализацию таких чеков мы блокируем — кассир должен дозаполнить
-   * ИКПУ в админке mytoolbox.
+   * ИКПУ в админке mytoolbox. package_code НЕ требуем (опционален,
+   * см. epos-mobile-api.md стр.140 — E-014 только при НЕВЕРНОМ коде).
    *
    * Считаем уникальные имена чтобы баннер не дублировал товары когда
    * один и тот же выбран в multi-item / split.
@@ -115,7 +122,9 @@ export default function Receipt() {
     const names = new Set<string>()
     for (const pm of match.positions) {
       for (const c of pm.candidates) {
-        if (!c.esfItem.class_code || !c.esfItem.package_code) {
+        // Только ИКПУ обязателен. package_code опционален (E-POS Mobile API
+        // помечает его ❌, E-014 только при НЕВЕРНОМ коде, не при пустом).
+        if (!c.esfItem.class_code || c.esfItem.class_code.trim() === '') {
           names.add(c.esfItem.name)
         }
       }
@@ -193,14 +202,16 @@ export default function Receipt() {
       // Обогащение characteristics из модификаций (linked-ms fallback).
       // Если в чеке базовый товар (product) без characteristics — пытаемся
       // найти его модификации и взять characteristics единственной модификации.
-      // Это позволяет matcher'у найти связку даже когда кассир пробил
-      // базовый товар, а бухгалтер заполнил «Бухгалтерское наименование»
-      // в характеристике единственной модификации. См. enrichWithVariants.
+      // С TTL-кэшем (5 мин) повторные чеки с тем же товаром не делают
+      // лишних HTTP-запросов к МС.
       if (msClient && inlinePositions(parsed)) {
         try {
           const { enrichedCount, productsChecked } = await enrichWithVariants(
             parsed,
-            (productId) => msClient.listVariantsByProduct(productId),
+            (productId) =>
+              getCachedVariants(productId, (id: string) =>
+                msClient.listVariantsByProduct(id),
+              ),
           )
           if (enrichedCount > 0) {
             await log.info(
@@ -248,6 +259,17 @@ export default function Receipt() {
       const linkCharacteristicName =
         linkCharRaw && linkCharRaw.trim() ? linkCharRaw.trim() : 'Бухгалтерское наименование'
 
+      // Принудительная ставка НДС для продаж (default 12% — общий режим
+      // в РУз). Override на уровне пула: vat_percent каждого инв.прихода
+      // переписывается на это значение, чтобы расчёт продажной цены и
+      // фискальный чек всегда использовали 12% независимо от того что
+      // указал поставщик в ЭСФ (упрощенцы шлют 0%).
+      const vatRaw = await getSetting(SettingKey.DefaultVatPercent)
+      const defaultVatPercent =
+        vatRaw != null && vatRaw !== ''
+          ? Number.parseInt(vatRaw, 10) || 0
+          : 12
+
       const opts: MatcherOptions = {
         toleranceTiyin: tolerance,
         markupPercent,
@@ -255,6 +277,7 @@ export default function Receipt() {
         discountForExactSum: discountEnabled,
         maxDiscountPerItemTiyin,
         linkCharacteristicName,
+        defaultVatPercent,
         excludeServerItemIds: excludedServerIds.length > 0 ? excludedServerIds : undefined,
       }
       const result = await buildMatch(parsed, opts)
@@ -443,7 +466,7 @@ export default function Receipt() {
               </div>
               <div className="mt-1 text-caption text-ink">
                 Без MXIK ОФД не начислит покупателю кешбэк, а ГНК штрафует
-                магазин на 1% от суммы. Дозаполните ИКПУ + код упаковки в{' '}
+                магазин на 1% от суммы. Дозаполните ИКПУ в{' '}
                 <em className="not-italic font-medium">mytoolbox → Inventory → Приходы</em>{' '}
                 и обновите чек.
               </div>
@@ -564,6 +587,15 @@ export default function Receipt() {
                             : undefined,
                       }
                     : undefined
+                // Ручной подбор — открывает модалку с поиском по приходам.
+                // Доступен на первой строке группы для любой стратегии — даже
+                // когда у matcher уже что-то подобрано, кассир может пере-выбрать.
+                const manual =
+                  isFirstCand && pool
+                    ? {
+                        onPick: () => setManualPickerForPos(posIdx),
+                      }
+                    : undefined
                 return {
                   name: c.esfItem.name,
                   quantity: c.quantity,
@@ -575,6 +607,7 @@ export default function Receipt() {
                   matched: true,
                   swap,
                   split,
+                  manual,
                 }
               }),
             )}
@@ -619,6 +652,38 @@ export default function Receipt() {
             </ul>
           </Card.Body>
         </Card>
+      )}
+
+      {/* Модалка ручного подбора — открыта когда manualPickerForPos !== null.
+          Загруженный pool переиспользуем, не делаем нового запроса. */}
+      {manualPickerForPos !== null && pool && match.positions[manualPickerForPos] && (
+        <ManualPickerModal
+          pool={pool}
+          positionName={match.positions[manualPickerForPos]!.source.name}
+          targetPriceTiyin={match.positions[manualPickerForPos]!.source.totalTiyin}
+          onClose={() => setManualPickerForPos(null)}
+          onPick={(result) => {
+            const next = replacePositionManual(
+              match,
+              manualPickerForPos,
+              result.item,
+              matcherOpts,
+            )
+            if (next) {
+              setMatch(next)
+              setManualPickerForPos(null)
+              toast.success(
+                `Выбран вручную: ${result.item.name}`,
+                { duration: 3000 },
+              )
+            } else {
+              toast.error(
+                `Не получилось подобрать «${result.item.name}» — остатка меньше чем нужно (нужно ${milliQtyToDisplay(match.positions[manualPickerForPos]!.source.quantity)} шт).`,
+                { duration: 5000 },
+              )
+            }
+          }}
+        />
       )}
     </div>
   )
@@ -677,6 +742,13 @@ interface DisplayPosition {
     onMore?: () => void
     onLess?: () => void
   }
+  /**
+   * Контрол ручного подбора — открывает модалку со списком всех приходов
+   * с поиском по тексту и сумме. Показывается на первой строке группы.
+   */
+  manual?: {
+    onPick: () => void
+  }
 }
 
 function PositionsTable({ positions }: { positions: DisplayPosition[] }) {
@@ -723,7 +795,10 @@ function PositionsTable({ positions }: { positions: DisplayPosition[] }) {
               <div className="font-mono text-caption text-ink-subtle mt-0.5">
                 {p.meta} · НДС {p.vatPercent}%
               </div>
-              {p.split && <SplitControl split={p.split} />}
+              <div className="flex items-center gap-2 flex-wrap mt-1">
+                {p.split && <SplitControl split={p.split} />}
+                {p.manual && <ManualPickControl onPick={p.manual.onPick} />}
+              </div>
             </td>
             <td className="px-3 py-3 text-right tabular-nums text-ink-muted">
               {milliQtyToDisplay(p.quantity)}
@@ -817,7 +892,7 @@ function SplitControl({
   split: { level: number; onMore?: () => void; onLess?: () => void }
 }) {
   return (
-    <div className="mt-1.5 inline-flex items-center gap-1.5">
+    <div className="inline-flex items-center gap-1.5">
       <span className="inline-flex items-center gap-1 text-caption text-ink-muted">
         <Scissors size={11} />
         Раздробить:
@@ -852,6 +927,34 @@ function SplitControl({
         <Plus size={12} />
       </button>
     </div>
+  )
+}
+
+/**
+ * Кнопка-чип «Подобрать вручную» — открывает модалку с индексированным
+ * поиском по всем приходам справочника. Размещается рядом с SplitControl.
+ *
+ * Используется когда:
+ *   - matcher не угадал товар точно (кассир хочет именно этот HR-2470, а
+ *     не похожий по цене)
+ *   - кассир хочет проверить какие альтернативы есть в пуле
+ *   - подбор «не сошёлся» по цене → ищем по сумме чека
+ */
+function ManualPickControl({ onPick }: { onPick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onPick}
+      title="Открыть поиск по всем приходам — выбрать товар вручную"
+      className={cn(
+        'inline-flex items-center gap-1.5 rounded-md border border-border',
+        'px-2 py-0.5 text-caption text-ink-muted',
+        'hover:bg-surface-hover hover:text-ink transition-colors',
+      )}
+    >
+      <Hand size={11} />
+      Подобрать вручную
+    </button>
   )
 }
 

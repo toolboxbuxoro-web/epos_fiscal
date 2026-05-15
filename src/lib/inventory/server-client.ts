@@ -21,6 +21,8 @@ import type {
   ReserveRequest,
   ReserveResponse,
   ShopMeResponse,
+  UnconsumeRequest,
+  UnconsumeResponse,
 } from './types'
 
 export class InventoryServerError extends Error {
@@ -119,6 +121,26 @@ export class InventoryServerClient {
     return this.request('/api/v1/inventory/extend', {
       method: 'POST',
       body: JSON.stringify(req),
+    })
+  }
+
+  /**
+   * Вернуть остаток в пул после refund.
+   *
+   * Идемпотентно через `refund_fiscal_sign` — двойной вызов не двинет
+   * остаток повторно.
+   *
+   * Разрешаем 404 (endpoint ещё не задеплоен) и 409 (conflict —
+   * ALREADY_UNCONSUMED это OK с точки зрения идемпотентности).
+   *
+   * Если 404 — caller (`processRefund`) кладёт операцию в локальный
+   * `inv_pending_confirms` с op_type='unconsume' для повторной попытки.
+   */
+  async unconsume(req: UnconsumeRequest): Promise<UnconsumeResponse> {
+    return this.request<UnconsumeResponse>('/api/v1/inventory/unconsume', {
+      method: 'POST',
+      body: JSON.stringify(req),
+      allowStatuses: [404, 409],
     })
   }
 

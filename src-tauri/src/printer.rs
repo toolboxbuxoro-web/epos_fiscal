@@ -45,6 +45,8 @@ pub fn print_test_qr(printer_name: String) -> Result<u64, String> {
     let test_data = ReceiptData {
         is_copy: false,
         is_test: true,
+        is_refund: false,
+        original_receipt_ref: String::new(),
         company: CompanyInfo {
             name: "ТЕСТОВЫЙ МАГАЗИН".to_string(),
             address: "Бухара".to_string(),
@@ -115,6 +117,16 @@ pub struct ReceiptData {
     /// и QR не читается. Никаких реальных побочных эффектов.
     #[serde(default)]
     pub is_test: bool,
+    /// `true` — это чек возврата. В шапке вместо «КАССОВЫЙ ЧЕК» / «КОПИЯ» / «ТЕСТ»
+    /// печатается «QAYTARUV / ВОЗВРАТ ТОВАРА». Под ней — ссылка на оригинал
+    /// (см. `original_receipt_ref`). Цвета/выделение чтобы кассир и покупатель
+    /// сразу видели что это refund, а не продажа.
+    #[serde(default)]
+    pub is_refund: bool,
+    /// Только если `is_refund=true`: ссылка на оригинал
+    /// (например "ABC123 от 14.05.2026 16:12"). Печатается под шапкой.
+    #[serde(default)]
+    pub original_receipt_ref: String,
     pub company: CompanyInfo,
     pub receipt_seq: String,
     pub date_str: String,
@@ -262,7 +274,31 @@ fn build_receipt(d: &ReceiptData) -> Vec<u8> {
         write_line(&mut buf, "ТЕСТ");
         buf.extend_from_slice(&[0x1B, 0x21, 0x00]);
         bold_off(&mut buf);
-        write_line(&mut buf, "НЕ ФИСКАЛЬНЫЙ ЧЕК");
+        if d.is_refund {
+            write_line(&mut buf, "ВОЗВРАТ — НЕ ФИСКАЛЬНЫЙ");
+        } else {
+            write_line(&mut buf, "НЕ ФИСКАЛЬНЫЙ ЧЕК");
+        }
+        write_line(&mut buf, "");
+    } else if d.is_refund {
+        // ── ВОЗВРАТ (большой жирный заголовок) ─────────────
+        // Без этой явной шапки кассир/покупатель могут спутать refund-чек
+        // с продажным (особенно если используется одинаковый шаблон).
+        // Делаем двойной ширины+высоты — будет заметно издалека.
+        bold_on(&mut buf);
+        buf.extend_from_slice(&[0x1B, 0x21, 0x30]);
+        write_line(&mut buf, "QAYTARUV");
+        buf.extend_from_slice(&[0x1B, 0x21, 0x00]);
+        write_line(&mut buf, "ВОЗВРАТ ТОВАРА");
+        bold_off(&mut buf);
+        if !d.original_receipt_ref.is_empty() {
+            // Подзаголовок — ссылка на оригинальный чек.
+            // Формат: "По чеку №ABC123 от 14.05.2026 16:12".
+            write_line(
+                &mut buf,
+                &format!("По чеку №{}", d.original_receipt_ref),
+            );
+        }
         write_line(&mut buf, "");
     } else if d.is_copy {
         write_line(&mut buf, "Chek nusxasi");
@@ -327,7 +363,13 @@ fn build_receipt(d: &ReceiptData) -> Vec<u8> {
         &mut buf,
         &two_cols("Bank kartasi:", &format!("{} so'm", d.card_str)),
     );
-    write_line(&mut buf, &two_cols("Chek turi:", "Xarid"));
+    write_line(
+        &mut buf,
+        &two_cols(
+            "Chek turi:",
+            if d.is_refund { "Qaytaruv" } else { "Xarid" },
+        ),
+    );
     write_line(&mut buf, &two_cols("Kassir:", &d.cashier));
     divider(&mut buf);
 
@@ -350,6 +392,11 @@ fn build_receipt(d: &ReceiptData) -> Vec<u8> {
         write_line(&mut buf, "Это тестовый прогон.");
         write_line(&mut buf, "В ОФД ГНК ничего не отправлено.");
         write_line(&mut buf, "QR-код не сканируется.");
+    } else if d.is_refund {
+        // Refund-чек — кешбэк не накапливается (он списывается обратно).
+        // Поэтому вместо «keshbek olish huquqiga» — нейтральная фраза.
+        write_line(&mut buf, "Tovar qaytarildi.");
+        write_line(&mut buf, "Pul mijozga to'liq qaytarildi.");
     } else {
         write_line(&mut buf, "Siz xaridning 1% miqdorida");
         write_line(&mut buf, "\"Keshbek\" olish huquqiga ega");

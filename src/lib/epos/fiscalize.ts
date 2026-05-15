@@ -117,22 +117,28 @@ export async function fiscalize(
     return { fiscal: fakeFiscal, fiscalReceiptDbId: 0, matchDbId: null }
   }
 
-  // ── Жёсткий guard: ИКПУ + код упаковки обязательны на ВСЁМ пути ──
+  // ── Жёсткий guard: ИКПУ обязателен на ВСЁМ пути ──
   // Без MXIK ОФД не начисляет покупателю кешбэк и ГНК штрафует магазин
   // на 1% от суммы (постановление ВМ-255 от 12.05.2022 п.20 ч.5).
+  // E-POS Mobile API: `spic` (ИКПУ) — обязательное поле (ошибка E-013).
+  //
+  // package_code НЕ проверяем — он опциональный (epos-mobile-api.md стр.140
+  // помечает packageCode ❌, E-014 только при НЕВЕРНОМ коде). Раньше guard
+  // зря блокировал товары с валидным ИКПУ но без кода упаковки. Подтверждено
+  // эмпирически: фискализация работала без package_code.
   // Применяется ДО любой работы с сервером (резерв, fiscalize) — иначе
   // потратим время и вернём резерв обратно при failure.
   const noIkpuItems: string[] = []
   for (const pm of build.positions) {
     for (const c of pm.candidates) {
-      if (!c.esfItem.class_code || !c.esfItem.package_code) {
+      if (!c.esfItem.class_code || c.esfItem.class_code.trim() === '') {
         noIkpuItems.push(c.esfItem.name)
       }
     }
   }
   if (noIkpuItems.length > 0) {
     throw new Error(
-      `Нельзя фискализировать: у ${noIkpuItems.length} товаров отсутствует ИКПУ или код упаковки. ` +
+      `Нельзя фискализировать: у ${noIkpuItems.length} товаров отсутствует ИКПУ. ` +
         `Дозаполните в mytoolbox админке → Inventory → Приходы. ` +
         `Товары: ${noIkpuItems.slice(0, 3).join(', ')}` +
         (noIkpuItems.length > 3 ? ` и ещё ${noIkpuItems.length - 3}` : ''),
@@ -602,7 +608,11 @@ async function fiscalizeJsonRpc(
       // Источник имени `spic`: docs.epos.uz/ru/mobile-api/receipts-sale.
       // НЕ менять без проверки — иначе MXIK перестанет доходить до ОФД.
       spic: c.esfItem.class_code,
-      packageCode: c.esfItem.package_code,
+      // package_code опционален: если его нет — шлём '' (E-POS трактует
+      // отсутствие как «не задано», E-014 только при НЕВЕРНОМ коде).
+      // null/undefined в JSON мог бы сериализоваться как `null` —
+      // нормализуем к пустой строке.
+      packageCode: c.esfItem.package_code || '',
       VATPercent: c.esfItem.vat_percent,
       OwnerType: c.esfItem.owner_type,
     })),

@@ -20,15 +20,21 @@ interface Props extends ButtonHTMLAttributes<HTMLButtonElement> {
 // `text-ink-inverse`, потому что в Tauri WKWebView с macOS Dark Mode UA-стили
 // иногда пробивают CSS-переменные form-controls. Hardcoded `white`/`zinc-900`
 // 100% переопределяет system-цвета и гарантирует читаемость в любой среде.
+// ВАЖНО: для primary/danger используем `text-ink-inverse` (CSS-переменная
+// rgb(var(--ink-inverse))), НЕ hardcoded `text-white`. WKWebView в macOS Dark
+// Mode иногда перекрывает Tailwind `text-white` своими UA-стилями (особенно
+// внутри <button>), и текст становится тёмным на тёмном фоне = невидимым.
+// CSS-переменная гарантированно `#fafafa` в light-теме (которая залочена
+// через `color-scheme: only light` в index.css).
 const variants: Record<Variant, string> = {
   primary:
-    'bg-primary text-white hover:bg-primary-hover disabled:bg-ink-subtle disabled:text-white',
+    'bg-primary text-ink-inverse hover:bg-primary-hover disabled:bg-ink-subtle disabled:text-ink-inverse',
   secondary:
     'bg-surface text-ink border border-border hover:bg-surface-hover disabled:opacity-50',
   ghost:
     'bg-transparent text-ink-muted hover:bg-surface-hover hover:text-ink disabled:opacity-50',
   danger:
-    'bg-danger text-white hover:opacity-90 disabled:opacity-50',
+    'bg-danger text-ink-inverse hover:opacity-90 disabled:opacity-50',
 }
 
 const sizes: Record<Size, string> = {
@@ -52,10 +58,24 @@ export const Button = forwardRef<HTMLButtonElement, Props>(function Button(
   ref,
 ) {
   const isDisabled = disabled || loading
+  // Inline style для primary/danger — safety net против WKWebView UA-стилей
+  // в macOS Dark Mode которые иногда перекрывают Tailwind text-* классы
+  // внутри form-controls. Inline `style` имеет наивысший CSS-приоритет.
+  // Merge с user-style (rest.style) чтобы не перетирать.
+  const forceColor =
+    variant === 'primary' || variant === 'danger'
+      ? { color: 'rgb(var(--ink-inverse))' }
+      : undefined
+  const mergedStyle = forceColor
+    ? { ...(rest.style || {}), ...forceColor }
+    : rest.style
+  // Извлекаем style из rest чтобы не перетирался ниже
+  const { style: _userStyle, ...restWithoutStyle } = rest
   return (
     <button
       ref={ref}
       disabled={isDisabled}
+      style={mergedStyle}
       className={cn(
         'inline-flex items-center justify-center rounded-md font-medium transition-colors',
         'disabled:cursor-not-allowed',
@@ -64,7 +84,7 @@ export const Button = forwardRef<HTMLButtonElement, Props>(function Button(
         sizes[size],
         className,
       )}
-      {...rest}
+      {...restWithoutStyle}
     >
       {loading ? (
         <Loader2 className="h-4 w-4 animate-spin" aria-hidden />

@@ -77,6 +77,24 @@ export const SettingKey = {
    */
   RoundUpToSum: 'pricing.round_up_to_sum',
   /**
+   * Принудительная ставка НДС для продаж (в процентах). По умолчанию **12**.
+   *
+   * Используется чтобы переопределить `inv_item.vat_percent` (который
+   * приходит из ЭСФ поставщика — у упрощенцев = 0) на ставку магазина.
+   *
+   * Если магазин на общем режиме НО (default в РУз для всех ИП/ООО кроме
+   * упрощёнки), он обязан **продавать** все товары с НДС 12% независимо
+   * от того что указал поставщик при поставке. Этот параметр применяется:
+   *
+   *   1. К `calculateSellingPrice` — расчёт продажной цены всегда × 1.12
+   *   2. К `makeCandidate` — НДС в фискальном чеке всегда 12%
+   *   3. К payload Communicator (`VATPercent: 12` для каждой позиции)
+   *
+   * Дефолт `'12'`. Поменять в Настройках если магазин на упрощёнке (0)
+   * или если ставка изменится (например с 12 на 15 — было такое в 2019).
+   */
+  DefaultVatPercent: 'pricing.default_vat_percent',
+  /**
    * Включить ли распределение скидок чтобы итоговая сумма подбора совпала
    * 1-в-1 с суммой чека МойСклад. 'true' / 'false'. По умолчанию 'true'.
    */
@@ -268,4 +286,41 @@ export interface ReplacementLogRow {
   fiscalized_items_json: string
   reason: string | null
   created_at: EpochSec
+}
+
+// ── fiscal_refunds ───────────────────────────────────────────────
+
+/**
+ * Чек возврата, отправленный в Communicator + ОФД.
+ *
+ * Один продажный чек (fiscal_receipts.id) может породить только ОДИН refund
+ * на MVP — UNIQUE constraint в БД. В Phase 2 уберём, чтобы можно было
+ * возвращать частично несколько раз.
+ *
+ * Денежные суммы (refund_cash_tiyin, refund_card_tiyin, refund_qr_tiyin) —
+ * сколько кассир выдал покупателю. Сумма всех трёх = сумма возврата.
+ *
+ * items_json — снапшот позиций возврата (структура совпадает с match_items,
+ * но это денормализация для аудита, чтобы изменения в match_items не сдвинули
+ * этот снапшот).
+ */
+export interface FiscalRefundRow {
+  id: number
+  original_fiscal_id: number
+  ms_return_id: number | null
+  terminal_id: string
+  receipt_seq: string
+  fiscal_sign: string
+  qr_code_url: string
+  fiscal_datetime: string // YYYYMMDDHHMMSS
+  applet_version: string | null
+  items_json: string
+  refund_cash_tiyin: Tiyin
+  refund_card_tiyin: Tiyin
+  refund_qr_tiyin: Tiyin
+  request_json: string
+  response_json: string
+  reason: string | null
+  cashier_name: string | null
+  refunded_at: EpochSec
 }

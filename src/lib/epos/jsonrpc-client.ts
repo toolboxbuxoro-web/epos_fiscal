@@ -108,6 +108,48 @@ export interface JsonRpcReceipt {
    * регистрации в ГНК, передавать их повторно нельзя.
    */
   Cashier?: string
+  /**
+   * Обязательное поле ТОЛЬКО для refund-чеков (`Api.SendRefundReceipt`).
+   * Без него Communicator вернёт ошибку `E-007 RECEIPT_REFUND_INFO_REQUIRED`.
+   *
+   * Поля внутри (terminalId/receiptSeq/dateTime/fiscalSign) берутся из ответа
+   * на оригинальный sale (см. `fiscal_receipts` в нашей БД).
+   *
+   * Формат: top-level в PascalCase (соответствует Time/Items/...), но
+   * **внутренние ключи camelCase** — так в документации Universal Communicator
+   * (см. docs/external-apis/universal-communicator.md строка 285).
+   *
+   * Имя поля `RefundInfo` (PascalCase) vs `refundInfo` (camelCase) точно не
+   * подтверждено для JSON-RPC API — если Communicator проигнорирует, нужно
+   * добавить альтернативный alias `refundInfo` в payload (см. также шаблон
+   * с `spic`).
+   */
+  RefundInfo?: JsonRpcRefundInfo
+}
+
+/**
+ * Блок refundInfo внутри Receipt — ссылка на оригинальный продажный чек.
+ *
+ * Все 4 поля обязательны. Внутренние ключи в camelCase (так в docs).
+ */
+export interface JsonRpcRefundInfo {
+  /** ID терминала из оригинального fiscal_receipts.terminal_id. */
+  terminalId: string
+  /** Порядковый номер оригинального чека (fiscal_receipts.receipt_seq). */
+  receiptSeq: string
+  /**
+   * Дата+время оригинала в формате **YYYYMMDDHHMMSS без разделителей**
+   * (см. universal-communicator.md строка 111).
+   *
+   * Источник: `fiscal_receipts.fiscal_datetime` (уже в нужном формате,
+   * см. answer.DateTime от Communicator).
+   *
+   * ⚠️ НЕ Go-style («2026-05-01 15:30:00») и НЕ ISO («T05:47:34») — именно
+   * 14 цифр подряд. Иначе Communicator JSON-RPC ругается «illegal argument».
+   */
+  dateTime: string
+  /** Фискальный признак оригинала (fiscal_receipts.fiscal_sign). */
+  fiscalSign: string
 }
 
 export interface JsonRpcFiscalAnswer {

@@ -122,6 +122,44 @@ export interface ExtendRequest {
   extend_seconds?: number
 }
 
+/**
+ * Запрос на возврат остатка в пул после refund.
+ *
+ * Использование: после успешного refund в Communicator кассир уже выдал
+ * деньги покупателю и забрал товар обратно. Шлём этот запрос на сервер
+ * чтобы вернуть `qty` в `qty_received - qty_consumed` (фактический остаток
+ * увеличивается).
+ *
+ * Идемпотентность через `refund_fiscal_sign` — если повторно прислать
+ * тот же fiscal_sign, сервер не двинет остаток дважды.
+ *
+ * ⚠️ Endpoint `/api/v1/inventory/unconsume` нужно добавить на backend
+ * mytoolbox. До этого — наш клиент ловит 404 и кладёт операцию в локальную
+ * очередь `inv_pending_confirms` с op_type='unconsume', чтобы переотправить
+ * когда backend задеплоится.
+ */
+export interface UnconsumeRequest {
+  /** Магазин определяется через api_key, поэтому здесь не нужен. */
+  items: { inv_item_id: number; quantity: MilliQty }[]
+  /** Фискальный признак возврата (для идемпотентности). */
+  refund_fiscal_sign: string
+  /** Идемпотентный ключ — например ms_return_id или fiscal_refunds.id. */
+  idempotency_key?: string
+}
+
+export interface UnconsumeResponse {
+  ok: boolean
+  /** Какие inv_item'ы реально были «откачены» (qty_consumed -= quantity). */
+  items?: Array<{
+    id: number
+    qty_received: MilliQty
+    qty_consumed: MilliQty
+    available: MilliQty
+  }>
+  /** Код ошибки если ok=false. */
+  code?: 'NOT_FOUND' | 'ALREADY_UNCONSUMED' | 'INSUFFICIENT_CONSUMED'
+}
+
 /** Конфигурация магазина для inventory клиента. */
 export interface InventoryClientConfig {
   serverUrl: string // 'https://mytoolbox-backend.up.railway.app' (без trailing /)

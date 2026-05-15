@@ -60,6 +60,7 @@ interface FormState {
   // Ценообразование (применяется к товарам из справочника при подборе)
   markupPercent: string
   roundUpToSum: string
+  defaultVatPercent: string
   // Скидка для точной суммы (распределяется чтобы Jami = чек МС)
   discountForExactSum: 'true' | 'false'
   maxDiscountPerItemSum: string
@@ -94,6 +95,7 @@ const empty: FormState = {
   replacementEnabled: 'true',
   markupPercent: '10',
   roundUpToSum: '1000',
+  defaultVatPercent: '12',
   discountForExactSum: 'true',
   maxDiscountPerItemSum: '2000',
   testMode: 'false',
@@ -196,6 +198,7 @@ export default function Settings() {
       matchToleranceTiyin: all[SettingKey.MatchToleranceTiyin] ?? '100000',
       markupPercent: all[SettingKey.MarkupPercent] ?? '10',
       roundUpToSum: all[SettingKey.RoundUpToSum] ?? '1000',
+      defaultVatPercent: all[SettingKey.DefaultVatPercent] ?? '12',
       discountForExactSum: (all[SettingKey.DiscountForExactSum] ?? 'true') as
         | 'true'
         | 'false',
@@ -332,6 +335,7 @@ export default function Settings() {
         [SettingKey.MatchToleranceTiyin]: form.matchToleranceTiyin,
         [SettingKey.MarkupPercent]: form.markupPercent,
         [SettingKey.RoundUpToSum]: form.roundUpToSum,
+        [SettingKey.DefaultVatPercent]: form.defaultVatPercent,
         [SettingKey.DiscountForExactSum]: form.discountForExactSum,
         [SettingKey.MaxDiscountPerItemSum]: form.maxDiscountPerItemSum,
         [SettingKey.TestMode]: form.testMode,
@@ -845,6 +849,24 @@ export default function Settings() {
             Продажная цена округляется ВВЕРХ до этого шага.{' '}
             <strong>1000</strong> = 15 500 → 16 000, 667 450 → 668 000.{' '}
             <strong>100</strong> = до сотен. <strong>1</strong> = без округления.
+          </div>
+        </Field>
+        <Field label="Ставка НДС для продаж, %">
+          <Input
+            type="number"
+            min={0}
+            max={50}
+            value={form.defaultVatPercent}
+            onChange={(e) => setField('defaultVatPercent', e.target.value)}
+          />
+          <div className="mt-1 text-xs text-ink-muted">
+            Принудительная ставка НДС для <strong>всех</strong> позиций
+            (независимо от того что указал поставщик в приходе).
+            По умолчанию <strong>12</strong> — общий режим в РУз.
+            Если магазин на упрощёнке — поставьте <strong>0</strong>.
+            <br />
+            Используется в расчёте продажной цены (×1.12), в НДС
+            фискального чека и в payload Communicator.
           </div>
         </Field>
         <div className="md:col-span-2 rounded-md bg-canvas p-3 text-xs text-ink-muted">

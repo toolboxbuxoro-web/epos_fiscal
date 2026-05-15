@@ -8,6 +8,7 @@ export type LogSource =
   | 'epos'
   | 'matcher'
   | 'fiscalize'
+  | 'refund'
   | 'updater'
   | 'ui'
   | 'esf-import'
