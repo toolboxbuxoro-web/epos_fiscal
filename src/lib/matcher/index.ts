@@ -124,6 +124,26 @@ export async function buildMatch(
         `Позиция «${pos.name}» (${tiyinToSumDisplay(pos.totalTiyin)} сум, ` +
           `ИКПУ ${pos.classCode ?? '—'}, НДС ${pos.vatPercent}%): ${reason}`,
       )
+      // ВАЖНО: всё равно добавляем позицию в matches с ПУСТЫМИ candidates.
+      // Иначе она существует только как текст в warnings — у кассира нет
+      // строки в UI и негде нажать «Подобрать вручную». С пустым
+      // candidates[] Receipt.tsx рисует строку «не подобрано» + кнопку
+      // ручного подбора. distributeDiscount/Bump её игнорируют (reduce по
+      // пустому candidates = 0). После ручного выбора replacePositionManual
+      // заполнит candidates (позиция уже в result.positions, индексируется).
+      matches.push({
+        source: pos,
+        candidates: [],
+        strategy: 'manual',
+        diffTiyin: 0,
+        warnings: [reason],
+        swappable: false,
+        alternatives: [],
+        selectedAlternativeIndex: -1,
+        splitLevel: 1,
+        canSplitMore: false,
+        splittable: false,
+      })
     }
   }
 

@@ -23,6 +23,7 @@ import { useNavigate, useParams } from 'react-router-dom'
 import { AlertCircle, ArrowLeft, Undo2 } from 'lucide-react'
 import {
   getDb,
+  getMsReceipt,
   getRefundByOriginalFiscalId,
   type FiscalReceiptRow,
   type FiscalRefundRow,
@@ -32,6 +33,8 @@ import {
   processRefund,
   RefundAlreadyExistsError,
 } from '@/lib/epos'
+import { extractPositions } from '@/lib/matcher'
+import type { MsRetailDemand } from '@/lib/moysklad'
 import {
   Badge,
   Button,
@@ -60,6 +63,12 @@ export default function Refund() {
 
   const [fiscalReceipt, setFiscalReceipt] = useState<FiscalReceiptRow | null>(null)
   const [items, setItems] = useState<OriginalItem[]>([])
+  // Позиции оригинального чека из МойСклад (что покупатель реально купил
+  // по кассе МС — до подмены ИКПУ). Кассир сверяет: вернулся именно этот товар.
+  const [msPositions, setMsPositions] = useState<
+    Array<{ name: string; quantity: number; total: number }>
+  >([])
+  const [msName, setMsName] = useState<string | null>(null)
   const [existing, setExisting] = useState<FiscalRefundRow | null>(null)
   const [defaultCash, setDefaultCash] = useState(0)
   const [defaultCard, setDefaultCard] = useState(0)
@@ -99,9 +108,31 @@ export default function Refund() {
       }
       setFiscalReceipt(fr)
 
-      // 2. Парсим request_json чтобы достать items.
+      // 2. Парсим request_json чтобы достать items (что ушло в ОФД).
       const parsedItems = parseItemsFromRequestJson(fr.request_json)
       setItems(parsedItems)
+
+      // 2b. Оригинальный чек МойСклад — что покупатель купил по кассе МС
+      // (до подмены). Кассир видит исходные позиции и сверяет возврат.
+      if (fr.ms_receipt_id) {
+        try {
+          const msr = await getMsReceipt(fr.ms_receipt_id)
+          if (msr) {
+            setMsName(msr.ms_name ?? null)
+            const rd = JSON.parse(msr.raw_json) as MsRetailDemand
+            const pos = extractPositions(rd)
+            setMsPositions(
+              pos.map((p) => ({
+                name: p.name,
+                quantity: p.quantity,
+                total: p.totalTiyin,
+              })),
+            )
+          }
+        } catch {
+          // Не критично — просто не покажем оригинал-МС блок.
+        }
+      }
 
       // 3. Проверка: уже был возврат?
       const ex = await getRefundByOriginalFiscalId(fiscalId)
@@ -257,10 +288,53 @@ export default function Refund() {
         </Card>
       )}
 
-      {/* Позиции оригинала */}
+      {/* Оригинальный чек из МойСклад — что покупатель реально купил
+          по кассе МС (до подмены ИКПУ). Кассир сверяет: тот ли товар. */}
+      {msPositions.length > 0 && (
+        <Card>
+          <Card.Header>
+            <Card.Title>
+              Оригинал из МойСклад{msName ? ` · чек ${msName}` : ''}
+            </Card.Title>
+            <Card.HeaderAction>
+              <Badge variant="info">{msPositions.length} позиций</Badge>
+            </Card.HeaderAction>
+          </Card.Header>
+          <table className="w-full text-body">
+            <thead className="border-b border-border bg-canvas">
+              <tr>
+                <th className="px-3 py-2.5 text-left text-caption font-medium text-ink-muted uppercase tracking-wide">
+                  Товар (как в МойСклад)
+                </th>
+                <th className="px-3 py-2.5 text-right text-caption font-medium text-ink-muted uppercase tracking-wide">
+                  Кол-во
+                </th>
+                <th className="px-3 py-2.5 text-right text-caption font-medium text-ink-muted uppercase tracking-wide">
+                  Сумма
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {msPositions.map((p, i) => (
+                <tr key={i} className="border-b border-border last:border-0">
+                  <td className="px-3 py-2.5 text-ink">{p.name}</td>
+                  <td className="px-3 py-2.5 text-right tabular-nums text-ink-muted">
+                    {p.quantity / 1000}
+                  </td>
+                  <td className="px-3 py-2.5 text-right tabular-nums text-ink">
+                    {tiyinToSumDisplay(p.total)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Card>
+      )}
+
+      {/* Позиции что реально ушли в ОФД (после подмены) — их и возвращаем */}
       <Card>
         <Card.Header>
-          <Card.Title>Что возвращаем</Card.Title>
+          <Card.Title>Что возвращаем (фискальные позиции)</Card.Title>
           <Card.HeaderAction>
             <Badge variant="info">{items.length} позиций</Badge>
           </Card.HeaderAction>

@@ -138,6 +138,17 @@ export default function Receipt() {
   }, [match])
 
   /**
+   * Есть ли позиция которую matcher не смог подобрать (пустой candidates[]).
+   * Такие теперь рисуются в таблице с кнопкой «Подобрать вручную», но
+   * фискализацию блокируем — чек неполный, сумма не сойдётся пока кассир
+   * не закроет позицию руками.
+   */
+  const hasUnmatched = useMemo(() => {
+    if (!match) return false
+    return match.positions.some((pm) => pm.candidates.length === 0)
+  }, [match])
+
+  /**
    * Тип оплаты из МойСклад — для бейджа над заголовком.
    * См. подробное описание правил в коммитах прошлых релизов.
    */
@@ -400,14 +411,17 @@ export default function Receipt() {
               disabled={
                 fiscalizing ||
                 match.positions.length === 0 ||
-                itemsWithoutIkpu.length > 0
+                itemsWithoutIkpu.length > 0 ||
+                hasUnmatched
               }
               onClick={doFiscalize}
               icon={!fiscalizing ? <Send size={14} /> : undefined}
               title={
-                itemsWithoutIkpu.length > 0
-                  ? `Невозможно фискализировать: ${itemsWithoutIkpu.length} товаров без ИКПУ`
-                  : undefined
+                hasUnmatched
+                  ? 'Есть неподобранные позиции — подберите их вручную'
+                  : itemsWithoutIkpu.length > 0
+                    ? `Невозможно фискализировать: ${itemsWithoutIkpu.length} товаров без ИКПУ`
+                    : undefined
               }
             >
               {testMode ? 'Тестовая фискализация' : 'Фискализировать'}
@@ -503,8 +517,26 @@ export default function Receipt() {
           sumDiff={match.totalDiffTiyin}
         >
           <PositionsTable
-            positions={match.positions.flatMap((pm, posIdx) =>
-              pm.candidates.map((c, candIdx) => {
+            positions={match.positions.flatMap((pm, posIdx): DisplayPosition[] => {
+              // Не подобрано (matcher ничего не нашёл) — одна строка-заглушка
+              // с кнопкой «Подобрать вручную». Без этого позиция была бы
+              // только в warnings, и кассир не смог бы её закрыть руками.
+              if (pm.candidates.length === 0) {
+                return [
+                  {
+                    name: pm.source.name,
+                    quantity: pm.source.quantity,
+                    total: pm.source.totalTiyin,
+                    vatPercent: pm.source.vatPercent,
+                    meta: pm.source.classCode ?? '— не подобрано —',
+                    matched: false,
+                    manual: pool
+                      ? { onPick: () => setManualPickerForPos(posIdx) }
+                      : undefined,
+                  },
+                ]
+              }
+              return pm.candidates.map((c, candIdx) => {
                 // Стрелки swap рисуем только на ПЕРВОМ candidate в группе
                 // и только когда позиция не дроблёная (splitLevel=1).
                 // При splitLevel>1 несколько строк — нечего свапать одной кнопкой.
@@ -609,8 +641,8 @@ export default function Receipt() {
                   split,
                   manual,
                 }
-              }),
-            )}
+              })
+            })}
           />
         </Side>
       </div>

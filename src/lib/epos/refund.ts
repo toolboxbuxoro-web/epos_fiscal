@@ -143,23 +143,38 @@ export async function processRefund(opts: ProcessRefundOptions): Promise<Process
   }
 
   // 5. Билдим refund payload (Items копируем из request_json оригинала).
+  //
+  // ⚠️ КРИТИЧНО для привязки к оригиналу в ОФД (иначе «бириктирилмаган»):
+  //
+  //   1. Имя поля — `refundInfo` (camelCase). Вся дока E-POS (mobile-api +
+  //      universal-communicator) показывает именно camelCase. PascalCase
+  //      `RefundInfo` Communicator ИГНОРИРУЕТ → refund уходит без привязки.
+  //      Шлём ОБА варианта (как с `spic` — belt & suspenders, лишний ключ
+  //      Communicator молча проигнорирует).
+  //
+  //   2. `dateTime` — строго 14 цифр YYYYMMDDHHMMSS без разделителей
+  //      (universal-communicator.md стр.111). `fiscal_datetime` оригинала
+  //      может быть «2026-05-16 09:54:18» (Go-style) или ISO — нормализуем.
   const refundInfo: JsonRpcRefundInfo = {
     terminalId: original.fr.terminal_id,
     receiptSeq: original.fr.receipt_seq,
-    // fiscal_datetime у нас формата YYYYMMDDHHMMSS — это то что нужно.
-    dateTime: original.fr.fiscal_datetime,
+    dateTime: toRefundDateTime(original.fr.fiscal_datetime),
     fiscalSign: original.fr.fiscal_sign,
   }
 
-  const refundReceipt: JsonRpcReceipt = {
+  // JsonRpcReceipt типизирован с `RefundInfo`, но шлём ещё и `refundInfo`
+  // (camelCase) — основной рабочий вариант по доке. Каст через unknown
+  // т.к. в интерфейсе нет lowercase-ключа (он намеренный alias на проводе).
+  const refundReceipt = {
     Time: formatGoTime(new Date()),
     // Items копируем как есть — те же ИКПУ, цены, скидки, НДС.
     // Это критично: ОФД сверяет с оригиналом, items должны быть идентичны.
     Items: originalReceipt.Items,
     ReceivedCash: refundCash,
     ReceivedCard: refundCard,
-    RefundInfo: refundInfo,
-  }
+    RefundInfo: refundInfo, // PascalCase (на всякий)
+    refundInfo, // camelCase — основной по доке E-POS
+  } as unknown as JsonRpcReceipt
 
   const eposUrl =
     (await getSetting(SettingKey.EposCommunicatorUrl)) ??
@@ -250,6 +265,23 @@ export async function processRefund(opts: ProcessRefundOptions): Promise<Process
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
+
+/**
+ * Нормализовать дату оригинала к строгому 14-значному YYYYMMDDHHMMSS
+ * (формат refundInfo.dateTime по universal-communicator.md стр.111).
+ *
+ * `fiscal_receipts.fiscal_datetime` хранится «как вернул Communicator»:
+ *   - «20260516095418»          (уже 14 цифр)        → как есть
+ *   - «2026-05-16 09:54:18»     (Go-style, пробел)   → убрать разделители
+ *   - «2026-05-16T09:54:18.000Z»(ISO с мс)           → цифры, первые 14
+ *
+ * Стратегия: выкинуть ВСЕ нецифры и взять первые 14. Это корректно для
+ * всех трёх форматов и не делает timezone-математику (Communicator и так
+ * отдаёт локальное время терминала Asia/Tashkent — пересчёт сломал бы).
+ */
+function toRefundDateTime(raw: string | null | undefined): string {
+  return (raw ?? '').replace(/\D/g, '').slice(0, 14)
+}
 
 interface OriginalContext {
   fr: FiscalReceiptRow
