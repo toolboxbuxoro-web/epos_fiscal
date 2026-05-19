@@ -26,6 +26,7 @@ import { Search, X } from 'lucide-react'
 import { Button } from '@/components/ui'
 import { tiyinToSumDisplay, milliQtyToDisplay } from '@/lib/format'
 import type { MatcherPool } from '@/lib/matcher'
+import { costWithVat } from '@/lib/matcher/strategies'
 import { searchPool, type SearchResult } from '@/lib/matcher/search'
 
 interface Props {
@@ -35,6 +36,13 @@ interface Props {
   positionName: string
   /** Сумма позиции из чека МС (тийины) — для quick-filter «по цене». */
   targetPriceTiyin: number
+  /**
+   * Кол-во позиции (миллидоли, 1000 = 1 шт). Нужно чтобы посчитать
+   * себестоимость с НДС за всё кол-во и заблокировать строки где
+   * продажа была бы в убыток (cost > targetPriceTiyin) — тот же
+   * инвариант что в replacePositionManual.
+   */
+  targetQuantityMilli: number
   /** Колбэк выбора товара. */
   onPick: (result: SearchResult) => void
   /** Закрытие без выбора. */
@@ -47,6 +55,7 @@ export function ManualPickerModal({
   pool,
   positionName,
   targetPriceTiyin,
+  targetQuantityMilli,
   onPick,
   onClose,
 }: Props) {
@@ -271,19 +280,61 @@ export function ManualPickerModal({
               <tbody>
                 {results.map((r) => {
                   const available = r.item.qty_received - r.item.qty_consumed
+                  // Себестоимость с НДС за нужное кол-во. Если выше суммы
+                  // позиции — продажа в убыток, выбор запрещён (тот же
+                  // инвариант что в replacePositionManual). Строка серая,
+                  // клик заблокирован, бейдж «убыток».
+                  const cost = costWithVat(
+                    r.item.unit_price_tiyin,
+                    r.item.vat_percent,
+                    targetQuantityMilli,
+                  )
+                  const loss = cost > targetPriceTiyin
                   return (
                     <tr
                       key={r.item.id}
-                      onClick={() => onPick(r)}
-                      style={{
-                        cursor: 'pointer',
-                        borderTop: '1px solid #e2e8f0',
+                      onClick={() => {
+                        if (loss) return
+                        onPick(r)
                       }}
-                      className="hover:bg-surface-hover"
+                      title={
+                        loss
+                          ? `Нельзя: себестоимость с НДС ${tiyinToSumDisplay(cost)} сум > суммы позиции ${tiyinToSumDisplay(targetPriceTiyin)} сум (продажа в убыток)`
+                          : undefined
+                      }
+                      style={{
+                        cursor: loss ? 'not-allowed' : 'pointer',
+                        borderTop: '1px solid #e2e8f0',
+                        opacity: loss ? 0.45 : 1,
+                        background: loss ? '#fef2f2' : undefined,
+                      }}
+                      className={loss ? '' : 'hover:bg-surface-hover'}
                     >
                       <td style={td}>
-                        <div className="text-ink" style={{ fontWeight: 500 }}>
+                        <div
+                          className="text-ink"
+                          style={{
+                            fontWeight: 500,
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 6,
+                          }}
+                        >
                           {r.item.name}
+                          {loss && (
+                            <span
+                              style={{
+                                fontSize: 10,
+                                fontWeight: 600,
+                                color: '#dc2626',
+                                background: '#fee2e2',
+                                borderRadius: 4,
+                                padding: '1px 5px',
+                              }}
+                            >
+                              убыток
+                            </span>
+                          )}
                         </div>
                       </td>
                       <td style={{ ...td, fontFamily: 'monospace', fontSize: 11 }}>

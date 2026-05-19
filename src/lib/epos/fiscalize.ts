@@ -1,5 +1,6 @@
 import {
   createMatch,
+  getFiscalReceiptByMsId,
   insertFiscalReceipt,
   setMsReceiptStatus,
   upsertMsReceipt,
@@ -67,6 +68,23 @@ export async function fiscalize(
 
   if (build.positions.length === 0) {
     throw new Error('Нечего отправлять в Communicator: пустой план')
+  }
+
+  // ── Defense-in-depth: уже фискализирован? ──────────────────────────
+  // UI (Receipt.tsx) уже дизейблит кнопку, но если кассир обойдёт UI
+  // (старая вкладка, гонка двойного клика) — здесь жёстко блокируем
+  // ДО отправки в Communicator. Двойная фискализация = двойной чек в
+  // ОФД + двойное списание остатков + дубль в ГНК.
+  if (opts.msReceiptId) {
+    const existing = await getFiscalReceiptByMsId(opts.msReceiptId).catch(
+      () => null,
+    )
+    if (existing) {
+      throw new AlreadyFiscalizedError(
+        existing.fiscal_sign,
+        existing.receipt_seq,
+      )
+    }
   }
   // matchedTotal — сумма к оплате (с учётом скидок если они применены).
   // = sum(priceTiyin - discountTiyin). Совпадает с rd.sum если включена
@@ -220,6 +238,21 @@ export async function fiscalize(
 
     // EPOS не выдал FiscalSign — отпускаем резерв.
     await releaseRemote(reserveResult.reservations, 'epos-failed').catch(() => {})
+
+    // Смена не открыта — Communicator вернул ERROR_ZREPORT_IS_NOT_OPEN
+    // (jsonRpcCode 36909). Подменяем на типизированную ошибку, чтобы UI
+    // показал понятное «откройте смену», а не сырой код.
+    const dataStr =
+      typeof eposExtra.data === 'string'
+        ? eposExtra.data
+        : JSON.stringify(eposExtra.data ?? '')
+    if (
+      eposExtra.code === 36909 ||
+      /ZREPORT_IS_NOT_OPEN/i.test(errMsg) ||
+      /ZREPORT_IS_NOT_OPEN/i.test(dataStr)
+    ) {
+      throw new ShiftNotOpenError()
+    }
     throw eposErr
   }
 
@@ -256,6 +289,38 @@ export async function fiscalize(
   await maybePrintReceipt(build, fiscal, receivedCash, receivedCard, false, false)
 
   return { fiscal, fiscalReceiptDbId, matchDbId }
+}
+
+/**
+ * Смена ККМ не открыта. Communicator отвечает ERROR_ZREPORT_IS_NOT_OPEN
+ * (jsonRpcCode 36909) на любой sale/refund при закрытой смене. UI ловит
+ * и показывает «Откройте смену» + кнопку в раздел Смена, вместо сырого кода.
+ */
+export class ShiftNotOpenError extends Error {
+  constructor() {
+    super(
+      'Смена ККМ не открыта. Откройте смену в разделе «Смена» перед фискализацией.',
+    )
+    this.name = 'ShiftNotOpenError'
+  }
+}
+
+/**
+ * Чек уже был фискализирован ранее. Бросается defense-in-depth guard'ом
+ * в `fiscalize()` если кассир обошёл UI-блокировку (старая вкладка,
+ * двойной клик). UI ловит и показывает «уже фискализирован FiscalSign…».
+ */
+export class AlreadyFiscalizedError extends Error {
+  constructor(
+    public readonly fiscalSign: string,
+    public readonly receiptSeq: string,
+  ) {
+    super(
+      `Чек уже фискализирован (FiscalSign ${fiscalSign}, чек № ${receiptSeq}). ` +
+        `Повторная фискализация запрещена.`,
+    )
+    this.name = 'AlreadyFiscalizedError'
+  }
 }
 
 /**

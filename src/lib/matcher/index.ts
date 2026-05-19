@@ -393,25 +393,63 @@ export function rebuildPositionWithSplit(
  *   - Swappable / splittable = false (ручной выбор — фиксируем)
  *   - Применяется distributeDiscount/Bump чтобы сумма чека сошлась
  *
- * Защита: проверяем что у inv_item достаточно остатка под `pos.quantity`.
- * Если нет — возвращаем result без изменений (UI должен показать toast).
+ * Защиты:
+ *   1. У inv_item достаточно остатка под `pos.quantity`.
+ *   2. **Себестоимость с НДС не выше суммы позиции** — нельзя продать в
+ *      убыток (нарушение инварианта матчера + продажа ниже себестоимости
+ *      юридически недопустима). Если кассир выбрал товар приходом 1М на
+ *      позицию 500к — отклоняем, UI показывает почему.
  *
  * Чистая функция — оригинальный `result` не мутируется.
  *
- * @returns обновлённый BuildMatchResult или null если manual pick невозможен
+ * @returns дискриминированный результат: ok=true с обновлённым match,
+ *          либо ok=false с причиной для понятного сообщения в UI.
  */
+export type ManualPickOutcome =
+  | { ok: true; result: BuildMatchResult }
+  | { ok: false; reason: 'invalid_index' }
+  | { ok: false; reason: 'not_enough_stock'; available: number; needed: number }
+  | { ok: false; reason: 'below_cost'; costTiyin: number; targetTiyin: number }
+
 export function replacePositionManual(
   result: BuildMatchResult,
   positionIndex: number,
   esfItem: import('@/lib/db').EsfItemWithAvailable,
   opts: MatcherOptions = {},
-): BuildMatchResult | null {
-  if (positionIndex < 0 || positionIndex >= result.positions.length) return null
+): ManualPickOutcome {
+  if (positionIndex < 0 || positionIndex >= result.positions.length) {
+    return { ok: false, reason: 'invalid_index' }
+  }
   const target = result.positions[positionIndex]!
   const pos = target.source
 
   const available = esfItem.qty_received - esfItem.qty_consumed
-  if (available < pos.quantity) return null
+  if (available < pos.quantity) {
+    return {
+      ok: false,
+      reason: 'not_enough_stock',
+      available,
+      needed: pos.quantity,
+    }
+  }
+
+  // Защита от продажи ниже себестоимости с НДС. priceTiyin позиции =
+  // pos.totalTiyin (что заплатил клиент по МС). Если себестоимость с НДС
+  // выбранного товара за нужное кол-во ВЫШЕ этой суммы — продажа в убыток,
+  // запрещаем (юр. + ломает инвариант distributeDiscount cost-floor).
+  const cost = costWithVat(
+    esfItem.unit_price_tiyin,
+    esfItem.vat_percent,
+    pos.quantity,
+  )
+  if (cost > pos.totalTiyin) {
+    return {
+      ok: false,
+      reason: 'below_cost',
+      costTiyin: cost,
+      targetTiyin: pos.totalTiyin,
+    }
+  }
 
   // Создаём candidate с ценой 1:1 из чека МС
   const candidate = {
@@ -467,12 +505,15 @@ export function replacePositionManual(
   )
 
   return {
-    ...result,
-    positions: newPositions,
-    matchedTotalTiyin: matchedTotal,
-    totalDiffTiyin: matchedTotal - target_sum,
-    overallStrategy: pickOverallStrategy(newPositions.map((p) => p.strategy)),
-    canAutoFiscalize: false, // manual = ручная проверка, отключаем auto
+    ok: true,
+    result: {
+      ...result,
+      positions: newPositions,
+      matchedTotalTiyin: matchedTotal,
+      totalDiffTiyin: matchedTotal - target_sum,
+      overallStrategy: pickOverallStrategy(newPositions.map((p) => p.strategy)),
+      canAutoFiscalize: false, // manual = ручная проверка, отключаем auto
+    },
   }
 }
 
@@ -719,7 +760,12 @@ function distributeBump(
   let remaining = targetSum - totalNet
   if (remaining <= 0) return []
 
-  const maxPerItem = opts.maxDiscountPerItemTiyin ?? 200_000 // 2000 сум
+  // Надбавка использует ОТДЕЛЬНЫЙ (больший) лимит — см. maxBumpPerItemTiyin
+  // в MatcherOptions. Надбавка = бо́льшая наценка, безопасна; cap 2000 сум
+  // от discount не закрывал разрывы 20-54к на дырявом складе → минус.
+  const maxPerItem =
+    opts.maxBumpPerItemTiyin ??
+    Math.max(opts.maxDiscountPerItemTiyin ?? 0, 1_000_000) // 10000 сум
 
   type Slot = { c: typeof candidates[number]; bumped: number }
   const slots: Slot[] = candidates.map((c) => ({ c, bumped: 0 }))

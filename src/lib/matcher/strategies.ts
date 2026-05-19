@@ -538,7 +538,11 @@ export function tryMultiItem(
   // Нулевая позиция — не подбираем, см. tryPassthrough.
   if (pos.totalTiyin <= 0) return null
   const tolerance = opts.toleranceTiyin ?? 0
-  const maxItems = opts.maxMultiItem ?? 5
+  // Дефолт 10 (было 5): склады бывают «дырявые» по ценам, и чтобы
+  // собрать сумму из мелочи (товары по 2-8к на чек 100-200к) нужно
+  // больше слотов. 10 — баланс «достаёт больше чеков» vs «чек на ленте
+  // не из 20 строк». При нехватке кассир добирает ручным подбором.
+  const maxItems = opts.maxMultiItem ?? 10
   const strictVat = opts.vatStrict === true
 
   const filtered = strictVat

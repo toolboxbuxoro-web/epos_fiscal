@@ -19,13 +19,14 @@ import {
 } from 'lucide-react'
 import {
   getDb,
+  getFiscalReceiptByMsId,
   getMsReceipt,
   getSetting,
   setMsReceiptStatus,
   SettingKey,
   now,
 } from '@/lib/db'
-import type { MsReceiptRow } from '@/lib/db/types'
+import type { FiscalReceiptRow, MsReceiptRow } from '@/lib/db/types'
 import {
   buildMatch,
   extractPositions,
@@ -38,7 +39,12 @@ import {
 } from '@/lib/matcher'
 import type { MatcherOptions } from '@/lib/matcher/types'
 import { ManualPickerModal } from './Receipt/ManualPickerModal'
-import { fiscalize, InventoryConflictError } from '@/lib/epos'
+import {
+  fiscalize,
+  AlreadyFiscalizedError,
+  InventoryConflictError,
+  ShiftNotOpenError,
+} from '@/lib/epos'
 import {
   MoyskladClient,
   enrichWithVariants,
@@ -84,6 +90,15 @@ export default function Receipt() {
   const [error, setError] = useState<string | null>(null)
   const [fiscalizing, setFiscalizing] = useState(false)
   const [testMode, setTestMode] = useState(false)
+  /**
+   * Если этот ms_receipt УЖЕ фискализирован — храним фискальный чек.
+   * Блокирует повторную фискализацию (двойной чек в ОФД = двойное
+   * списание + дубль в ГНК). Кассир приходит сюда из Чеков → внутрь.
+   */
+  const [alreadyFiscalized, setAlreadyFiscalized] =
+    useState<FiscalReceiptRow | null>(null)
+  /** Communicator сказал «смена не открыта» — баннер с кнопкой в /zreport. */
+  const [shiftNotOpen, setShiftNotOpen] = useState(false)
   /**
    * server_item_id'ы которые сервер отказал на reserve (другой магазин
    * успел забрать). При rematch matcher их игнорирует — иначе сразу
@@ -182,6 +197,15 @@ export default function Receipt() {
       }
       setReceipt(r)
 
+      // Уже фискализирован? Проверяем ДО построения подбора — баннер +
+      // дизейбл кнопки. Защита от повторной фискализации (двойной чек ОФД).
+      const existingFiscal = await getFiscalReceiptByMsId(r.id).catch(() => null)
+      if (existingFiscal || r.status === 'fiscalized') {
+        setAlreadyFiscalized(existingFiscal ?? null)
+      } else {
+        setAlreadyFiscalized(null)
+      }
+
       let parsed = JSON.parse(r.raw_json) as MsRetailDemand
 
       // МС в list-запросе не отдаёт inline positions. Если их нет —
@@ -235,7 +259,12 @@ export default function Receipt() {
         }
       }
 
-      const DEFAULT_TOLERANCE_TIYIN = 100_000
+      // Дефолт 500k тийинов (5000 сум), было 100k (1000 сум). Жёсткий
+      // ±1000 при округлении цен до 1000 и редком складе почти не давал
+      // совпадений. ±5000 + distributeBump закрывает остаток. В чек всё
+      // равно пишется pos.totalTiyin (что заплатил клиент), так что
+      // расширение безопасно. Меняется через Настройки если нужно.
+      const DEFAULT_TOLERANCE_TIYIN = 500_000
       const tolStr = await getSetting(SettingKey.MatchToleranceTiyin)
       const tolerance =
         tolStr != null && tolStr !== ''
@@ -314,6 +343,7 @@ export default function Receipt() {
     if (!match || !receipt) return
     setFiscalizing(true)
     setError(null)
+    setShiftNotOpen(false)
     try {
       const result = await fiscalize(match, { msReceiptId: receipt.id })
       if (testMode) {
@@ -351,6 +381,20 @@ export default function Receipt() {
         setTimeout(() => {
           void load()
         }, 300)
+        return
+      }
+      // Уже фискализирован (обошли UI-блок) — НЕ failed, просто
+      // показываем баннер и перезагружаем чтобы alreadyFiscalized встал.
+      if (e instanceof AlreadyFiscalizedError) {
+        toast.error(e.message, { duration: 6000 })
+        void load()
+        return
+      }
+      // Смена не открыта — НЕ failed (чек валиден, просто нет смены).
+      // Показываем баннер с кнопкой перехода в раздел Смена.
+      if (e instanceof ShiftNotOpenError) {
+        setShiftNotOpen(true)
+        toast.error(e.message, { duration: 6000 })
         return
       }
       setError(e instanceof Error ? e.message : String(e))
@@ -412,19 +456,26 @@ export default function Receipt() {
                 fiscalizing ||
                 match.positions.length === 0 ||
                 itemsWithoutIkpu.length > 0 ||
-                hasUnmatched
+                hasUnmatched ||
+                !!alreadyFiscalized
               }
               onClick={doFiscalize}
               icon={!fiscalizing ? <Send size={14} /> : undefined}
               title={
-                hasUnmatched
-                  ? 'Есть неподобранные позиции — подберите их вручную'
-                  : itemsWithoutIkpu.length > 0
-                    ? `Невозможно фискализировать: ${itemsWithoutIkpu.length} товаров без ИКПУ`
-                    : undefined
+                alreadyFiscalized
+                  ? 'Чек уже фискализирован — повторная фискализация запрещена'
+                  : hasUnmatched
+                    ? 'Есть неподобранные позиции — подберите их вручную'
+                    : itemsWithoutIkpu.length > 0
+                      ? `Невозможно фискализировать: ${itemsWithoutIkpu.length} товаров без ИКПУ`
+                      : undefined
               }
             >
-              {testMode ? 'Тестовая фискализация' : 'Фискализировать'}
+              {alreadyFiscalized
+                ? 'Уже фискализирован'
+                : testMode
+                  ? 'Тестовая фискализация'
+                  : 'Фискализировать'}
             </Button>
           </div>
         }
@@ -440,6 +491,72 @@ export default function Receipt() {
             qrSum={rd.qrSum ?? 0}
           />
         </div>
+      )}
+
+      {shiftNotOpen && (
+        <Card className="border-warning/30 bg-warning-soft">
+          <Card.Body className="flex items-start gap-3">
+            <TriangleAlert size={18} className="text-warning shrink-0 mt-0.5" />
+            <div className="flex-1">
+              <div className="text-body font-medium text-warning">
+                Смена ККМ не открыта
+              </div>
+              <div className="mt-1 text-caption text-ink">
+                Communicator отказал: фискализация невозможна без открытой
+                смены. Откройте смену в разделе «Смена», затем повторите
+                фискализацию.
+              </div>
+              <div className="mt-2">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => nav('/zreport')}
+                >
+                  Перейти в Смену
+                </Button>
+              </div>
+            </div>
+          </Card.Body>
+        </Card>
+      )}
+
+      {alreadyFiscalized && (
+        <Card className="border-danger/30 bg-danger-soft">
+          <Card.Body className="flex items-start gap-3">
+            <AlertCircle size={18} className="text-danger shrink-0 mt-0.5" />
+            <div className="flex-1">
+              <div className="text-body font-medium text-danger">
+                Этот чек уже фискализирован
+              </div>
+              <div className="mt-1 text-caption text-ink">
+                FiscalSign{' '}
+                <span className="font-mono">
+                  {alreadyFiscalized.fiscal_sign}
+                </span>{' '}
+                · чек № {alreadyFiscalized.receipt_seq} ·{' '}
+                {formatDateTime(alreadyFiscalized.fiscalized_at)}. Повторная
+                фискализация запрещена (был бы двойной чек в ОФД). Если нужно
+                вернуть товар — оформите возврат.
+              </div>
+              <div className="mt-2 flex gap-2">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => nav('/history')}
+                >
+                  В Историю
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => nav(`/refund/${alreadyFiscalized.id}`)}
+                >
+                  Оформить возврат
+                </Button>
+              </div>
+            </div>
+          </Card.Body>
+        </Card>
       )}
 
       {testMode && (
@@ -665,12 +782,67 @@ export default function Receipt() {
         </Card>
       )}
 
+      {(() => {
+        const totalPos = sourcePositions.length
+        const matchedPos = match.positions.filter(
+          (pm) => pm.candidates.length > 0,
+        ).length
+        const shortfall =
+          match.totalDiffTiyin < 0 ? -match.totalDiffTiyin : 0
+        if (matchedPos >= totalPos && shortfall === 0) return null
+        return (
+          <Card className="border-warning/30 bg-warning-soft">
+            <Card.Body className="flex items-start gap-3">
+              <TriangleAlert
+                size={18}
+                className="text-warning shrink-0 mt-0.5"
+              />
+              <div className="flex-1">
+                <div className="text-body font-medium text-warning">
+                  Подбор неполный: {matchedPos} из {totalPos} позиций
+                  {shortfall > 0 &&
+                    `, не хватает ${tiyinToSumDisplay(shortfall)} сум`}
+                </div>
+                <div className="mt-1 text-caption text-ink">
+                  Склад не покрывает сумму автоматически. Что делать:
+                </div>
+                <ul className="mt-1 space-y-0.5 text-caption text-ink">
+                  <li className="flex gap-2">
+                    <span className="text-warning shrink-0">·</span>
+                    <span>
+                      <strong>Подобрать вручную</strong> — кнопка на
+                      неподобранной позиции (рекомендуется)
+                    </span>
+                  </li>
+                  <li className="flex gap-2">
+                    <span className="text-warning shrink-0">·</span>
+                    <span>
+                      Дозаполнить склад в mytoolbox (больше приходов с
+                      разными ценами)
+                    </span>
+                  </li>
+                  <li className="flex gap-2">
+                    <span className="text-warning shrink-0">·</span>
+                    <span>
+                      Поднять «допуск по сумме» в Настройках если такое
+                      часто
+                    </span>
+                  </li>
+                </ul>
+              </div>
+            </Card.Body>
+          </Card>
+        )
+      })()}
+
       {match.warnings.length > 0 && (
         <Card className="border-warning/20 bg-warning-soft">
           <Card.Header className="border-warning/20">
             <div className="flex items-center gap-2">
               <TriangleAlert size={16} className="text-warning" />
-              <Card.Title className="text-warning">Предупреждения</Card.Title>
+              <Card.Title className="text-warning">
+                Предупреждения (детали)
+              </Card.Title>
             </div>
           </Card.Header>
           <Card.Body>
@@ -693,26 +865,41 @@ export default function Receipt() {
           pool={pool}
           positionName={match.positions[manualPickerForPos]!.source.name}
           targetPriceTiyin={match.positions[manualPickerForPos]!.source.totalTiyin}
+          targetQuantityMilli={match.positions[manualPickerForPos]!.source.quantity}
           onClose={() => setManualPickerForPos(null)}
           onPick={(result) => {
-            const next = replacePositionManual(
+            const outcome = replacePositionManual(
               match,
               manualPickerForPos,
               result.item,
               matcherOpts,
             )
-            if (next) {
-              setMatch(next)
+            if (outcome.ok) {
+              setMatch(outcome.result)
               setManualPickerForPos(null)
-              toast.success(
-                `Выбран вручную: ${result.item.name}`,
-                { duration: 3000 },
-              )
-            } else {
+              toast.success(`Выбран вручную: ${result.item.name}`, {
+                duration: 3000,
+              })
+              return
+            }
+            if (outcome.reason === 'below_cost') {
               toast.error(
-                `Не получилось подобрать «${result.item.name}» — остатка меньше чем нужно (нужно ${milliQtyToDisplay(match.positions[manualPickerForPos]!.source.quantity)} шт).`,
+                `Нельзя выбрать «${result.item.name}»: себестоимость с НДС ` +
+                  `${tiyinToSumDisplay(outcome.costTiyin)} сум выше суммы позиции ` +
+                  `${tiyinToSumDisplay(outcome.targetTiyin)} сум — продажа в убыток запрещена.`,
+                { duration: 6000 },
+              )
+            } else if (outcome.reason === 'not_enough_stock') {
+              toast.error(
+                `Не получилось подобрать «${result.item.name}» — остатка ` +
+                  `${milliQtyToDisplay(outcome.available)} шт, нужно ` +
+                  `${milliQtyToDisplay(outcome.needed)} шт.`,
                 { duration: 5000 },
               )
+            } else {
+              toast.error('Не получилось подобрать (некорректная позиция).', {
+                duration: 5000,
+              })
             }
           }}
         />
