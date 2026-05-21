@@ -50,21 +50,22 @@ Polling МойСклад (раз в 30 сек, фильтр retailStore)
 ms_receipts (raw JSON чеков из МС)
        │
        ▼
-Matcher (4 стратегии: linked-ms / passthrough / price-bucket / multi-item)
-       │  ↑                                  + manual picker (UI fallback)
+Matcher (4 стратегии classic + holistic fallback + manual picker)
+       │  ↑    targetSumOverrideTiyin ← Click/Payme exclude (UI поле)
        │  └── читает esf_items (mirror серверного inv_items, sync c reconcile)
        ▼
 matches + match_items (план: чем подменить)
        │
        ▼  + AlreadyFiscalizedError guard (запрет повторной фискализации)
        ▼  + ShiftNotOpenError detect (понятный баннер «откройте смену»)
+       ▼  + CardKindModal (Korporativ/Jismoniy shaxs — только на печать)
 fiscalize() → JsonRpcEposClient.sendSaleReceipt (Api.SendSaleReceipt)
+       │       + excludePaymentTiyin (вычитается из noCashSum при split)
+       ▼
+fiscal_receipts (FiscalSign, card_kind, excluded_payment_tiyin для аудита)
        │
        ▼
-fiscal_receipts (TerminalID, ReceiptSeq, FiscalSign, QRCodeURL)
-       │
-       ▼
-printer.rs::print_fiscal_receipt (ESC/POS на Xprinter)
+printer.rs::print_fiscal_receipt (ESC/POS + Karta turi + сумма без exclude)
 
 Параллельная ветка — смена ККМ (роут /zreport):
    getZReportInfo (раз в 30 сек) → UI данные
@@ -334,6 +335,89 @@ Matcher выбирает товары так, чтобы суммарно сов
 - mixed → пропорциональный split от `cash:(card+qr)`.
 
 В UI Receipt.tsx — бейдж типа оплаты с суммами.
+
+## Click/Payme — частичная фискализация
+
+Магазин в РУз часто принимает оплату через **Click / Payme / Apelsin** —
+эти электронные платежи **НЕ фискализируются** через ОФД (магазин ведёт
+их отдельно, обычно на упрощёнке или через другое юр.лицо). Нужен
+механизм исключить такую сумму из фискального чека.
+
+### Семантика
+
+Кассир в Receipt.tsx видит мини-карточку «Сумма через Click/Payme» с
+input-полем. Вводит сумму электронной оплаты — matcher пересобирает
+план на оставшуюся (rd.sum − exclude), фискальный чек уходит в ОФД
+только на эту меньшую сумму.
+
+Пример: МС-чек 300 000 (150к нал + 150к Click) → кассир вводит 150 000
+в поле → фискальный чек = 150 000 нал → ОФД получает 150 000.
+
+### Flow
+
+```
+Receipt.tsx
+  ├─ excludeTiyin state (default 0)
+  ├─ input + debounced 400ms → load() → buildMatch
+  │
+  ▼  opts.targetSumOverrideTiyin = rd.sum − excludeTiyin
+matcher/index.ts::buildMatch
+  ├─ effectiveTarget = override ?? receipt.sum
+  ├─ scaling позиций пропорционально к effectiveTarget
+  ├─ holistic.planHolistic(effectiveTarget, ...) — если fallback нужен
+  ├─ distributeDiscount/Bump → targetSum = effectiveTarget
+  ▼  matchedTotal ≈ effectiveTarget
+fiscalize() opts.excludePaymentTiyin
+  ├─ determinePaymentFromMs(rd, matchedTotal, excludePayment):
+  │    cash = rd.cashSum (как есть)
+  │    effectiveCard = max(0, rd.noCashSum + rd.qrSum − excludePayment)
+  │    total = cash + effectiveCard
+  │    receivedCash/Card = пропорция от matchedTotal по этому split
+  │
+  ├─ Api.SendSaleReceipt → ОФД (только фискальная часть)
+  ▼
+fiscal_receipts INSERT:
+  excluded_payment_tiyin = excludePayment  ← для аудита/отчётов
+  card_kind                                 ← (если карта была)
+```
+
+### Граничные случаи
+
+| Кейс | Поведение |
+|---|---|
+| `exclude = 0` | Всё как раньше, override не передаётся в matcher |
+| `0 < exclude < rd.sum` | Фискальный чек на (rd.sum − exclude). Кнопка «Фискализировать» |
+| `exclude >= rd.sum` | Effective = 0. Кнопка меняется на **«Отметить как не фискальный»** → `ms_receipts.status='not_required'`, ОФД ничего не получает |
+| `exclude > noCashSum + qrSum` | Предупреждение в UI: «больше безналичной части МС». Не блок — кассир знает что делает. effectiveCard кэпится на 0 |
+| `exclude < 0` или `> rd.sum` | Игнорируется (input заклампован; override в matcher тоже отбрасывается) |
+
+### Refund / reprint
+
+- **Refund** работает с **фискальным** итогом (150к), не с МС (300к).
+  Excluded часть Click возвращается через кабинет Click — **вне нашего флоу**.
+- **Reprint копии** из Истории — берёт сумму из `request_json`
+  (это 150к, что ушло в ОФД). Никаких пересчётов.
+- **excluded_payment_tiyin** хранится в БД для отчётов «сколько было
+  Click/Payme за день/месяц» (отчёты в Phase 2, поле уже сохраняется).
+
+### Юр.аспект
+
+МС-чек 300к, фискальный 150к → расхождение видно при сверке. Магазин
+принимает риск перед ГНК. Та же серая зона как и подмена ИКПУ. Юзер
+дал на это согласие, программа — инструмент.
+
+### Файлы
+
+- `src/lib/matcher/types.ts` — `MatcherOptions.targetSumOverrideTiyin`
+- `src/lib/matcher/index.ts` — `effectiveTarget` в `buildMatch` +
+  `recalculateAfterSwap` / `rebuildPositionWithSplit` / `replacePositionManual`
+- `src/lib/epos/fiscalize.ts` — `FiscalizeOptions.excludePaymentTiyin`,
+  `determinePaymentFromMs` с третьим параметром
+- `src/lib/db/types.ts` — `FiscalReceiptRow.excluded_payment_tiyin`,
+  `MsReceiptStatus` += `'not_required'`
+- `src/lib/db/fiscal-receipts.ts` — INSERT с новой колонкой
+- `src/routes/Receipt.tsx` — input UI + `markNotRequired()` handler
+- `src-tauri/migrations/010_fiscal_receipts_excluded_payment.sql` — ALTER ADD COLUMN
 
 ## Тестовый режим (`SettingKey.TestMode`)
 
@@ -700,6 +784,10 @@ src-tauri/
     007_force_jsonrpc_url.sql ← форсим http://localhost:3448/rpc/api
     008_refunds.sql       ← fiscal_refunds (UNIQUE original_fiscal_id) +
                             колонка op_type в inv_pending_confirms (confirm/unconsume)
+    009_fiscal_receipts_card_kind.sql ← + card_kind ('fiz'|'corp'|NULL) для
+                                          печати «Karta turi» на refund/reprint
+    010_fiscal_receipts_excluded_payment.sql ← + excluded_payment_tiyin
+                            (тийины Click/Payme, не пошедшие в ОФД, для аудита)
 src/
   lib/
     db/                   ← SQLite, типы и DAO (SettingKey enum)
@@ -819,19 +907,22 @@ docs/
 | matcher не подбирал — minus тыс. сум | Дырявый склад + жёсткий tolerance 1000 сум + общий bump cap 2000 не закрывал разрывы 20-54к | tolerance дефолт 500_000 тийинов (5000 сум); maxMultiItem 5→10; отдельный `maxBumpPerItemTiyin` 1_000_000 (10000 сум). Что не добралось — manual picker. UX-баннер «подобрано N/M, не хватает X» |
 | Неподобранные позиции жили только в `warnings` (текст), manual picker недостижим | `match.positions` содержал только matched | Теперь buildMatch добавляет позицию с пустым `candidates[]` → UI рисует строку «не подобрано» + кнопку manual; фискализация блокирована пока `hasUnmatched` |
 | Бухгалтер-упрощенец шлёт vat=0 в ЭСФ, но магазин на общем режиме продаёт с 12% | inv_item.vat_percent — это ставка ПОСТАВЩИКА, не магазина | `SettingKey.DefaultVatPercent` (default 12) → override всех vat в `loadMatcherPool` |
+| Holistic не сошёлся на нестандартном шаге округления (`roundUpToSum != 1000`) | DP_BUCKET_TIYIN зашит как 100_000 (=1000 сум). При шаге 250 selling-цены не кратны bucket → `dpExactSum` возвращает null | Фаза 3 (closest-below + bump) закрывает delta до `maxBumpPerItemTiyin`. Если магазин использует step≠1000 — поднять `maxBumpPerItemTiyin` в Настройках |
+| Сумма МС-чека и фискального чека различаются (Click/Payme exclude) | Магазин принимает электронные платежи отдельно от ОФД; кассир вручную исключает в Receipt.tsx | Поле «Сумма через Click/Payme» → `targetSumOverrideTiyin` в matcher; `excludePaymentTiyin` в fiscalize → корректирует payment split (вычитает из noCashSum/qrSum, cash не трогает) + сохраняет в `fiscal_receipts.excluded_payment_tiyin` |
+| Refund / reprint копии должны показывать тот же тип карты что и оригинал | Без сохранения тип терялся при печати refund/копии | Migration 009 → колонка `fiscal_receipts.card_kind`. fiscalize.ts сохраняет `opts.cardKind`. refund.ts + History.tsx читают из БД и кладут в `karta_turi` ReceiptData |
 
 ## Открытые вопросы
 
 - **VAT-формула**: по умолчанию `vat = total * percent / (100 + percent)` (НДС включён в цену). Если у магазина НДС начисляется сверху — нужно поменять `vatIncluded` → `vatAddedOn` в `matcher/strategies.ts`.
 - **Ключи подписи**: `~/.tauri/epos-fiscal.key` живёт только на одной машине разработчика. Если потеряем — нужно перевыпустить и заново публиковать клиентам (auto-update сломается). Бэкап ключа — обязательно.
 
-## Текущее состояние (на 2026-05-19)
+## Текущее состояние (на 2026-05-21)
 
 ### Версии
 
 - **Последний released tag:** `v0.10.18` (12.05.2026) — на этом сидят все 4 магазина в проде
-- **Dev-сборка (текущая):** `0.10.29` — НЕ тегнута. Авто-апдейт на магазины НЕ идёт. Для теста — dev-build `.exe` через `gh workflow run dev-build.yml` (см. `release:dev` в package.json)
-- **Накопленные фичи между 0.10.18 → 0.10.29 ждут production-тег** (8 крупных feature/fix коммитов)
+- **Dev-сборка (текущая):** `0.10.29` (в package.json), ветка `dev-test/holistic-phase1`. НЕ тегнута. Авто-апдейт на магазины НЕ идёт. Для теста — dev-build `.exe` через push в `dev-test/**` или `gh workflow run dev-build.yml`
+- **Накопленные фичи между 0.10.18 → 0.10.30 ждут production-тег** (11 крупных feature/fix коммитов)
 
 ### ✅ Что готово и в коде (0.10.29)
 
@@ -855,6 +946,7 @@ docs/
 | 0.10.27 | **Unconsume retry** — closes критическую дыру «refund терял остаток»: listFiscalOk фильтрует op_type='confirm', retryUnconsumePending отдельный обработчик. Backend mytoolbox: POST /api/v1/inventory/unconsume атомарный+идемпотентный |
 | 0.10.28 | Refund **привязка к оригиналу** (бириктирилган): поле `refundInfo` camelCase (оба варианта), `dateTime` нормализован к 14 цифрам; manual picker для **неподобранных** позиций (раньше только в warnings); карточка «Оригинал из МойСклад» в /refund |
 | 0.10.29 | **AlreadyFiscalizedError** (блок повторной фискализации из Чеков, UI + defense-in-depth); **ShiftNotOpenError** (понятный баннер на ZREPORT_IS_NOT_OPEN); manual picker **cost floor** (строки-убытки серые + бейдж); **тюнинг matcher** (maxMultiItem 5→10, tolerance 100k→500k, отдельный maxBumpPerItemTiyin=10000 сум); UX-баннер «подобрано N/M» |
+| 0.10.30 *(в работе)* | **Holistic matcher** — целостный подбор на сумму чека (фаза 1 greedy + фаза 2 DP exact-sum + bump delta), fallback при разреженном пуле; `SettingKey.MatcherMode` с дефолтом `'auto'`. **«Karta turi»** — модалка перед фискализацией при оплате картой (Jismoniy shaxs / Korporativ), печать на ленте, сохранение в `fiscal_receipts.card_kind` (migration 009) для refund/reprint. **Click/Payme exclude** — поле в Receipt.tsx позволяет исключить сумму электронной оплаты из ОФД; matcher пересобирает план на остаток через `targetSumOverrideTiyin`; `excluded_payment_tiyin` сохраняется в БД (migration 010) для аудита; при exclude=rd.sum кнопка меняется на «Отметить как не фискальный» (`ms_receipts.status='not_required'`) |
 
 ### 🔴 Что критично проверить на проде перед тегом
 
@@ -869,7 +961,9 @@ docs/
 - **Polling `retailreturn` из МС** (вариант «А» — отдельный поллер на refund-сущность МС).
 - **Refund EPS** (PAYME/CLICK/UZUM rollback) — refundEPS метод. Сейчас refund только cash/card.
 - **Sidebar пункт «Возвраты»** (список всех `fiscal_refunds` глобально для админа).
-- **Тег `v0.10.29`** для production раскатки на все магазины. Сейчас 4 магазина сидят на 0.10.18 — отстают на 11 версий.
+- **Тег `v0.10.30`** для production раскатки на все магазины. Сейчас 4 магазина сидят на 0.10.18 — отстают на 12 версий.
+- **Отчёт «Click/Payme за период»** — суммировать `fiscal_receipts.excluded_payment_tiyin` по датам. Сейчас поле сохраняется, отчёт — Phase 2.
+- **Помечать `not_required` чеки в МС** — отдельным статусом или примечанием, чтобы бухгалтер видел что мы сознательно не фискализировали.
 
 ### 🔑 Безопасность (TODO)
 
