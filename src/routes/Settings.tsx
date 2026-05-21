@@ -57,6 +57,7 @@ interface FormState {
   matchToleranceTiyin: string
   autoFiscalize: 'true' | 'false'
   replacementEnabled: 'true' | 'false'
+  matcherMode: 'auto' | 'classic' | 'holistic' | 'off'
   // Ценообразование (применяется к товарам из справочника при подборе)
   markupPercent: string
   roundUpToSum: string
@@ -93,6 +94,7 @@ const empty: FormState = {
   matchToleranceTiyin: '0',
   autoFiscalize: 'false',
   replacementEnabled: 'true',
+  matcherMode: 'auto',
   markupPercent: '10',
   roundUpToSum: '1000',
   defaultVatPercent: '12',
@@ -196,6 +198,10 @@ export default function Settings() {
         | 'true'
         | 'false',
       matchToleranceTiyin: all[SettingKey.MatchToleranceTiyin] ?? '100000',
+      matcherMode: ((): 'auto' | 'classic' | 'holistic' | 'off' => {
+        const v = all[SettingKey.MatcherMode]
+        return v === 'classic' || v === 'holistic' || v === 'off' ? v : 'auto'
+      })(),
       markupPercent: all[SettingKey.MarkupPercent] ?? '10',
       roundUpToSum: all[SettingKey.RoundUpToSum] ?? '1000',
       defaultVatPercent: all[SettingKey.DefaultVatPercent] ?? '12',
@@ -333,6 +339,7 @@ export default function Settings() {
         [SettingKey.PrinterName]: form.printerName,
         [SettingKey.PrinterAutoPrint]: form.printerAutoPrint,
         [SettingKey.MatchToleranceTiyin]: form.matchToleranceTiyin,
+        [SettingKey.MatcherMode]: form.matcherMode,
         [SettingKey.MarkupPercent]: form.markupPercent,
         [SettingKey.RoundUpToSum]: form.roundUpToSum,
         [SettingKey.DefaultVatPercent]: form.defaultVatPercent,
@@ -785,6 +792,41 @@ export default function Settings() {
       </Section>
 
       <Section title="Правила подбора">
+        <Field label="Режим подбора">
+          <Select
+            value={form.matcherMode}
+            onChange={(e) =>
+              setField(
+                'matcherMode',
+                e.target.value as 'auto' | 'classic' | 'holistic' | 'off',
+              )
+            }
+          >
+            <option value="auto">
+              Авто (рекомендуется) — classic + holistic при провале
+            </option>
+            <option value="classic">
+              Только classic — позиция-в-позицию (старое поведение)
+            </option>
+            <option value="holistic">
+              Только holistic — всегда собирать целостно на сумму
+            </option>
+            <option value="off">
+              Выключен — никакого авто-подбора, только ручной
+            </option>
+          </Select>
+          <div className="mt-1 text-xs text-ink-muted">
+            <strong>Авто</strong> сначала пробует classic (одна МС-позиция →
+            один товар), а если в пуле нет подходящих кандидатов — переключается
+            в <strong>holistic</strong>: подбирает товары совокупно на сумму
+            всего чека (крупные + филлеры, точная сборка через DP). Это спасает
+            кассира от ручного подбора когда склад «дырявый».
+            <br />
+            <strong>Только classic</strong> воспроизводит поведение до 0.10.30
+            — при пустом пуле кассир увидит «не подобрано» и должен подобрать
+            вручную через модалку.
+          </div>
+        </Field>
         <Field label="Допуск по сумме (тийины)">
           <Input
             type="number"

@@ -11,19 +11,23 @@ import {
   vatIncluded,
   type MatcherPool,
 } from './strategies'
+import { planHolistic } from './holistic'
 import type {
   BuildMatchResult,
+  MatcherMode,
   MatcherOptions,
   NormalizedPosition,
   PositionMatch,
 } from './types'
 import type { MatchStrategy } from '@/lib/db/types'
 import { countEsfItems } from '@/lib/db'
+import { log } from '@/lib/log'
 import { tiyinToSumDisplay } from '@/lib/format'
 
 export * from './types'
 export { extractPositions } from './extract'
 export { loadMatcherPool, type MatcherPool } from './strategies'
+export { planHolistic } from './holistic'
 
 /**
  * Главная функция: собрать план фискализации для чека МойСклад.
@@ -65,6 +69,7 @@ export async function buildMatch(
       originalTotalTiyin: receipt.sum,
       matchedTotalTiyin: 0,
       canAutoFiscalize: false,
+      mode: 'classic',
       warnings: [
         'Чек оплачен бонусами / баллами полностью (сумма к оплате 0). ' +
           'Фискализация не нужна — фискальный чек создаётся только на сумму, ' +
@@ -169,6 +174,67 @@ export async function buildMatch(
   // Преобладающая стратегия — самая «слабая» из применённых.
   const overallStrategy = pickOverallStrategy(matches.map((m) => m.strategy))
 
+  // ── Holistic fallback ──────────────────────────────────────────────
+  // Если classic не закрыл задачу (есть unmatched позиции или итог ≠ target)
+  // И MatcherMode = 'auto' | 'holistic' — пробуем целостный подбор.
+  // Phase 1: holistic ЗАМЕЩАЕТ classic-результат целиком (см. holistic.ts).
+  // Phase 2 (future): возможно гибридный merge — сейчас простая замена.
+  const mode: MatcherMode = opts.matcherMode ?? 'auto'
+  const hasUnmatched = matches.some((m) => m.candidates.length === 0)
+  const shouldTryHolistic =
+    mode === 'holistic' ||
+    (mode === 'auto' && (hasUnmatched || matchedTotal !== receipt.sum))
+
+  if (shouldTryHolistic) {
+    const holistic = planHolistic(receipt.sum, pool, opts)
+    if (holistic.ok) {
+      void log.info(
+        'matcher',
+        `[holistic] fallback применён: ${holistic.plan.lines.length} строк`,
+        {
+          mode,
+          unmatchedBefore: matches.filter((m) => m.candidates.length === 0).length,
+          classicTotal: matchedTotal,
+          holisticTotal: holistic.plan.totalTiyin,
+          target: receipt.sum,
+        },
+      )
+      const holisticMatched = holistic.plan.totalTiyin
+      // Сохраняем classic-positions ТОЛЬКО как информационный «оригинал из МС»
+      // в UI. fiscalize() и печать пойдут через holistic.lines (см. fiscalize.ts).
+      return {
+        receipt,
+        positions: matches,
+        overallStrategy,
+        totalDiffTiyin: holisticMatched - receipt.sum, // должен быть 0
+        originalTotalTiyin: receipt.sum,
+        matchedTotalTiyin: holisticMatched,
+        canAutoFiscalize: false, // holistic = всегда требует подтверждения кассира
+        mode: 'holistic',
+        holistic: holistic.plan,
+        warnings: [
+          ...warnings,
+          `Подбор переключён в режим holistic: classic не сошёлся ` +
+            `(${matches.filter((m) => m.candidates.length === 0).length} неподобранных, ` +
+            `сумма ${tiyinToSumDisplay(matchedTotal)} ≠ ${tiyinToSumDisplay(receipt.sum)}). ` +
+            `Чек собран целиком на сумму, фискальные строки см. справа.`,
+          ...holistic.plan.notes,
+        ],
+      }
+    }
+    // Holistic не справился — продолжаем с classic-результатом
+    // (UI покажет unmatched и предложит manual picker).
+    void log.warn(
+      'matcher',
+      `[holistic] fallback отклонён: ${holistic.reason} — ${holistic.detail}`,
+      { mode, target: receipt.sum },
+    )
+    warnings.push(
+      `Holistic-режим не справился (${holistic.reason}): ${holistic.detail}. ` +
+        `Используйте ручной подбор для неподобранных позиций.`,
+    )
+  }
+
   // canAutoFiscalize: все позиции linked-ms или passthrough, нет warnings, diff = 0.
   // linked-ms — явная связка от бухгалтера, ещё надёжнее чем passthrough.
   const canAutoFiscalize =
@@ -185,6 +251,7 @@ export async function buildMatch(
     originalTotalTiyin: receipt.sum,
     matchedTotalTiyin: matchedTotal,
     canAutoFiscalize,
+    mode: 'classic',
     warnings,
   }
 }
@@ -213,6 +280,10 @@ export function recalculateAfterSwap(
   newAlternativeIndex: number,
   opts: MatcherOptions = {},
 ): BuildMatchResult {
+  // В holistic-режиме swap по позициям не имеет смысла — фискальные строки
+  // строятся из result.holistic.lines, а result.positions хранится только
+  // как «оригинал из МС». UI этой ветки не должен рисовать swap-стрелки.
+  if (result.mode === 'holistic') return result
   if (positionIndex < 0 || positionIndex >= result.positions.length) {
     return result // невалидный индекс — no-op
   }
@@ -317,6 +388,8 @@ export function rebuildPositionWithSplit(
   pool: MatcherPool,
   opts: MatcherOptions = {},
 ): BuildMatchResult | null {
+  // В holistic-режиме split не применим, см. recalculateAfterSwap.
+  if (result.mode === 'holistic') return null
   if (positionIndex < 0 || positionIndex >= result.positions.length) return null
   if (newSplitLevel < 1) return null
   const target = result.positions[positionIndex]!
@@ -417,6 +490,11 @@ export function replacePositionManual(
   esfItem: import('@/lib/db').EsfItemWithAvailable,
   opts: MatcherOptions = {},
 ): ManualPickOutcome {
+  // В holistic-режиме manual picker по позиции не применим — план собран
+  // целостно. UI должен скрыть кнопку «Подобрать вручную» в этой ветке.
+  if (result.mode === 'holistic') {
+    return { ok: false, reason: 'invalid_index' }
+  }
   if (positionIndex < 0 || positionIndex >= result.positions.length) {
     return { ok: false, reason: 'invalid_index' }
   }

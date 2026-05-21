@@ -135,13 +135,17 @@ export default function Receipt() {
   const itemsWithoutIkpu = useMemo(() => {
     if (!match) return [] as string[]
     const names = new Set<string>()
-    for (const pm of match.positions) {
-      for (const c of pm.candidates) {
-        // Только ИКПУ обязателен. package_code опционален (E-POS Mobile API
-        // помечает его ❌, E-014 только при НЕВЕРНОМ коде, не при пустом).
-        if (!c.esfItem.class_code || c.esfItem.class_code.trim() === '') {
-          names.add(c.esfItem.name)
-        }
+    // В holistic-режиме источник правды — match.holistic.lines (плоский
+    // список фискальных строк), в classic — match.positions.candidates.
+    const lines =
+      match.mode === 'holistic' && match.holistic
+        ? match.holistic.lines
+        : match.positions.flatMap((pm) => pm.candidates)
+    for (const c of lines) {
+      // Только ИКПУ обязателен. package_code опционален (E-POS Mobile API
+      // помечает его ❌, E-014 только при НЕВЕРНОМ коде, не при пустом).
+      if (!c.esfItem.class_code || c.esfItem.class_code.trim() === '') {
+        names.add(c.esfItem.name)
       }
     }
     return Array.from(names)
@@ -160,6 +164,9 @@ export default function Receipt() {
    */
   const hasUnmatched = useMemo(() => {
     if (!match) return false
+    // В holistic-режиме «unmatched» по позициям не блокирует — план собран
+    // целостно на сумму чека, фискальные строки берутся из match.holistic.
+    if (match.mode === 'holistic') return false
     return match.positions.some((pm) => pm.candidates.length === 0)
   }, [match])
 
@@ -310,6 +317,16 @@ export default function Receipt() {
           ? Number.parseInt(vatRaw, 10) || 0
           : 12
 
+      // Режим matcher'а: 'auto' (default) пробует classic, при провале
+      // включает holistic. См. SettingKey.MatcherMode.
+      const modeRaw = await getSetting(SettingKey.MatcherMode)
+      const matcherMode = ((): 'auto' | 'classic' | 'holistic' | 'off' => {
+        if (modeRaw === 'classic' || modeRaw === 'holistic' || modeRaw === 'off') {
+          return modeRaw
+        }
+        return 'auto'
+      })()
+
       const opts: MatcherOptions = {
         toleranceTiyin: tolerance,
         markupPercent,
@@ -318,6 +335,7 @@ export default function Receipt() {
         maxDiscountPerItemTiyin,
         linkCharacteristicName,
         defaultVatPercent,
+        matcherMode,
         excludeServerItemIds: excludedServerIds.length > 0 ? excludedServerIds : undefined,
       }
       const result = await buildMatch(parsed, opts)
@@ -573,6 +591,34 @@ export default function Receipt() {
         </Card>
       )}
 
+      {/* Holistic-режим: classic per-position не сошёлся, чек собран целостно
+          на сумму. Фискальные строки = match.holistic.lines (правая колонка),
+          ручной подбор по позиции в этом режиме недоступен. */}
+      {match.mode === 'holistic' && match.holistic && (
+        <Card className="border-warning/30 bg-warning-soft">
+          <Card.Body className="flex items-start gap-3">
+            <TriangleAlert size={18} className="text-warning shrink-0 mt-0.5" />
+            <div className="flex-1">
+              <div className="text-body font-medium text-warning">
+                Чек собран совокупно (holistic-режим)
+              </div>
+              <div className="mt-1 text-caption text-ink">
+                Подбор «позиция-в-позицию» не сошёлся ({' '}
+                {match.positions.filter((p) => p.candidates.length === 0).length}{' '}
+                из {match.positions.length} не нашлось индивидуально). Matcher
+                собрал чек целиком на сумму{' '}
+                <span className="font-mono">
+                  {(match.matchedTotalTiyin / 100).toLocaleString('ru-RU')} сум
+                </span>{' '}
+                из {match.holistic.lines.length}{' '}
+                {match.holistic.lines.length === 1 ? 'товара' : 'товаров'}.
+                Список фискальных строк — справа.
+              </div>
+            </div>
+          </Card.Body>
+        </Card>
+      )}
+
       {error && (
         <Card className="border-danger/20 bg-danger-soft">
           <Card.Body className="flex items-start gap-3">
@@ -629,10 +675,28 @@ export default function Receipt() {
         </Side>
 
         <Side
-          title={`Подбор: ${strategyLabel(match.overallStrategy)}`}
+          title={
+            match.mode === 'holistic'
+              ? 'Подбор: holistic (на сумму чека)'
+              : `Подбор: ${strategyLabel(match.overallStrategy)}`
+          }
           sumTiyin={match.matchedTotalTiyin}
           sumDiff={match.totalDiffTiyin}
         >
+          {match.mode === 'holistic' && match.holistic ? (
+            // Holistic: плоский список фискальных строк, без manual/swap/split.
+            // План построен целостно на сумму, отдельных «позиций» нет.
+            <PositionsTable
+              positions={match.holistic.lines.map((line): DisplayPosition => ({
+                name: line.esfItem.name,
+                quantity: line.quantity,
+                total: line.priceTiyin - line.discountTiyin,
+                vatPercent: line.esfItem.vat_percent,
+                meta: line.esfItem.class_code || '— нет ИКПУ —',
+                matched: true,
+              }))}
+            />
+          ) : (
           <PositionsTable
             positions={match.positions.flatMap((pm, posIdx): DisplayPosition[] => {
               // Не подобрано (matcher ничего не нашёл) — одна строка-заглушка
@@ -761,6 +825,7 @@ export default function Receipt() {
               })
             })}
           />
+          )}
         </Side>
       </div>
 
@@ -783,6 +848,9 @@ export default function Receipt() {
       )}
 
       {(() => {
+        // В holistic-режиме «N подобранных» по позициям не применимо —
+        // план собран целостно на сумму, баннер с подсчётом был бы вреден.
+        if (match.mode === 'holistic') return null
         const totalPos = sourcePositions.length
         const matchedPos = match.positions.filter(
           (pm) => pm.candidates.length > 0,

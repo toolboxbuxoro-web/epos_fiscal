@@ -161,6 +161,23 @@ export const SettingKey = {
    * приходов.
    */
   MsLinkCharacteristicName: 'matcher.ms_link_characteristic_name',
+  /**
+   * Режим matcher'а — как подбирать товары на сумму чека.
+   *
+   * Значения:
+   *   - `'auto'`    (default) — сначала classic per-position, при провале
+   *                 fallback на holistic (целостный подбор на сумму чека)
+   *   - `'classic'` — только classic per-position (старое поведение до 0.10.30)
+   *   - `'holistic'` — всегда holistic, classic пропускается
+   *   - `'off'`     — оба автоматических режима выключены, только manual picker
+   *
+   * `holistic` решает задачу так: target = rd.sum, пул = inv_items с остатками,
+   * жадно набираем крупное под резерв филлеров + DP exact-sum на остаток.
+   * Применяется когда per-position не сошлось (sparse pool) — собирает чек
+   * как целое, без жёсткой привязки фискальных строк к МС-позициям.
+   * См. `src/lib/matcher/holistic.ts`.
+   */
+  MatcherMode: 'matcher.mode',
 } as const
 
 export type SettingKey = (typeof SettingKey)[keyof typeof SettingKey]

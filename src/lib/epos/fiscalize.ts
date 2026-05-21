@@ -8,7 +8,26 @@ import {
   SettingKey,
 } from '@/lib/db'
 import { log } from '@/lib/log'
-import type { BuildMatchResult } from '@/lib/matcher/types'
+import type { BuildMatchResult, HolisticLine, MatchCandidate } from '@/lib/matcher/types'
+
+/**
+ * Унифицированный список «фискальных строк» из BuildMatchResult.
+ *
+ * - mode='classic'  → flat MatchCandidate'ы из всех positions
+ * - mode='holistic' → holistic.lines напрямую
+ *
+ * Это позволяет коду фискализации/печати/реserve не знать про режим:
+ * структура MatchCandidate и HolisticLine идентична (esfItem, quantity,
+ * priceTiyin, discountTiyin, vatTiyin).
+ */
+type FiscalLine = MatchCandidate | HolisticLine
+
+function getEffectiveLines(build: BuildMatchResult): FiscalLine[] {
+  if (build.mode === 'holistic' && build.holistic) {
+    return build.holistic.lines
+  }
+  return build.positions.flatMap((pm) => pm.candidates)
+}
 import {
   deletePendingByReservations,
   getInventoryClient,
@@ -66,7 +85,8 @@ export async function fiscalize(
   // токен не нужен. Поле в Settings оставлено только для обратной
   // совместимости БД старых установок и UI его не показывает.
 
-  if (build.positions.length === 0) {
+  const effectiveLines = getEffectiveLines(build)
+  if (effectiveLines.length === 0) {
     throw new Error('Нечего отправлять в Communicator: пустой план')
   }
 
@@ -89,9 +109,9 @@ export async function fiscalize(
   // matchedTotal — сумма к оплате (с учётом скидок если они применены).
   // = sum(priceTiyin - discountTiyin). Совпадает с rd.sum если включена
   // discountForExactSum и хватает запаса по себестоимости.
-  const matchedTotal = build.positions.reduce(
-    (s, pm) =>
-      s + pm.candidates.reduce((cs, c) => cs + c.priceTiyin - c.discountTiyin, 0),
+  // В holistic-режиме — это totalTiyin плана (по конструкции = receipt.sum).
+  const matchedTotal = effectiveLines.reduce(
+    (s, c) => s + c.priceTiyin - c.discountTiyin,
     0,
   )
 
@@ -147,11 +167,9 @@ export async function fiscalize(
   // Применяется ДО любой работы с сервером (резерв, fiscalize) — иначе
   // потратим время и вернём резерв обратно при failure.
   const noIkpuItems: string[] = []
-  for (const pm of build.positions) {
-    for (const c of pm.candidates) {
-      if (!c.esfItem.class_code || c.esfItem.class_code.trim() === '') {
-        noIkpuItems.push(c.esfItem.name)
-      }
+  for (const c of effectiveLines) {
+    if (!c.esfItem.class_code || c.esfItem.class_code.trim() === '') {
+      noIkpuItems.push(c.esfItem.name)
     }
   }
   if (noIkpuItems.length > 0) {
@@ -164,18 +182,22 @@ export async function fiscalize(
   }
 
   // 1-2. Сохранить ms_receipt и match.
-  const { msReceiptId, matchDbId } = await persistMatch(build, opts)
+  const { msReceiptId, matchDbId } = await persistMatch(build, effectiveLines, opts)
 
   // ── Multi-shop: атомарная резервация на сервере ДО EPOS ──────────────
   // Если включён remote-режим (общий пул через mytoolbox), резервируем
   // все позиции на сервере. Это блокирует другие магазины от списания
   // тех же штук. Если 409 — кто-то опередил, кидаем ошибку для re-match.
-  const reserveResult = await tryRemoteReserve(build, build.receipt.id ?? msReceiptId.toString())
+  const reserveResult = await tryRemoteReserve(
+    effectiveLines,
+    build.receipt.id ?? msReceiptId.toString(),
+  )
   // ────────────────────────────────────────────────────────────────────
 
   await log.info('fiscalize', `Отправляю чек ${build.receipt.name} в EPOS`, {
     eposUrl,
-    items: build.positions.length,
+    items: effectiveLines.length,
+    mode: build.mode,
     total: matchedTotal,
     remoteReserved: reserveResult.reservations?.length ?? 0,
   })
@@ -204,7 +226,12 @@ export async function fiscalize(
   let fiscal: FiscalReceiptInfo
   let requestJson: string
   try {
-    const result = await fiscalizeJsonRpc(eposUrl, build, receivedCash, receivedCard)
+    const result = await fiscalizeJsonRpc(
+      eposUrl,
+      effectiveLines,
+      receivedCash,
+      receivedCard,
+    )
     fiscal = result.fiscal
     requestJson = result.requestJson
   } catch (eposErr) {
@@ -220,20 +247,19 @@ export async function fiscalize(
       jsonRpcData: eposExtra.data,
       errorMessage: errMsg,
       errorStack: errStack,
-      itemsCount: build.positions.length,
+      itemsCount: effectiveLines.length,
+      matcherMode: build.mode,
       matchedTotalTiyin: matchedTotal,
       receivedCash,
       receivedCard,
       // Первые 3 товара с их ИКПУ — для проверки данных
-      sampleItems: build.positions.slice(0, 3).map((pm) =>
-        pm.candidates.map((c) => ({
-          name: c.esfItem.name,
-          class_code: c.esfItem.class_code,
-          package_code: c.esfItem.package_code,
-          vat_percent: c.esfItem.vat_percent,
-          priceTiyin: c.priceTiyin,
-        })),
-      ).flat(),
+      sampleItems: effectiveLines.slice(0, 3).map((c) => ({
+        name: c.esfItem.name,
+        class_code: c.esfItem.class_code,
+        package_code: c.esfItem.package_code,
+        vat_percent: c.esfItem.vat_percent,
+        priceTiyin: c.priceTiyin,
+      })),
     })
 
     // EPOS не выдал FiscalSign — отпускаем резерв.
@@ -352,7 +378,7 @@ export class InventoryConflictError extends Error {
  * с failed item_ids; UI ловит и автоматически перематчивает.
  */
 async function tryRemoteReserve(
-  build: BuildMatchResult,
+  effectiveLines: FiscalLine[],
   ms_receipt_id: string,
 ): Promise<{ reservations: ReservationInfo[] }> {
   const cfg = await loadInventoryConfig()
@@ -371,18 +397,19 @@ async function tryRemoteReserve(
 
   // Собираем (server_item_id, quantity) пары. Локальные строки без
   // server_item_id блокируют — миграция через Catalog обязательна.
+  // В holistic-режиме строки могут «дублироваться» по esfItem (если фаза 2 DP
+  // подобрала несколько штук одного SKU + фаза 1 тоже взяла тот же SKU) —
+  // server.reserve атомарно складывает их по inv_item_id, конфликта нет.
   const items: { inv_item_id: number; quantity: number }[] = []
-  for (const pm of build.positions) {
-    for (const c of pm.candidates) {
-      const sid = c.esfItem.server_item_id
-      if (sid == null) {
-        throw new Error(
-          `Приход «${c.esfItem.name}» импортирован локально (старый Excel-импорт). ` +
-            `Откройте Справочник → «Перенести в общий пул» чтобы включить в общий пул.`,
-        )
-      }
-      items.push({ inv_item_id: sid, quantity: c.quantity })
+  for (const c of effectiveLines) {
+    const sid = c.esfItem.server_item_id
+    if (sid == null) {
+      throw new Error(
+        `Приход «${c.esfItem.name}» импортирован локально (старый Excel-импорт). ` +
+          `Откройте Справочник → «Перенести в общий пул» чтобы включить в общий пул.`,
+      )
     }
+    items.push({ inv_item_id: sid, quantity: c.quantity })
   }
 
   const resp = await client.reserve({ ms_receipt_id, items })
@@ -592,35 +619,30 @@ async function buildReceiptData(
 ): Promise<ReceiptData> {
   const company = await readCompanySettings()
   const cashier = (await getSetting(SettingKey.MoyskladEmployeeName)) ?? ''
+  const effectiveLines = getEffectiveLines(build)
 
   // Все позиции — после подмены, по продажным ценам, со скидкой если есть.
   // На ленте: Price = до скидки, Discount = размер скидки (показывается
   // отдельной строкой на принтере если > 0).
-  const items = build.positions.flatMap((pm) =>
-    pm.candidates.map((c) => ({
-      name: c.esfItem.name,
-      class_code: c.esfItem.class_code,
-      qty_str: formatQtyForPrint(c.quantity),
-      price_str: formatTiyinForPrint(c.priceTiyin),
-      // Пустая строка если скидки нет — Rust пропустит строку «Skidka».
-      discount_str:
-        c.discountTiyin > 0 ? formatTiyinForPrint(c.discountTiyin) : '',
-      vat_str: formatTiyinForPrint(c.vatTiyin),
-      vat_percent: c.esfItem.vat_percent,
-    })),
-  )
+  const items = effectiveLines.map((c) => ({
+    name: c.esfItem.name,
+    class_code: c.esfItem.class_code,
+    qty_str: formatQtyForPrint(c.quantity),
+    price_str: formatTiyinForPrint(c.priceTiyin),
+    // Пустая строка если скидки нет — Rust пропустит строку «Skidka».
+    discount_str:
+      c.discountTiyin > 0 ? formatTiyinForPrint(c.discountTiyin) : '',
+    vat_str: formatTiyinForPrint(c.vatTiyin),
+    vat_percent: c.esfItem.vat_percent,
+  }))
 
-  // Итог = сумма (price - discount) по всем кандидатам — то что покупатель
+  // Итог = сумма (price - discount) по всем строкам — то что покупатель
   // реально платит и что должно совпасть с receivedCash + receivedCard.
-  const totalTiyin = build.positions.reduce(
-    (s, pm) =>
-      s + pm.candidates.reduce((cs, c) => cs + c.priceTiyin - c.discountTiyin, 0),
+  const totalTiyin = effectiveLines.reduce(
+    (s, c) => s + c.priceTiyin - c.discountTiyin,
     0,
   )
-  const totalVatTiyin = build.positions.reduce(
-    (s, pm) => s + pm.candidates.reduce((cs, c) => cs + c.vatTiyin, 0),
-    0,
-  )
+  const totalVatTiyin = effectiveLines.reduce((s, c) => s + c.vatTiyin, 0)
 
   return {
     is_copy: isCopy,
@@ -651,37 +673,37 @@ async function buildReceiptData(
 
 async function fiscalizeJsonRpc(
   url: string,
-  build: BuildMatchResult,
+  effectiveLines: FiscalLine[],
   receivedCash: number,
   receivedCard: number,
 ): Promise<{ fiscal: FiscalReceiptInfo; requestJson: string }> {
   // Guard ИКПУ перенесён на верхний уровень `fiscalize()` (см. там же,
   // он срабатывает ДО резервации). Здесь — точка построения JSON-RPC payload.
+  // effectiveLines содержит либо все candidates из всех positions (classic),
+  // либо holistic.lines напрямую — формат идентичный.
 
-  const items = build.positions.flatMap((pm) =>
-    pm.candidates.map((c) => ({
-      Price: c.priceTiyin,           // продажная сумма ДО скидки за всё quantity
-      Discount: c.discountTiyin,     // размер скидки в тийинах (0 если без скидки)
-      Barcode: c.esfItem.barcode ?? '0',
-      Amount: c.quantity,
-      // VAT уже пересчитан в matcher с учётом скидки = (price-discount) × % / (100+%)
-      VAT: c.vatTiyin,
-      Name: c.esfItem.name,
-      Other: 0,
-      // 🎯 ИМЯ ПОЛЕЙ ПОДТВЕРЖДЕНО реальной фискализацией с TerminalID
-      // VG343420011189 в 0.10.12: spic = MXIK, packageCode = код упаковки.
-      // Источник имени `spic`: docs.epos.uz/ru/mobile-api/receipts-sale.
-      // НЕ менять без проверки — иначе MXIK перестанет доходить до ОФД.
-      spic: c.esfItem.class_code,
-      // package_code опционален: если его нет — шлём '' (E-POS трактует
-      // отсутствие как «не задано», E-014 только при НЕВЕРНОМ коде).
-      // null/undefined в JSON мог бы сериализоваться как `null` —
-      // нормализуем к пустой строке.
-      packageCode: c.esfItem.package_code || '',
-      VATPercent: c.esfItem.vat_percent,
-      OwnerType: c.esfItem.owner_type,
-    })),
-  )
+  const items = effectiveLines.map((c) => ({
+    Price: c.priceTiyin,           // продажная сумма ДО скидки за всё quantity
+    Discount: c.discountTiyin,     // размер скидки в тийинах (0 если без скидки)
+    Barcode: c.esfItem.barcode ?? '0',
+    Amount: c.quantity,
+    // VAT уже пересчитан в matcher с учётом скидки = (price-discount) × % / (100+%)
+    VAT: c.vatTiyin,
+    Name: c.esfItem.name,
+    Other: 0,
+    // 🎯 ИМЯ ПОЛЕЙ ПОДТВЕРЖДЕНО реальной фискализацией с TerminalID
+    // VG343420011189 в 0.10.12: spic = MXIK, packageCode = код упаковки.
+    // Источник имени `spic`: docs.epos.uz/ru/mobile-api/receipts-sale.
+    // НЕ менять без проверки — иначе MXIK перестанет доходить до ОФД.
+    spic: c.esfItem.class_code,
+    // package_code опционален: если его нет — шлём '' (E-POS трактует
+    // отсутствие как «не задано», E-014 только при НЕВЕРНОМ коде).
+    // null/undefined в JSON мог бы сериализоваться как `null` —
+    // нормализуем к пустой строке.
+    packageCode: c.esfItem.package_code || '',
+    VATPercent: c.esfItem.vat_percent,
+    OwnerType: c.esfItem.owner_type,
+  }))
 
   const receipt: JsonRpcReceipt = {
     // Go-style "2026-05-01 15:30:00" с ПРОБЕЛОМ. ISO с T парсер
@@ -748,6 +770,7 @@ async function fiscalizeJsonRpc(
 
 async function persistMatch(
   build: BuildMatchResult,
+  effectiveLines: FiscalLine[],
   opts: FiscalizeOptions,
 ): Promise<{ msReceiptId: number; matchDbId: number | null }> {
   let msReceiptId: number
@@ -767,20 +790,28 @@ async function persistMatch(
   // В match_items сохраняем сумму К ОПЛАТЕ (price - discount) — то что
   // покупатель реально заплатил по этой позиции. discount как отдельное
   // поле в схеме БД сейчас нет, но это фиксируется в request_json.
-  const matchItems = build.positions.flatMap((pm) =>
-    pm.candidates.map((c) => ({
-      esf_item_id: c.esfItem.id,
-      quantity: c.quantity,
-      price_tiyin: c.priceTiyin - c.discountTiyin,
-      vat_tiyin: c.vatTiyin,
-    })),
-  )
+  // В holistic-режиме сохраняем именно фискальные строки (holistic.lines)
+  // — они и есть то, что ушло в ОФД.
+  const matchItems = effectiveLines.map((c) => ({
+    esf_item_id: c.esfItem.id,
+    quantity: c.quantity,
+    price_tiyin: c.priceTiyin - c.discountTiyin,
+    vat_tiyin: c.vatTiyin,
+  }))
+
+  // В holistic-режиме strategy на уровне match — это 'price-bucket' по сути
+  // (подбор по цене с подменой ИКПУ), хотя реально это глобальный coin-change.
+  // Чтобы не плодить новый enum в БД, помечаем как 'price-bucket' для
+  // отчётности (см. MatchStrategy). UI знает истинный режим через
+  // build.mode и показывает «holistic».
+  const strategyForDb =
+    build.mode === 'holistic' ? 'price-bucket' : build.overallStrategy
 
   const matchDbId =
     matchItems.length > 0
       ? await createMatch({
           ms_receipt_id: msReceiptId,
-          strategy: build.overallStrategy,
+          strategy: strategyForDb,
           total_tiyin: build.matchedTotalTiyin,
           diff_tiyin: build.totalDiffTiyin,
           items: matchItems,

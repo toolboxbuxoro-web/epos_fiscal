@@ -128,7 +128,70 @@ export interface BuildMatchResult {
   canAutoFiscalize: boolean
   /** Все warning'и в одном плоском списке. */
   warnings: string[]
+  /**
+   * Режим подбора. По умолчанию `'classic'` (per-position).
+   *
+   * - `'classic'`  — `positions[]` это правда; matchedTotalTiyin = Σ candidates.
+   * - `'holistic'` — `holistic` это правда; `positions[]` сохраняется только
+   *   для UI («оригинал из МС»), фискальные строки строятся из `holistic.lines`.
+   *
+   * Управляется в `buildMatch` на основе `SettingKey.MatcherMode`.
+   */
+  mode: 'classic' | 'holistic'
+  /**
+   * План holistic-подбора. Заполнен только когда `mode === 'holistic'`.
+   *
+   * Каждая `line` — одна фискальная строка чека: товар × qty × сумма.
+   * Сумма plan.totalTiyin совпадает с receipt.sum (exact-sum guarantee
+   * по конструкции, иначе planHolistic возвращает Reject).
+   *
+   * См. `src/lib/matcher/holistic.ts`.
+   */
+  holistic?: HolisticPlan
 }
+
+/**
+ * Одна строка holistic-плана. Каждая → одна позиция в фискальном чеке.
+ *
+ * Цена `priceTiyin` это **продажная сумма за всё quantity** (как в
+ * `MatchCandidate.priceTiyin`). discountTiyin может быть > 0 если в фазе 3
+ * пришлось срезать остаток скидкой; vatTiyin рассчитан от `priceTiyin - discountTiyin`.
+ */
+export interface HolisticLine {
+  esfItem: import('@/lib/db/types').EsfItemRow & { available?: MilliQty }
+  /** Кол-во штук в миллидолях (1000 = 1 шт). */
+  quantity: MilliQty
+  /** Продажная сумма ДО скидки за всё quantity, тийины. */
+  priceTiyin: Tiyin
+  /** Размер скидки в тийинах (0 если без скидки). */
+  discountTiyin: Tiyin
+  /** НДС от (priceTiyin - discountTiyin), тийины. */
+  vatTiyin: Tiyin
+}
+
+/**
+ * Результат holistic-планировщика: список строк + итоговая сумма.
+ *
+ * `totalTiyin` = Σ (priceTiyin - discountTiyin) — это то что уйдёт в EPOS
+ * как сумма к оплате. Совпадает с `receipt.sum` (exact, проверено в planHolistic).
+ *
+ * `totalCostTiyin` = Σ unitPrice × (1+vat/100) × qty — себестоимость с НДС.
+ * Инвариант: `totalCostTiyin ≤ totalTiyin` (не в убыток).
+ */
+export interface HolisticPlan {
+  lines: HolisticLine[]
+  totalTiyin: Tiyin
+  totalCostTiyin: Tiyin
+  /** Информационные сообщения о том как был собран план (для UI/логов). */
+  notes: string[]
+}
+
+/**
+ * Режим работы matcher'а — управляется `SettingKey.MatcherMode`.
+ *
+ * См. документацию на `SettingKey.MatcherMode` в `src/lib/db/types.ts`.
+ */
+export type MatcherMode = 'auto' | 'classic' | 'holistic' | 'off'
 
 export interface MatcherOptions {
   /** Допуск по сумме на одну позицию (тийины). По умолчанию 0 (точное совпадение). */
@@ -221,4 +284,34 @@ export interface MatcherOptions {
    * (legacy режим — для магазинов на упрощёнке или для тестов).
    */
   defaultVatPercent?: number
+  /**
+   * Режим matcher'а. По умолчанию `'auto'`:
+   *   1. Запускаем classic per-position.
+   *   2. Если `hasUnmatched` ИЛИ `matched ≠ target` — пытаемся holistic.
+   *   3. Если holistic вернул план — используем его.
+   *
+   * См. `MatcherMode` и `SettingKey.MatcherMode`.
+   */
+  matcherMode?: MatcherMode
+  /**
+   * Максимальное число фискальных строк в holistic-плане. Sanity-cap
+   * против чеков из 50+ строк (ОФД и кассир-лента не любят такое).
+   * По умолчанию 30. Если план получается длиннее — `planHolistic`
+   * вернёт `Reject(TOO_MANY_LINES)` и UI попросит manual picker.
+   */
+  holisticMaxLines?: number
+  /**
+   * Резерв (в тийинах) под филлеры в фазе 1 holistic-планировщика.
+   * Жадный greedy не «съест» весь target крупными SKU — оставит этот
+   * резерв для последующего exact-sum DP на мелких товарах.
+   * По умолчанию 3 000 000 (30 000 сум).
+   */
+  holisticFillerReserveTiyin?: Tiyin
+  /**
+   * Граница «крупное / мелкое» для holistic-планировщика (тийины
+   * за 1 шт продажной цены). Товары с `sellPrice ≤ этого значения`
+   * считаются филлерами и идут в фазу 2 (DP), остальные — в фазу 1
+   * (greedy крупного). По умолчанию 2 000 000 (20 000 сум).
+   */
+  holisticFillerThresholdTiyin?: Tiyin
 }

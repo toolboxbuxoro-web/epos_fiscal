@@ -50,13 +50,14 @@ Polling МойСклад (раз в 30 сек, фильтр retailStore)
 ms_receipts (raw JSON чеков из МС)
        │
        ▼
-Matcher (3 стратегии: passthrough / price-bucket / multi-item)
-       │  ↑
-       │  └── читает esf_items (приходы с ИКПУ из Excel или ЭСФ)
+Matcher (4 стратегии: linked-ms / passthrough / price-bucket / multi-item)
+       │  ↑                                  + manual picker (UI fallback)
+       │  └── читает esf_items (mirror серверного inv_items, sync c reconcile)
        ▼
 matches + match_items (план: чем подменить)
        │
-       ▼
+       ▼  + AlreadyFiscalizedError guard (запрет повторной фискализации)
+       ▼  + ShiftNotOpenError detect (понятный баннер «откройте смену»)
 fiscalize() → JsonRpcEposClient.sendSaleReceipt (Api.SendSaleReceipt)
        │
        ▼
@@ -69,6 +70,13 @@ printer.rs::print_fiscal_receipt (ESC/POS на Xprinter)
    getZReportInfo (раз в 30 сек) → UI данные
    openShift → Api.OpenZReport
    closeShift → Api.CloseZReport → printer.rs::print_z_report (Z auto)
+
+Ветка возврата (роут /refund/:fiscalReceiptId) — см. секцию «Возвраты»:
+   Чеки → клик «Возврат» → processRefund()
+        → Api.SendRefundReceipt + refundInfo (camelCase, dateTime 14 цифр)
+        → fiscal_refunds (UNIQUE на original_fiscal_id — один refund на чек)
+        → /api/v1/inventory/unconsume на сервер (idempotent, retry-очередь)
+        → печать «ВОЗВРАТ ТОВАРА»
 ```
 
 ## Multi-shop
@@ -182,11 +190,16 @@ Tauri/reqwest). Поэтому в каждом запросе шлём `Authoriz
 | Количество товара | **тысячные** (1000 = 1 шт) | 2500 = 2.5 кг |
 | Время в БД | **epoch секунды** | now() helper |
 | Дата для МС filter | `YYYY-MM-DD HH:MM:SS.SSS` UTC | `formatMsMoment` |
-| Дата для EPOS sale | `YYYYMMDDHHMMSS` без разделителей | `refundInfo.dateTime` |
-| Дата для JSON-RPC | **Go-style с пробелом**, локальное время | `2026-05-04 15:30:00` |
+| Дата `Receipt.Time` (JSON-RPC sale/refund) | **Go-style с пробелом**, локальное время | `2026-05-04 15:30:00` (через `formatGoTime`) |
+| **`refundInfo.dateTime`** (внутри refund-payload) | **строго 14 цифр** YYYYMMDDHHMMSS без разделителей | `20260516095418` (через `toRefundDateTime` — выкидывает нецифры, первые 14) |
+| `fiscal_receipts.fiscal_datetime` (хранилка) | Как вернул Communicator — может быть либо | `20260516095418` или `2026-05-16 09:54:18` |
 
 Любой числовой расчёт с деньгами — в тийинах. Конвертация только на
 вход (Excel) и UI-форматирование (`format.ts`).
+
+**`refundInfo.dateTime` критично** — формат с разделителями (Go-style/ISO)
+ОФД не парсит и refund попадает в «Бириктирилмаган» (не привязан к оригиналу).
+`toRefundDateTime()` в `refund.ts` нормализует любой формат.
 
 ## ИКПУ и приходы
 
@@ -204,7 +217,7 @@ Matcher выбирает товары так, чтобы суммарно сов
 **Юридический нюанс:** подмена ИКПУ — серая зона. Юзер взял на себя
 ответственность. Журнал замен — `replacement_log` для аудита.
 
-## Matcher: цена и три стратегии
+## Matcher: цена и четыре стратегии + manual
 
 ### Формула продажной цены
 
@@ -215,32 +228,73 @@ Matcher выбирает товары так, чтобы суммарно сов
 `5959.28 × 1.10 × 1.12 = 7341.63` → округление вверх → **8000 сум**.
 
 Себестоимость с НДС (пол скидки): `unit_price × (1 + vat/100)` × quantity —
-**без** наценки. Это нижняя граница для `distributeDiscount`.
+**без** наценки. Это нижняя граница для `distributeDiscount` **и** ручного
+подбора (`replacePositionManual` отвергает если cost > pos.totalTiyin).
+
+### НДС override (общий режим магазина)
+
+`SettingKey.DefaultVatPercent` (default `'12'`) — override `inv_item.vat_percent`
+для **всех** товаров пула в `loadMatcherPool`. Магазин на общем режиме РУз
+продаёт всё с НДС 12% независимо от того что указал поставщик в ЭСФ
+(упрощенцы шлют 0%). Override применяется в pool → matcher → fiscalize →
+печать одновременно. Если магазин на упрощёнке — поставь `'0'`.
 
 ### Стратегии (по очереди для каждой позиции)
 
-1. **passthrough** — есть приход с тем же ИКПУ и достаточным остатком →
+1. **linked-ms** — в МС-модификации есть характеристика «Бухгалтерское
+   наименование» (имя как в `esf_items.name`) → smart-search по пулу
+   (exact → substring ≥15 символов с model-token → token-fuzzy ≥50%
+   + model-token). Самая надёжная — явная связка от бухгалтера.
+   Swap между **батчами** одного buh-name + split разрешены.
+2. **passthrough** — есть приход с тем же ИКПУ и достаточным остатком →
    фискализируем «как есть». Цена = расчётная продажная.
-2. **price-bucket** — нет ИКПУ или нет остатка → ищем товар, у которого
+3. **price-bucket** — нет ИКПУ или нет остатка → ищем товар, у которого
    расчётная цена близка к `pos.totalTiyin` в пределах `toleranceTiyin`.
    **В чек пишем `pos.totalTiyin` (не calculated)** — клиент заплатил
-   эту сумму, фискализируем именно её. Calc цена использовалась только
-   для матчинга. Это убирает систематический микро-минус -1000.
-3. **multi-item** — greedy knapsack по убыванию цены, набираем N товаров
-   на сумму ± tolerance. Лимит N — `maxMultiItem` (default 5).
+   эту сумму, фискализируем именно её.
+4. **multi-item** — greedy knapsack по убыванию цены, набираем N товаров
+   на сумму ± tolerance. Лимит N — `maxMultiItem` (default **10**, был 5).
+
+**Manual picker (UI fallback)** — если ни одна не сработала, позиция
+попадает в `match.positions` с пустым `candidates[]` (раньше уходила
+только в warnings). UI рисует строку «не подобрано» + кнопку «Подобрать
+вручную» → модалка с индексированным поиском по всему пулу + фильтром
+по цене. `replacePositionManual()` атомарно заменяет позицию и
+проверяет `costWithVat ≤ pos.totalTiyin` (нельзя в убыток).
+
+### Pool-фильтр (важно)
+
+`loadMatcherPool`:
+- Только `source='remote'` (synced from mytoolbox), legacy excel-импорты
+  с `server_item_id IS NULL` исключены — они не работают в multi-shop.
+- Исключаем приходы без `class_code` (ИКПУ обязателен по mobile-api E-013).
+- **`package_code` НЕ требуем** — по mobile-api он ❌ опциональное
+  (E-014 только при НЕВЕРНОМ коде). Раньше зря фильтровали — товары с
+  валидным ИКПУ но без package_code выпадали из подбора.
+- НДС override (см. выше).
 
 ### Финальное выравнивание суммы
 
 После основного цикла (если флаг `discountForExactSum=true`):
 
 - `distributeDiscount` — matched > target → срезаем скидкой. Cap
-  `maxDiscountPerItemTiyin` (default 200_000 = 2000 сум). Floor — себестоимость
-  с НДС (нельзя продавать в убыток).
-- `distributeBump` — matched < target → надбавка к цене. Cap тот же.
-  Floor не нужен (повышение наценки всегда легально).
+  `maxDiscountPerItemTiyin` (default 200_000 = 2000 сум). Floor —
+  себестоимость с НДС (нельзя продавать в убыток).
+- `distributeBump` — matched < target → надбавка к цене. **Отдельный**
+  cap `maxBumpPerItemTiyin` (default **1_000_000 = 10000 сум**, не общий
+  с discount). Bump = легальная наценка, нет cost-floor — можно поднимать
+  выше. Дефолт 10000 сум закрывает разрывы 20-54к при «дырявом» складе.
 
 Один флаг → точное совпадение в обе стороны. По дефолту флаг **включён**
 (в Receipt.tsx fallback `null → true`).
+
+### tolerance дефолт
+
+`Receipt.tsx::DEFAULT_TOLERANCE_TIYIN = 500_000` (5000 сум). Раньше 100k
+(1000 сум) — при округлении цен до 1000 и редком складе ничего не
+матчилось. ±5000 + bump 10000 закрывает разумные разрывы. В чек всё
+равно пишется `pos.totalTiyin` (что заплатил клиент) — расширение
+безопасно. Переопределяется через `SettingKey.MatchToleranceTiyin`.
 
 ### Пул товаров — один запрос на чек
 
@@ -380,6 +434,174 @@ data=<json>`. Иначе в UI выводилось бы пустое «Не у�
 - `src-tauri/src/printer.rs` — `print_z_report` Tauri-команда + `build_z_report` (ESC/POS байты) + struct `ZReportPrintData`
 - `src/lib/epos/jsonrpc-client.ts` — `getZReportInfo()`, `openZReport()`, `closeZReport()` + интерфейс `JsonRpcZReportInfo`
 
+## Возвраты (refund) — full feature
+
+Кассир из Чеков → клик «Возврат» на ранее фискализированном чеке →
+`/refund/:fiscalReceiptId` → `processRefund()` отправляет `Api.SendRefundReceipt`
+в Communicator → ОФД и пишет `fiscal_refunds`.
+
+### Привязка к оригиналу — **критично** для ОФД
+
+Communicator/ОФД требует блок `refundInfo` в payload с ссылкой на оригинал.
+Без правильной привязки refund попадает в soliq.uz как «Бириктирилмаган»
+(не привязан к продажному чеку).
+
+```ts
+const refundReceipt = {
+  Time: formatGoTime(new Date()),
+  Items: originalReceipt.Items,    // 1-в-1 как ушло в ОФД при продаже
+  ReceivedCash: refundCash,
+  ReceivedCard: refundCard,
+  RefundInfo: refundInfo,          // PascalCase — на всякий случай
+  refundInfo,                      // camelCase — ОСНОВНОЙ по доке E-POS
+}
+```
+
+**2 правила** (нашли эмпирически после провала первой версии):
+1. **Имя поля — `refundInfo` (camelCase).** Шлём оба варианта (как с `spic` —
+   belt & suspenders). PascalCase `RefundInfo` Communicator игнорирует.
+2. **`dateTime` — строго 14 цифр `YYYYMMDDHHMMSS`.** Helper
+   `toRefundDateTime()` нормализует любой формат (Go-style «2026-05-16
+   09:54:18», ISO с мс, уже 14 цифр) выкидывая нецифры и беря первые 14.
+
+### Идемпотентность + защита
+
+- `fiscal_refunds.original_fiscal_id` **UNIQUE** — один продажный чек =
+  один refund. Повторный клик «Возврат» получает `RefundAlreadyExistsError`.
+- При успехе: INSERT `fiscal_refunds` + POST `/api/v1/inventory/unconsume`
+  на сервер (возврат остатка в пул) → SSE-broadcast другим магазинам.
+- `/unconsume` идемпотентен по `refund_fiscal_sign` (сервер проверяет
+  `inv_events` на наличие события `unconsumed` с этим признаком).
+- Если `/unconsume` упал (сеть/404) → строки кладутся в
+  `inv_pending_confirms` с `op_type='unconsume'`, `retryUnconsumePending()`
+  добивает на старте app + периодике, реконструируя items из
+  `fiscal_refunds→fiscal_receipts→match_items→server_item_id`.
+
+### Печать refund-чека
+
+Шапка **«QAYTARUV / ВОЗВРАТ ТОВАРА»** (двойная высота+ширина, жирная),
+подзаголовок «По чеку №ABC от 14.05.2026», `Chek turi: Qaytaruv`,
+footer без кешбэка («Tovar qaytarildi. Pul mijozga to'liq qaytarildi.»).
+
+### UI
+
+- Чеки (`/history`) — колонка «Возврат»: кнопка `/refund/:id` или бейдж
+  «Возвращён» (если уже был, см. `getRefundedFiscalIds` bulk-проверка).
+- `/refund/:id` показывает **3 секции**: оригинальные позиции МС
+  (что покупатель купил, до подмены ИКПУ — через `extractPositions`
+  из `ms_receipts.raw_json`), фискальные позиции (что ушло в ОФД),
+  поля возврата денег (cash/card pre-fill = как было оплачено).
+- Тестовый режим: refund НЕ уходит в ОФД, печатается «ТЕСТ — ВОЗВРАТ».
+
+### Файлы
+
+- `src-tauri/migrations/008_refunds.sql` — `fiscal_refunds` + колонка
+  `op_type` в `inv_pending_confirms` (`confirm`/`unconsume`).
+- `src/lib/db/fiscal-refunds.ts` — DAO (`insertFiscalRefund`,
+  `getRefundByOriginalFiscalId`, `getRefundedFiscalIds`).
+- `src/lib/epos/refund.ts` — `processRefund()`, `toRefundDateTime()`,
+  `getDefaultRefundAmounts()`, `RefundAlreadyExistsError`.
+- `src/lib/epos/jsonrpc-client.ts` — `JsonRpcRefundInfo` + `RefundInfo` в
+  `JsonRpcReceipt` (плюс camelCase alias в payload).
+- `src/lib/inventory/{server-client,types}.ts` — `unconsume()` + типы.
+- `src/lib/inventory/retry.ts` — `retryUnconsumePending()`.
+- `src/routes/Refund.tsx` — UI.
+- Backend `mytoolbox`:
+  - `backend/src/services/inventory/reservations.js::unconsume()` —
+    атомарная функция (`BEGIN→FOR UPDATE→qty_consumed-=qty→inv_events→COMMIT`),
+    идемпотентность по `refund_fiscal_sign` через `inv_events`.
+  - `backend/src/routes/inventory.js::shopRouter.post('/unconsume')`.
+
+## Sync приходов: сервер = источник правды
+
+`esf_items` — **зеркало** серверного `inv_items` (mytoolbox Postgres).
+Локально только read-cache, реальные reserve/confirm/release/unconsume
+идут на сервер атомарно с FOR UPDATE.
+
+### `syncFromServer({ forceFull?: true })`
+
+При `forceFull` тянем ПОЛНЫЙ снимок сервера и **reconcile**:
+- Собираем все увиденные `server_item_id` в Set.
+- `reconcileDeletedItems()`: локальные строки `source='remote'` которых
+  нет в Set — кандидаты на удаление.
+- **С историей фискализаций** (FK `match_items`): не удаляем физически
+  (PG/SQLite кинул бы FK violation, sync упал бы). Soft-void:
+  `qty_received := qty_consumed` (available=0) + пометка в notes.
+  Matcher фильтрует `available ≥ 1000` → товар-призрак не попадает в
+  подбор, аудит цел.
+- **Без истории**: физический `DELETE` чанками по 500.
+- Reconcile **только при forceFull** (полный снимок). Delta-sync с
+  `updated_since` не знает про удаления — для него reconcile отключён.
+- Safety: если pull оборвался → `throw` ДО reconcile (incomplete set
+  не двинет удаления).
+
+### Когда вызывается forceFull
+
+- `runInventoryHousekeeping()` на **старте app** — кэш самозалечивается
+  даже если sync вообще не было между запусками.
+- **Periodic timer** (раз в N мин) — тоже forceFull (бандвидс не критичен
+  для ≤5000 строк раз в N мин, корректность важнее).
+- **Открытие Catalog** (`/catalog`) — Справочник всегда показывает
+  актуальный серверный пул, не застрявший кэш.
+- Кнопка «🔄 Обновить с сервера» в Справочнике (manual trigger).
+
+### SSE (real-time updates)
+
+`subscribeToInventoryEvents` подписывается на `/api/v1/inventory/events`,
+получает `inv.items.updated` с массивом `{id, available}` → `applyItemsUpdate`
+делает UPDATE qty_received локально. SSE НЕ удаляет — для удалений нужен
+forceFull reconcile (см. выше).
+
+## Атомарность/идемпотентность склада
+
+### Server-side (mytoolbox Postgres) — крепкая
+
+| Операция | Атомарность | Идемпотентность |
+|---|---|---|
+| `reserve` | BEGIN→`SELECT FOR UPDATE` (ORDER BY id — анти-deadlock)→COMMIT | по `(shop_id, ms_receipt_id)` → `idempotent_replay: true` |
+| `confirm` | BEGIN+FOR UPDATE | по статусу резервации: `confirmed`→replay, `released`/`expired`→коды |
+| `release / extend / expireStale` | BEGIN+FOR UPDATE | ✓ |
+| `unconsume` | BEGIN→FOR UPDATE→`qty_consumed -= qty`→inv_events→COMMIT | по `refund_fiscal_sign` через `inv_events.meta` |
+| `bulkImport` | SAVEPOINT per-row | dedup 6-key (org+class+name+date+source_doc+price) |
+| `createItem` (ручной ввод) | BEGIN/COMMIT | dedup 6-key |
+
+**DB-инварианты `inv_items`** (физически нельзя нарушить):
+```sql
+CHECK (qty_consumed + qty_reserved <= qty_received)
+CHECK (qty_received/consumed/reserved >= 0)
+```
+
+### Local-side (epos_fiscal SQLite) — best-effort
+
+- `tauri-plugin-sql` имеет известный pitfall: `BEGIN/COMMIT` через
+  `db.execute` ненадёжен (разные коннекшены). Поэтому локальные
+  операции не транзакционные, но **идемпотентные**: повторный прогон
+  сходится к тому же состоянию.
+- `reconcileDeletedItems` — не транзакционный (несколько `db.execute`),
+  но запускается только на полном снимке → consistency over time.
+
+### Граница Communicator — не ACID (by design)
+
+`Communicator OK → INSERT fiscal_receipts/refunds`. Если INSERT упал
+после успеха Communicator → чек в ОФД, локально нет. Защита:
+`fiscal_refunds.original_fiscal_id UNIQUE` + `fiscal_receipts.fiscal_sign
+UNIQUE`. Стандартная distributed-проблема, та же что у sale, митигируется
+UNIQUE + ручная сверка.
+
+## Защиты фискализации (error classes)
+
+Все экспортятся из `@/lib/epos`. UI ловит и показывает понятные баннеры
+вместо сырых ошибок.
+
+| Класс | Когда | Что UI делает |
+|---|---|---|
+| `AlreadyFiscalizedError(fiscalSign, receiptSeq)` | `getFiscalReceiptByMsId()` нашёл существующий → защита от двойной фискализации. Бросается в Receipt.tsx UI dispatch + defense-in-depth в `fiscalize()` | Кнопка «Уже фискализирован» (disabled) + красный баннер с FiscalSign и ссылками «В Историю» / «Оформить возврат» |
+| `ShiftNotOpenError()` | Communicator вернул `ERROR_ZREPORT_IS_NOT_OPEN` (code 36909) или текст содержит ZREPORT_IS_NOT_OPEN — detect в catch `fiscalizeJsonRpc` | Жёлтый баннер «Смена ККМ не открыта» + кнопка «Перейти в Смену» |
+| `RefundAlreadyExistsError(existing)` | На `original_fiscal_id` уже есть `fiscal_refunds` | Баннер «Этот чек уже возвращён DD.MM, FiscalSign…» + поля disabled |
+| `InventoryConflictError(failed)` | Server `/reserve` вернул 409 INSUFFICIENT_STOCK | Toast «товар закончился» + auto-rematch с excluded server_ids |
+| `InventoryNotConfiguredError` | Нет `serverUrl`/`apiKey` в Settings | Сообщение «Откройте Настройки и подключитесь» |
+| `ManualPickOutcome.reason='below_cost'` (не Error, дискриминированный return) | `replacePositionManual` — `costWithVat > pos.totalTiyin` | Toast «себестоимость X выше суммы Y, нельзя в убыток» + в модалке строка серая с бейджем «убыток» |
+
 ## Релизы и Auto-update
 
 ```
@@ -471,36 +693,66 @@ src-tauri/
   migrations/
     001_initial.sql       ← 7 таблиц (settings, esf_items, ms_receipts, ...)
     002_logs.sql          ← логи диагностики
-    003_inventory_sync.sql ← inventory remote-конфиг (mytoolbox)
+    003_inventory_sync.sql ← inventory remote-конфиг (mytoolbox) + inv_pending_confirms
     004_drop_legacy_items.sql ← очистка legacy excel_items таблицы
     005_drop_legacy_epos_url.sql ← сброс старого uzpos URL
     006_revert_legacy_url.sql ← (откат после прерывания 0.10.8)
     007_force_jsonrpc_url.sql ← форсим http://localhost:3448/rpc/api
+    008_refunds.sql       ← fiscal_refunds (UNIQUE original_fiscal_id) +
+                            колонка op_type в inv_pending_confirms (confirm/unconsume)
 src/
   lib/
     db/                   ← SQLite, типы и DAO (SettingKey enum)
-    moysklad/             ← клиент + поллер с фильтром по retailStore
+      fiscal-refunds.ts   ← DAO refund-чеков (insert/getByOriginal/listRefunded)
+    moysklad/
+      variants-cache.ts   ← LRU+TTL5min для МС-модификаций (linked-ms enrichment)
     esf/                  ← Excel импорт с автомаппингом колонок
     matcher/
-      extract.ts          ← service-фильтр + нормализация
-      strategies.ts       ← 3 стратегии + pricing + cost-with-VAT
+      extract.ts          ← service-фильтр + нормализация + readLinkedBuhName
+                            из characteristics И attributes (для linked-ms)
+      strategies.ts       ← 4 стратегии (linked-ms first!) + pricing +
+                            cost-with-VAT + НДС override в loadMatcherPool +
+                            reconcile-фильтры (ИКПУ обязателен, package_code НЕТ)
       index.ts            ← buildMatch + distributeDiscount + distributeBump
-      types.ts            ← MatchCandidate (price/discount/vat) + MatcherOptions
+                            (separate maxBumpPerItemTiyin cap) +
+                            replacePositionManual (ManualPickOutcome) +
+                            recalculateAfterSwap + rebuildPositionWithSplit
+      search.ts           ← in-memory search для manual picker (substring +
+                            AND-токены + score, ИКПУ exact 14-17 digits)
+      types.ts            ← MatchCandidate + MatcherOptions +
+                            ManualPickOutcome (discriminated) + maxBumpPerItemTiyin
     epos/
-      jsonrpc-client.ts   ← /rpc/api + formatGoTime + JsonRpcZReportInfo
-                            методы: SendSaleReceipt, OpenZReport, CloseZReport,
-                            GetZReportInfo, GetReceiptCount, GetUnsentCount, Status
-      fiscalize.ts        ← главный flow + payment split + spic поле
+      jsonrpc-client.ts   ← /rpc/api + formatGoTime + JsonRpcZReportInfo +
+                            JsonRpcRefundInfo (camelCase в payload!)
+                            методы: SendSaleReceipt, SendRefundReceipt,
+                            OpenZReport, CloseZReport, GetZReportInfo, ...
+      fiscalize.ts        ← главный flow + payment split + spic поле +
+                            AlreadyFiscalizedError + ShiftNotOpenError +
+                            InventoryConflictError + InventoryNotConfiguredError
+      refund.ts           ← processRefund + toRefundDateTime + queueUnconsumePending +
+                            RefundAlreadyExistsError + печать «ВОЗВРАТ»
+    inventory/
+      server-client.ts    ← reserve/confirm/release/extend/unconsume/listItems
+      sync.ts             ← syncFromServer(forceFull) + reconcileDeletedItems
+      retry.ts            ← retryFiscalOkPending + retryUnconsumePending +
+                            runInventoryHousekeeping
+      pending-confirms.ts ← DAO (op_type='confirm'|'unconsume', listFiscalOk
+                            фильтрует op_type='confirm')
+      sse.ts              ← live updates (только qty, удаления через reconcile)
     printer/              ← JS-обёртка: printFiscalReceipt + printZReport
-                            + ZReportPrintData (mirror Rust-структуры)
-    log.ts                ← запись в logs таблицу
+                            (ReceiptData теперь имеет is_refund + original_receipt_ref)
+    log.ts                ← запись в logs таблицу (LogSource: + 'refund')
     updater.ts            ← autoApplyOnStartup
-  routes/                 ← 7 экранов:
-                            Dashboard / Receipt / Zreport / History
-                            / Catalog / Logs / Settings
+  routes/                 ← 8 экранов:
+                            Dashboard / Receipt / Refund (NEW) / Zreport /
+                            History / Catalog / Logs / Settings
+    Receipt/
+      ManualPickerModal.tsx ← модалка manual picker (поиск, фильтр цены,
+                              блок строк с убытком)
   components/
     Layout.tsx            ← sidebar: 6 пунктов (Касса/Смена/Чеки/Справочник/
                             Настройки/Логи) — пункт «Смена» с ClipboardList
+                            (Refund доступен через Чеки → клик «Возврат»)
 docs/
   external-apis/
     universal-communicator.md  ← Communicator API (JSON-RPC + legacy историч.)
@@ -557,33 +809,69 @@ docs/
 | «Не удалось открыть смену» с пустым сообщением | Communicator вернул JSON-RPC error без `message`, только `code/data`; смена уже была открыта | В `openShift()` сначала `getZReportInfo()` — если `CloseTime===''`, просто обновляем UI. `formatEposError()` показывает `code+data` если `message` пуст |
 | `getZReportInfo` рандомные timeout-ы | Communicator занят отправкой чека в ОФД | Retry до 3 раз с exp backoff (300→900ms) в `refresh()` Zreport.tsx |
 | «Не настроен принтер чеков» при печати Z | `SettingKey.PrinterName` пустой | Настройки → Печать чека → выбрать принтер |
+| Refund в soliq.uz попадает в «Бириктирилмаган» (не привязан к оригиналу) | (а) поле было `RefundInfo` PascalCase — Communicator игнорил; (б) `dateTime` не нормализован к 14 цифрам | Шлём ОБА варианта (`refundInfo` + `RefundInfo`); `toRefundDateTime()` нормализует к 14 цифрам YYYYMMDDHHMMSS |
+| Товары без ИКПУ блокировали фискализацию даже когда не были выбраны | Pool возвращал «призраков» без ИКПУ → multi-item их подбирал → guard в fiscalize блокировал чек | `loadMatcherPool` фильтрует `!class_code`; package_code НЕ фильтруем (опционален по mobile-api) |
+| После TRUNCATE/удаления приходов на сервере локальный кэш показывал призраков навсегда | Delta-sync только upsert'ил, никогда не удалял | `syncFromServer({forceFull:true})` теперь reconcile: удаляет orphans, soft-void для строк с FK-историей. Bootstrap + periodic + открытие Catalog — все forceFull |
+| Существующий `retryFiscalOkPending` хватал unconsume-строки и слал как confirm | `listFiscalOk` не фильтровал по op_type | `listFiscalOk` теперь `WHERE op_type='confirm' OR op_type IS NULL`; `retryUnconsumePending` отдельно обрабатывает unconsume-очередь |
+| Manual picker позволял выбрать товар приходом 1М на позицию 500к | Не было cost-floor для ручного выбора | `replacePositionManual` возвращает `ManualPickOutcome` с `reason='below_cost'`; в модалке строки-убытки серые + бейдж «убыток» + клик заблокирован |
+| Двойная фискализация из «Чеки → внутрь чека → Фискализировать» | UI не проверял существующий fiscal_receipt по ms_receipt_id | Receipt.tsx грузит `getFiscalReceiptByMsId` → дизейбл + баннер; `fiscalize()` defense-in-depth → `AlreadyFiscalizedError` |
+| `ERROR_ZREPORT_IS_NOT_OPEN` сырой код в UI | Нет detection в catch | Code 36909 / текст `/ZREPORT_IS_NOT_OPEN/i` → `ShiftNotOpenError` → жёлтый баннер «Откройте смену» + кнопка в /zreport |
+| matcher не подбирал — minus тыс. сум | Дырявый склад + жёсткий tolerance 1000 сум + общий bump cap 2000 не закрывал разрывы 20-54к | tolerance дефолт 500_000 тийинов (5000 сум); maxMultiItem 5→10; отдельный `maxBumpPerItemTiyin` 1_000_000 (10000 сум). Что не добралось — manual picker. UX-баннер «подобрано N/M, не хватает X» |
+| Неподобранные позиции жили только в `warnings` (текст), manual picker недостижим | `match.positions` содержал только matched | Теперь buildMatch добавляет позицию с пустым `candidates[]` → UI рисует строку «не подобрано» + кнопку manual; фискализация блокирована пока `hasUnmatched` |
+| Бухгалтер-упрощенец шлёт vat=0 в ЭСФ, но магазин на общем режиме продаёт с 12% | inv_item.vat_percent — это ставка ПОСТАВЩИКА, не магазина | `SettingKey.DefaultVatPercent` (default 12) → override всех vat в `loadMatcherPool` |
 
 ## Открытые вопросы
 
 - **VAT-формула**: по умолчанию `vat = total * percent / (100 + percent)` (НДС включён в цену). Если у магазина НДС начисляется сверху — нужно поменять `vatIncluded` → `vatAddedOn` в `matcher/strategies.ts`.
 - **Ключи подписи**: `~/.tauri/epos-fiscal.key` живёт только на одной машине разработчика. Если потеряем — нужно перевыпустить и заново публиковать клиентам (auto-update сломается). Бэкап ключа — обязательно.
 
-## Текущее состояние (на 2026-05-12, версия 0.10.18)
+## Текущее состояние (на 2026-05-19)
 
-- ✅ MVP функционально полный
-- ✅ Auto-update работает с подписью (Win + Mac)
-- ✅ Multi-shop архитектура (фильтр по точке продаж)
-- ✅ **MXIK доходит до ОФД** — поле `spic` в JSON-RPC payload, подтверждено реальным чеком и кешбэком клиенту (0.10.12)
-- ✅ Legacy /uzpos удалён в 0.10.13 — остался только JSON-RPC `/rpc/api`
-- ✅ JSON-RPC поддержка для актуального Communicator + Go-style date format
-- ✅ Импорт Excel: per-row try/catch вместо broken-транзакции (819 из 819 строк)
-- ✅ Matcher по дефолту vatStrict=false + tolerance 100k тийинов (без этого 0 матчей на реальных чеках)
-- ✅ Pricing-формула markup×VAT (последовательно, не суммой 22%)
-- ✅ `distributeDiscount` (matched > target) + `distributeBump` (matched < target) → точное совпадение суммы в обе стороны
-- ✅ price-bucket пишет `pos.totalTiyin` (что заплатил клиент), не расчётную цену
-- ✅ Скейл позиций при частичной оплате бонусами + skip фискализации при `rd.sum=0`
-- ✅ Фильтр услуг (`assortment.meta.type === 'service'`)
-- ✅ Авто-определение оплаты cash/card/QR/mixed из МС
-- ✅ Печать QR на термопринтер Xprinter XP-80 (CP866, ESC/POS native QR)
-- ✅ Тестовый режим без отправки в ОФД (но с печатью «ТЕСТ»)
-- ✅ Перформанс matcher: один пул на чек вместо N×5000 запросов
-- ✅ **Z-отчёт ККМ** — раздел `/zreport` в стиле E-POS Cashdesk, открытие/закрытие смены через Communicator, X/Z-печать своя (ESC/POS), auto-print Z при закрытии (0.10.14–0.10.16)
-- ✅ **Retry+guard для Communicator** — `refresh()` ретраит при timeout, `openShift()` не дублирует открытие если смена уже есть (0.10.18)
-- ✅ Полная документация в `docs/external-apis/` — Communicator API, E-POS Mobile API, FiscalDriveService
-- ✅ CI 7–10 мин (Win + Mac, без Linux)
-- ⏳ Реальная фискализация end-to-end **проверена** (MXIK + кешбэк ✅), но edge cases с возвратами и mixed-payment ещё не тестировались на проде
+### Версии
+
+- **Последний released tag:** `v0.10.18` (12.05.2026) — на этом сидят все 4 магазина в проде
+- **Dev-сборка (текущая):** `0.10.29` — НЕ тегнута. Авто-апдейт на магазины НЕ идёт. Для теста — dev-build `.exe` через `gh workflow run dev-build.yml` (см. `release:dev` в package.json)
+- **Накопленные фичи между 0.10.18 → 0.10.29 ждут production-тег** (8 крупных feature/fix коммитов)
+
+### ✅ Что готово и в коде (0.10.29)
+
+**Базовое (было в 0.10.18):**
+- MVP функционально полный, auto-update Win+Mac
+- Multi-shop архитектура, фильтр по точке продаж
+- MXIK через `spic` (подтверждено реальной фискализацией, кешбэк ✅)
+- JSON-RPC only (legacy /uzpos удалён)
+- Z-отчёт ККМ, smart open-shift, retry refresh
+- Печать QR на Xprinter (CP866, ESC/POS native QR)
+- Pricing markup×VAT с округлением, distributeDiscount/Bump
+
+**Добавлено 0.10.19 → 0.10.29:**
+
+| Версия | Что |
+|---|---|
+| 0.10.20-22 | Linked-ms (связка МС-модификация ↔ inv_item по «Бух. наименованию»), варианты sub-strategy (exact→substring≥15+model→token-fuzzy), enrichWithVariants подтягивает characteristics для product-чеков с TTL-кэшем (variants-cache.ts LRU500/5min) |
+| 0.10.23-24 | linked-ms также читает `attributes` product (не только characteristics модификации); clamp limit≤100 в МС /entity/retaildemand?expand= (HTTP 400 fix) |
+| 0.10.25 | **Manual picker** (modal с indexed search по пулу + price-filter); **НДС override** (SettingKey.DefaultVatPercent default 12); pool-фильтр по ИКПУ; **package_code сделан опциональным** (E-014 только при неверном); **Возвраты** (refund) — full feature: миграция 008, /refund/:id, processRefund, Api.SendRefundReceipt, печать «ВОЗВРАТ»; Button text-color fix для WKWebView Dark Mode |
+| 0.10.26 | **Sync reconcile** — сервер = источник правды: forceFull удаляет orphans + кнопка «Обновить с сервера» в Справочнике; bootstrap+periodic→forceFull (кэш самозалечивается) |
+| 0.10.27 | **Unconsume retry** — closes критическую дыру «refund терял остаток»: listFiscalOk фильтрует op_type='confirm', retryUnconsumePending отдельный обработчик. Backend mytoolbox: POST /api/v1/inventory/unconsume атомарный+идемпотентный |
+| 0.10.28 | Refund **привязка к оригиналу** (бириктирилган): поле `refundInfo` camelCase (оба варианта), `dateTime` нормализован к 14 цифрам; manual picker для **неподобранных** позиций (раньше только в warnings); карточка «Оригинал из МойСклад» в /refund |
+| 0.10.29 | **AlreadyFiscalizedError** (блок повторной фискализации из Чеков, UI + defense-in-depth); **ShiftNotOpenError** (понятный баннер на ZREPORT_IS_NOT_OPEN); manual picker **cost floor** (строки-убытки серые + бейдж); **тюнинг matcher** (maxMultiItem 5→10, tolerance 100k→500k, отдельный maxBumpPerItemTiyin=10000 сум); UX-баннер «подобрано N/M» |
+
+### 🔴 Что критично проверить на проде перед тегом
+
+1. **Refund.привязка** — после 0.10.28 fix: refund в soliq.uz должен попадать в **«Бириктирилган»** (не «Бириктирилмаган»). Этот fix ещё **не подтверждён** реальной фискализацией.
+2. **Двойная фискализация** — попробовать вернуться в уже-фискализированный чек: кнопка должна быть disabled + баннер.
+3. **Возвраты end-to-end** — refund → unconsume → остаток в пул → SSE → другие магазины видят. Backend /unconsume на mytoolbox задеплоен (Railway), endpoint доступен.
+
+### ⏳ Не сделано (Phase 2 / future)
+
+- **Частичный refund** (qty picker для каждой позиции). Сейчас только full refund — UNIQUE constraint на `original_fiscal_id`. Снять constraint + добавить `qty_refunded` в match_items.
+- **Авто-создание `retailreturn` в МС** при refund — сейчас МС-сторона не интегрирована (магазины оформляют возвраты в МС руками).
+- **Polling `retailreturn` из МС** (вариант «А» — отдельный поллер на refund-сущность МС).
+- **Refund EPS** (PAYME/CLICK/UZUM rollback) — refundEPS метод. Сейчас refund только cash/card.
+- **Sidebar пункт «Возвраты»** (список всех `fiscal_refunds` глобально для админа).
+- **Тег `v0.10.29`** для production раскатки на все магазины. Сейчас 4 магазина сидят на 0.10.18 — отстают на 11 версий.
+
+### 🔑 Безопасность (TODO)
+
+- Сменить пароль БД mytoolbox Postgres на Railway — он несколько раз светился в диалогах разработки (Postgres → Variables → Reset).
+- Бэкап minisign-ключа `~/.tauri/epos-fiscal.key` (живёт только на машине разработчика; если потеряем — auto-update сломается у всех клиентов).
