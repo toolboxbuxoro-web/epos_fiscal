@@ -105,6 +105,15 @@ export default function Receipt() {
    * предложил бы те же товары и снова получил 409.
    */
   const [excludedServerIds, setExcludedServerIds] = useState<number[]>([])
+  /**
+   * Открыта ли модалка «Karta turi». Появляется при клике «Фискализировать»
+   * когда оплата картой/QR/mixed (cardSum > 0). Кассир выбирает «Jismoniy
+   * shaxs» / «Korporativ» — этот выбор печатается на ленте (в ОФД не идёт).
+   *
+   * Модалка показывается ОДИН раз за сессию открытия чека. После выбора
+   * doFiscalize() запускается с переданным cardKind.
+   */
+  const [cardKindModal, setCardKindModal] = useState(false)
 
   const rd: MsRetailDemand | null = useMemo(() => {
     if (!receipt) return null
@@ -357,13 +366,34 @@ export default function Receipt() {
     }
   }
 
-  async function doFiscalize() {
+  /**
+   * Клик «Фискализировать»: если оплата чисто наличкой — сразу фискализируем.
+   * Иначе — открываем модалку выбора типа карты, фискализация запустится
+   * после клика «Jismoniy shaxs» / «Korporativ» в модалке.
+   *
+   * `paymentKind` уже посчитан выше через useMemo:
+   *   'cash'  → нет карты, модалка не нужна
+   *   'card' / 'qr' / 'mixed' → карта есть, спрашиваем тип
+   *   null    → fallback (rd.sum=0 и т.п.) — модалку не показываем
+   */
+  function onFiscalizeClick(): void {
+    if (paymentKind === 'card' || paymentKind === 'qr' || paymentKind === 'mixed') {
+      setCardKindModal(true)
+      return
+    }
+    void doFiscalize()
+  }
+
+  async function doFiscalize(cardKind?: 'fiz' | 'corp'): Promise<void> {
     if (!match || !receipt) return
     setFiscalizing(true)
     setError(null)
     setShiftNotOpen(false)
     try {
-      const result = await fiscalize(match, { msReceiptId: receipt.id })
+      const result = await fiscalize(match, {
+        msReceiptId: receipt.id,
+        cardKind,
+      })
       if (testMode) {
         const total = match.matchedTotalTiyin / 100
         const itemsCount = match.positions.reduce(
@@ -477,7 +507,7 @@ export default function Receipt() {
                 hasUnmatched ||
                 !!alreadyFiscalized
               }
-              onClick={doFiscalize}
+              onClick={onFiscalizeClick}
               icon={!fiscalizing ? <Send size={14} /> : undefined}
               title={
                 alreadyFiscalized
@@ -972,6 +1002,93 @@ export default function Receipt() {
           }}
         />
       )}
+
+      {/* Модалка «Karta turi» — выбор типа карты перед фискализацией.
+          Появляется когда есть карточная/QR/смешанная оплата (paymentKind !== 'cash').
+          Выбор НЕ уходит в ОФД (JSON-RPC не принимает) — печатается только
+          на ленте, как «Karta turi: Korporativ» / «Karta turi: Jismoniy shaxs»
+          в блоке «To'lov Turi», см. printer.rs::build_receipt. */}
+      {cardKindModal && (
+        <CardKindModal
+          cashTiyin={rd.cashSum ?? 0}
+          cardTiyin={(rd.noCashSum ?? 0) + (rd.qrSum ?? 0)}
+          onCancel={() => setCardKindModal(false)}
+          onPick={(kind) => {
+            setCardKindModal(false)
+            void doFiscalize(kind)
+          }}
+        />
+      )}
+    </div>
+  )
+}
+
+/**
+ * Минимальная модалка для выбора типа карты перед фискализацией.
+ *
+ * Не выносим в отдельный файл — компонент очень специфичен (используется
+ * только здесь, ~30 строк), и так держать ближе к месту использования
+ * понятнее. Стиль матчится с ManualPickerModal — overlay + central card.
+ */
+function CardKindModal(props: {
+  cashTiyin: number
+  cardTiyin: number
+  onCancel: () => void
+  onPick: (kind: 'fiz' | 'corp') => void
+}): JSX.Element {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm"
+      onClick={props.onCancel}
+    >
+      <div
+        className="w-full max-w-md mx-4 rounded-lg bg-canvas shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="border-b border-border px-5 py-4">
+          <div className="text-h4 font-medium text-ink">Тип карты для печати</div>
+          <div className="mt-1 text-caption text-ink-muted">
+            Кассир выбирает тип, который напечатается на ленте в блоке «To‘lov
+            shakli» (как в чеке E-POS Cashdesk). В ОФД не отправляется.
+          </div>
+          {(props.cashTiyin > 0 || props.cardTiyin > 0) && (
+            <div className="mt-3 space-y-0.5 text-caption text-ink-muted font-mono">
+              {props.cashTiyin > 0 && (
+                <div>Naqd: {tiyinToSumDisplay(props.cashTiyin)} сум</div>
+              )}
+              {props.cardTiyin > 0 && (
+                <div>
+                  Bank kartasi: {tiyinToSumDisplay(props.cardTiyin)} сум
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+        <div className="flex flex-col gap-2 p-5">
+          <Button
+            variant="primary"
+            onClick={() => props.onPick('fiz')}
+            className="justify-start"
+          >
+            Jismoniy shaxs (физлицо)
+          </Button>
+          <Button
+            variant="secondary"
+            onClick={() => props.onPick('corp')}
+            className="justify-start"
+          >
+            Korporativ (корпоративная)
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={props.onCancel}
+            className="mt-2"
+          >
+            Отмена
+          </Button>
+        </div>
+      </div>
     </div>
   )
 }

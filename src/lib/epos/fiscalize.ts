@@ -56,6 +56,18 @@ export interface FiscalizeOptions {
   receivedCash?: number
   receivedCard?: number
   msReceiptId?: number
+  /**
+   * Тип карты для печати на ленте (НЕ уходит в ОФД — JSON-RPC такого
+   * аргумента не имеет, см. epos-mobile-api.md).
+   *
+   * - `'fiz'`  → лента: «Karta turi: Jismoniy shaxs»
+   * - `'corp'` → лента: «Karta turi: Korporativ»
+   * - `undefined` → строка не печатается
+   *
+   * Выбирается кассиром в Receipt.tsx через модалку перед фискализацией,
+   * только когда есть карточная оплата (`receivedCard > 0`).
+   */
+  cardKind?: 'fiz' | 'corp'
 }
 
 export interface FiscalizeResult {
@@ -151,7 +163,15 @@ export async function fiscalize(
       AppletVersion: 'TEST',
     }
     // Печать всё равно отправляем — она не имеет побочных эффектов в ОФД.
-    await maybePrintReceipt(build, fakeFiscal, receivedCash, receivedCard, false, true)
+    await maybePrintReceipt(
+      build,
+      fakeFiscal,
+      receivedCash,
+      receivedCard,
+      false,
+      true,
+      opts.cardKind,
+    )
     return { fiscal: fakeFiscal, fiscalReceiptDbId: 0, matchDbId: null }
   }
 
@@ -312,7 +332,15 @@ export async function fiscalize(
   // 7. Авто-печать на термопринтер, если включено в Settings.
   // Печать НЕ должна валить фискализацию — чек уже в ОФД, лента это
   // просто удобство для покупателя. Любая ошибка идёт в логи.
-  await maybePrintReceipt(build, fiscal, receivedCash, receivedCard, false, false)
+  await maybePrintReceipt(
+    build,
+    fiscal,
+    receivedCash,
+    receivedCard,
+    false,
+    false,
+    opts.cardKind,
+  )
 
   return { fiscal, fiscalReceiptDbId, matchDbId }
 }
@@ -565,6 +593,7 @@ export async function maybePrintReceipt(
   receivedCard: number,
   isCopy: boolean,
   isTest: boolean = false,
+  cardKind?: 'fiz' | 'corp',
 ): Promise<void> {
   try {
     const enabled = (await getSetting(SettingKey.PrinterAutoPrint)) === 'true'
@@ -591,6 +620,7 @@ export async function maybePrintReceipt(
       receivedCard,
       isCopy,
       isTest,
+      cardKind,
     )
     const jobId = await printFiscalReceipt(printerName, data)
     await log.info('fiscalize', `Чек отправлен на печать (job #${jobId})`, {
@@ -616,6 +646,7 @@ async function buildReceiptData(
   receivedCard: number,
   isCopy: boolean,
   isTest: boolean,
+  cardKind?: 'fiz' | 'corp',
 ): Promise<ReceiptData> {
   const company = await readCompanySettings()
   const cashier = (await getSetting(SettingKey.MoyskladEmployeeName)) ?? ''
@@ -660,6 +691,10 @@ async function buildReceiptData(
     total_vat_str: formatTiyinForPrint(totalVatTiyin),
     cash_str: formatTiyinForPrint(receivedCash),
     card_str: formatTiyinForPrint(receivedCard),
+    // Печатается «Karta turi: …» только если кассир выбрал тип в модалке
+    // и оплата картой реально была. Если receivedCard=0 — Rust всё равно
+    // не вставит строку (доп. defensive check) благодаря пустому karta_turi.
+    karta_turi: receivedCard > 0 ? (cardKind ?? '') : '',
     cashier,
     terminal_id: fiscal.TerminalID,
     fiscal_sign: fiscal.FiscalSign,

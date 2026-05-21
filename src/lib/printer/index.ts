@@ -94,6 +94,16 @@ export interface ReceiptData {
   total_vat_str: string
   cash_str: string
   card_str: string
+  /**
+   * Тип карты (если была оплата картой/QR): 'fiz' → «Jismoniy shaxs»,
+   * 'corp' → «Korporativ». undefined/пусто → строка не печатается
+   * (например, если оплата чисто наличкой).
+   *
+   * Выбирается кассиром перед фискализацией в Receipt.tsx через модалку.
+   * В JSON-RPC `Api.SendSaleReceipt` это поле **не отправляется** (Mobile
+   * API не имеет такого аргумента) — только на печать локально.
+   */
+  karta_turi?: 'fiz' | 'corp' | ''
   cashier: string
   terminal_id: string
   fiscal_sign: string

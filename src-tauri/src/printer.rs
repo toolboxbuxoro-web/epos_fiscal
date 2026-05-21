@@ -68,6 +68,7 @@ pub fn print_test_qr(printer_name: String) -> Result<u64, String> {
         total_vat_str: "107.14".to_string(),
         cash_str: "1 000.00".to_string(),
         card_str: "0.00".to_string(),
+        karta_turi: String::new(),
         cashier: "TEST".to_string(),
         terminal_id: "TEST-MODE".to_string(),
         fiscal_sign: "0000000000".to_string(),
@@ -135,6 +136,14 @@ pub struct ReceiptData {
     pub total_vat_str: String,
     pub cash_str: String,
     pub card_str: String,
+    /// Тип карты (только для печати, в ОФД не отправляется):
+    ///   `""`     → строка «Karta turi» не печатается (default)
+    ///   `"fiz"`  → печатаем «Karta turi: Jismoniy shaxs»
+    ///   `"corp"` → печатаем «Karta turi: Korporativ»
+    /// JSON-RPC `Api.SendSaleReceipt` это поле не принимает, мы кладём его
+    /// только в ESC/POS-строку на ленте — как E-POS Cashdesk.
+    #[serde(default)]
+    pub karta_turi: String,
     pub cashier: String,
     pub terminal_id: String,
     pub fiscal_sign: String,
@@ -363,6 +372,18 @@ fn build_receipt(d: &ReceiptData) -> Vec<u8> {
         &mut buf,
         &two_cols("Bank kartasi:", &format!("{} so'm", d.card_str)),
     );
+    // Тип карты — печатается только если кассир выбрал в модалке перед
+    // фискализацией (см. Receipt.tsx). Формат как в чеке E-POS Cashdesk:
+    //   «Karta turi: Korporativ» / «Karta turi: Jismoniy shaxs».
+    // В ОФД через JSON-RPC это поле не уходит — только на ленту для учёта.
+    let karta_turi_label = match d.karta_turi.as_str() {
+        "corp" => Some("Korporativ"),
+        "fiz" => Some("Jismoniy shaxs"),
+        _ => None,
+    };
+    if let Some(label) = karta_turi_label {
+        write_line(&mut buf, &two_cols("Karta turi:", label));
+    }
     write_line(
         &mut buf,
         &two_cols(
