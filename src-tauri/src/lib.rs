@@ -59,6 +59,12 @@ pub fn run() {
             sql: include_str!("../migrations/009_fiscal_receipts_card_kind.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 10,
+            description: "fiscal_receipts_excluded_payment",
+            sql: include_str!("../migrations/010_fiscal_receipts_excluded_payment.sql"),
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()

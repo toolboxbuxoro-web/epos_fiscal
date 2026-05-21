@@ -231,6 +231,13 @@ export type MsReceiptStatus =
   | 'failed'
   | 'manual'
   | 'skipped'
+  /**
+   * Чек полностью оплачен через Click/Payme/QR — фискальный чек не выдаётся
+   * (магазин ведёт такие оплаты отдельно от ОФД). Кассир жмёт «Отметить как
+   * не фискальный» когда поле «Сумма через Click/Payme» = rd.sum (вся сумма
+   * исключена). Чек остаётся в Истории как notFiscal, не блокирует поллинг.
+   */
+  | 'not_required'
 
 export interface MsReceiptRow {
   id: number
@@ -301,6 +308,17 @@ export interface FiscalReceiptRow {
    * при печати refund-чека (Refund.tsx).
    */
   card_kind: 'fiz' | 'corp' | null
+  /**
+   * Сумма (тийины) которая была исключена из фискализации как Click/Payme/
+   * иной не-фискализируемый электронный платёж. См. migration 010.
+   *
+   * Чек МойСклад пришёл на сумму X, кассир пометил часть Y как Click/Payme,
+   * и в ОФД ушло X − Y. Это поле = Y. Для всех чеков до миграции 010 = 0.
+   *
+   * Используется для аудита и отчётов «сколько за день было Click/Payme».
+   * В refund / reprint не влияет — refund работает с фискальным итогом.
+   */
+  excluded_payment_tiyin: Tiyin
 }
 
 // ── replacement_log ──────────────────────────────────────────────

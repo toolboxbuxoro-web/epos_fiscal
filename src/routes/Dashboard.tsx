@@ -66,6 +66,7 @@ const STATUS_TO_BADGE: Record<
   failed: { label: 'Ошибка', status: 'error' },
   manual: { label: 'Ручной', status: 'warning' },
   skipped: { label: 'Пропущен', status: 'neutral' },
+  not_required: { label: 'Не фискальный', status: 'neutral' },
 }
 
 type Scope = 'shift' | 'all'
@@ -83,6 +84,7 @@ export default function Dashboard() {
     failed: 0,
     manual: 0,
     skipped: 0,
+    not_required: 0,
   })
   const [pollerStatus, setPollerStatus] = useState<PollerStatus | null>(null)
   const [loading, setLoading] = useState(true)

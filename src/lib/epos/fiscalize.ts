@@ -68,6 +68,18 @@ export interface FiscalizeOptions {
    * только когда есть карточная оплата (`receivedCard > 0`).
    */
   cardKind?: 'fiz' | 'corp'
+  /**
+   * Сумма (тийины) которую исключить из фискализации как Click/Payme.
+   *
+   * Когда магазин принимает Click/Payme — эти оплаты НЕ идут в ОФД.
+   * Кассир в Receipt.tsx вводит сумму, и фискальный чек строится на
+   * `ms_sum − excludePaymentTiyin`. Эта сумма вычитается из noCashSum/qrSum
+   * при распределении ReceivedCash/Card; cash не трогается.
+   *
+   * Сохраняется в `fiscal_receipts.excluded_payment_tiyin` для аудита.
+   * Default = 0 (фискализируем всё, как раньше).
+   */
+  excludePaymentTiyin?: number
 }
 
 export interface FiscalizeResult {
@@ -132,7 +144,12 @@ export async function fiscalize(
   // в EPOS/ОФД сходится: сумма items = сумма оплат. Если кассир хочет
   // переопределить (через FiscalizeOptions) — opts.receivedCash/Card
   // выигрывают.
-  const auto = determinePaymentFromMs(build.receipt, matchedTotal)
+  //
+  // opts.excludePaymentTiyin (Click/Payme) — вычитается из noCashSum+qrSum
+  // ПЕРЕД пропорциональным split, иначе ReceivedCard был бы завышен
+  // относительно фактической фискальной части.
+  const excludePayment = Math.max(0, opts.excludePaymentTiyin ?? 0)
+  const auto = determinePaymentFromMs(build.receipt, matchedTotal, excludePayment)
   const receivedCash = opts.receivedCash ?? auto.receivedCash
   const receivedCard = opts.receivedCard ?? auto.receivedCard
 
@@ -312,7 +329,8 @@ export async function fiscalize(
   // Server is authoritative. SSE придёт обратно и обновит локальный кэш.
   await confirmRemote(reserveResult.reservations, fiscal.FiscalSign)
 
-  // 5. Сохранить fiscal_receipt (включая card_kind для refund/reprint flow).
+  // 5. Сохранить fiscal_receipt (включая card_kind для refund/reprint flow
+  // и excluded_payment_tiyin для аудита Click/Payme).
   const fiscalReceiptDbId = await insertFiscalReceipt({
     ms_receipt_id: msReceiptId,
     match_id: matchDbId,
@@ -327,6 +345,7 @@ export async function fiscalize(
     // card_kind пишем только если оплата картой реально была. Для cash-only
     // чеков и тестового режима — null (строка «Karta turi» не печатается).
     card_kind: receivedCard > 0 ? (opts.cardKind ?? null) : null,
+    excluded_payment_tiyin: excludePayment,
   })
 
   // 6. Статус.
@@ -544,25 +563,32 @@ async function releaseRemote(
 function determinePaymentFromMs(
   rd: import('@/lib/moysklad/types').MsRetailDemand,
   matchedTotal: number,
+  excludeFromNonCash: number = 0,
 ): { receivedCash: number; receivedCard: number } {
   const cash = rd.cashSum ?? 0
-  const card = (rd.noCashSum ?? 0) + (rd.qrSum ?? 0)
-  const total = cash + card
+  const rawCard = (rd.noCashSum ?? 0) + (rd.qrSum ?? 0)
+  // excludeFromNonCash — это сумма Click/Payme которую кассир пометил как
+  // НЕ фискализируется (она была в noCashSum/qrSum МС). Вычитаем её ИЗ карты:
+  // оставшаяся часть rawCard − exclude фискализируется как ReceivedCard.
+  // Cash не трогаем — клиент действительно дал нал, эта часть фискальная.
+  // Если exclude > rawCard — кэп до rawCard (защита от отрицательной карты).
+  const effectiveCardSrc = Math.max(0, rawCard - Math.max(0, excludeFromNonCash))
+  const total = cash + effectiveCardSrc
 
   // Все нули — fallback на нал.
   if (total <= 0) {
     return { receivedCash: matchedTotal, receivedCard: 0 }
   }
-  // Только нал.
-  if (card === 0) {
+  // Только нал (после вычета exclude из карты — карты не осталось).
+  if (effectiveCardSrc === 0) {
     return { receivedCash: matchedTotal, receivedCard: 0 }
   }
-  // Только безнал (карта/QR).
+  // Только безнал (карта/QR), нала не было.
   if (cash === 0) {
     return { receivedCash: 0, receivedCard: matchedTotal }
   }
-  // Смешанная — пропорционально, остаток уходит в карту чтобы copecks
-  // не потерялись при округлении.
+  // Смешанная — пропорционально по cash/card соотношению ПОСЛЕ exclude.
+  // Остаток уходит в карту чтобы тийины не потерялись при округлении.
   const receivedCash = Math.round((matchedTotal * cash) / total)
   const receivedCard = matchedTotal - receivedCash
   return { receivedCash, receivedCard }

@@ -19,6 +19,12 @@ export interface NewFiscalReceipt {
    * В ОФД не отправляется.
    */
   card_kind?: 'fiz' | 'corp' | null
+  /**
+   * Сумма (тийины) которая была исключена из фискализации как Click/Payme.
+   * 0 (default) = ничего не исключалось, фискальный чек = ms_sum.
+   * См. migration 010 + FiscalReceiptRow.excluded_payment_tiyin.
+   */
+  excluded_payment_tiyin?: number
 }
 
 export async function insertFiscalReceipt(input: NewFiscalReceipt): Promise<number> {
@@ -26,8 +32,9 @@ export async function insertFiscalReceipt(input: NewFiscalReceipt): Promise<numb
   const result = await db.execute(
     `INSERT INTO fiscal_receipts (
        ms_receipt_id, match_id, terminal_id, receipt_seq, fiscal_sign, qr_code_url,
-       fiscal_datetime, applet_version, request_json, response_json, fiscalized_at, card_kind
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+       fiscal_datetime, applet_version, request_json, response_json, fiscalized_at,
+       card_kind, excluded_payment_tiyin
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
     [
       input.ms_receipt_id,
       input.match_id,
@@ -41,6 +48,7 @@ export async function insertFiscalReceipt(input: NewFiscalReceipt): Promise<numb
       input.response_json,
       now(),
       input.card_kind ?? null,
+      input.excluded_payment_tiyin ?? 0,
     ],
   )
   return result.lastInsertId ?? 0

@@ -49,18 +49,40 @@ export async function buildMatch(
   const matches: PositionMatch[] = []
   const warnings: string[] = []
 
+  // ── Эффективная таргет-сумма ─────────────────────────────────────
+  // Обычно = receipt.sum (что покупатель заплатил по МС). Но если кассир
+  // в UI указал что часть оплаты прошла через Click/Payme (не фискализируем) —
+  // matcher должен работать с уменьшенной суммой. Override приходит через
+  // opts.targetSumOverrideTiyin, см. MatcherOptions.
+  //
+  // `receipt.sum` НЕ мутируем (он используется в Refund.tsx, истории и т.д.).
+  // `effectiveTarget` — это локальный «target» для подбора + распределения.
+  //
+  // Если override отрицательный или > receipt.sum — игнорируем (защита).
+  const effectiveTarget =
+    typeof opts.targetSumOverrideTiyin === 'number' &&
+    opts.targetSumOverrideTiyin >= 0 &&
+    opts.targetSumOverrideTiyin <= receipt.sum
+      ? opts.targetSumOverrideTiyin
+      : receipt.sum
+
   // ── Скидка на чек МС (бонусы / баллы / ручная скидка) ────────────
   // В retaildemand `sum` — это что покупатель РЕАЛЬНО заплатил (после
   // вычета бонусов/баллов). Сумма позиций может быть БОЛЬШЕ — например
   // покупка на 1 000 000 сум, 100 000 закрыто баллами, к оплате 900 000.
-  // Фискализируем именно `receipt.sum`, не сумму товаров. Если сумма
-  // позиций больше rd.sum — пропорционально уменьшаем totalTiyin каждой
-  // позиции, чтобы matcher подбирал товары на правильную сумму.
+  // Фискализируем именно `effectiveTarget` (= receipt.sum минус Click/Payme).
+  // Если сумма позиций больше effectiveTarget — пропорционально уменьшаем
+  // totalTiyin каждой позиции, чтобы matcher подбирал товары на правильную сумму.
   //
-  // Если rd.sum = 0 (всё оплачено бонусами) — фискализировать нечего:
-  // ОФД не примет нулевой чек, да и обоснования нет.
+  // Если effectiveTarget = 0 (всё оплачено бонусами или Click/Payme) — фискализировать
+  // нечего: ОФД не примет нулевой чек.
   const positionsSumRaw = rawPositions.reduce((s, p) => s + p.totalTiyin, 0)
-  if (receipt.sum <= 0) {
+  if (effectiveTarget <= 0) {
+    const isClickPaymeCase =
+      effectiveTarget === 0 &&
+      typeof opts.targetSumOverrideTiyin === 'number' &&
+      opts.targetSumOverrideTiyin === 0 &&
+      receipt.sum > 0
     return {
       receipt,
       positions: [],
@@ -71,30 +93,43 @@ export async function buildMatch(
       canAutoFiscalize: false,
       mode: 'classic',
       warnings: [
-        'Чек оплачен бонусами / баллами полностью (сумма к оплате 0). ' +
-          'Фискализация не нужна — фискальный чек создаётся только на сумму, ' +
-          'реально проведённую через кассу.',
+        isClickPaymeCase
+          ? 'Вся сумма чека помечена как оплата через Click/Payme — фискальный ' +
+            'чек не выдаётся. Закройте чек как «не фискальный».'
+          : 'Чек оплачен бонусами / баллами полностью (сумма к оплате 0). ' +
+            'Фискализация не нужна — фискальный чек создаётся только на сумму, ' +
+            'реально проведённую через кассу.',
       ],
     }
   }
 
-  // Если МС-сумма меньше суммы позиций — масштабируем позиции пропорционально.
+  // Если эффективный target меньше суммы позиций — масштабируем позиции пропорционально.
   // Скейл применяется ДО подбора: matcher работает с уже-скейленной позиций.
   const positions =
-    positionsSumRaw > 0 && receipt.sum < positionsSumRaw
+    positionsSumRaw > 0 && effectiveTarget < positionsSumRaw
       ? rawPositions.map((p) => ({
           ...p,
-          totalTiyin: Math.round((p.totalTiyin * receipt.sum) / positionsSumRaw),
+          totalTiyin: Math.round((p.totalTiyin * effectiveTarget) / positionsSumRaw),
         }))
       : rawPositions
-  if (positionsSumRaw > 0 && receipt.sum < positionsSumRaw) {
-    const scaledOff = positionsSumRaw - receipt.sum
+  if (positionsSumRaw > 0 && effectiveTarget < positionsSumRaw) {
+    const scaledOff = positionsSumRaw - effectiveTarget
+    // Различаем причину скейла: Click/Payme или бонусы — баннер у кассира
+    // будет точнее.
+    const isExcludeScale =
+      typeof opts.targetSumOverrideTiyin === 'number' &&
+      opts.targetSumOverrideTiyin < receipt.sum
     warnings.push(
-      `Покупатель оплатил частично бонусами/баллами: сумма к оплате ` +
-        `${tiyinToSumDisplay(receipt.sum)} сум, ` +
-        `сумма товаров ${tiyinToSumDisplay(positionsSumRaw)} сум, ` +
-        `списано ${tiyinToSumDisplay(scaledOff)} сум. ` +
-        `Подбор пропорционально уменьшен.`,
+      isExcludeScale
+        ? `Часть оплаты помечена как Click/Payme: МС-сумма ` +
+            `${tiyinToSumDisplay(receipt.sum)} сум, фискализируется ` +
+            `${tiyinToSumDisplay(effectiveTarget)} сум, исключено ` +
+            `${tiyinToSumDisplay(scaledOff)} сум. Позиции пропорционально уменьшены.`
+        : `Покупатель оплатил частично бонусами/баллами: сумма к оплате ` +
+            `${tiyinToSumDisplay(effectiveTarget)} сум, ` +
+            `сумма товаров ${tiyinToSumDisplay(positionsSumRaw)} сум, ` +
+            `списано ${tiyinToSumDisplay(scaledOff)} сум. ` +
+            `Подбор пропорционально уменьшен.`,
     )
   }
 
@@ -152,14 +187,14 @@ export async function buildMatch(
     }
   }
 
-  // Применить распределение скидок чтобы итоговая сумма совпала с rd.sum.
+  // Применить распределение скидок чтобы итоговая сумма совпала с effectiveTarget.
   // distributeDiscount: matched > target → срезаем скидкой (cost-floor).
   // distributeBump: matched < target → добавляем надбавку к цене (без cost-floor).
   // Оба гейтятся одним флагом opts.discountForExactSum, симметрично.
   // Каждое — no-op в своём «не моём» направлении, поэтому safe вызывать оба.
-  const discountWarnings = distributeDiscount(matches, receipt.sum, opts)
+  const discountWarnings = distributeDiscount(matches, effectiveTarget, opts)
   warnings.push(...discountWarnings)
-  const bumpWarnings = distributeBump(matches, receipt.sum, opts)
+  const bumpWarnings = distributeBump(matches, effectiveTarget, opts)
   warnings.push(...bumpWarnings)
 
   // matchedTotal теперь = сумма (priceTiyin - discountTiyin) каждого кандидата.
@@ -169,7 +204,10 @@ export async function buildMatch(
       s + m.candidates.reduce((cs, c) => cs + c.priceTiyin - c.discountTiyin, 0),
     0,
   )
-  const totalDiff = matchedTotal - receipt.sum
+  // totalDiff считается ОТ effectiveTarget (не от ms_sum) — это то расхождение
+  // которое релевантно для подбора. Поле в return называется
+  // `originalTotalTiyin` и хранит МС-сумму для UI «оригинал из МС».
+  const totalDiff = matchedTotal - effectiveTarget
 
   // Преобладающая стратегия — самая «слабая» из применённых.
   const overallStrategy = pickOverallStrategy(matches.map((m) => m.strategy))
@@ -183,10 +221,10 @@ export async function buildMatch(
   const hasUnmatched = matches.some((m) => m.candidates.length === 0)
   const shouldTryHolistic =
     mode === 'holistic' ||
-    (mode === 'auto' && (hasUnmatched || matchedTotal !== receipt.sum))
+    (mode === 'auto' && (hasUnmatched || matchedTotal !== effectiveTarget))
 
   if (shouldTryHolistic) {
-    const holistic = planHolistic(receipt.sum, pool, opts)
+    const holistic = planHolistic(effectiveTarget, pool, opts)
     if (holistic.ok) {
       void log.info(
         'matcher',
@@ -196,7 +234,7 @@ export async function buildMatch(
           unmatchedBefore: matches.filter((m) => m.candidates.length === 0).length,
           classicTotal: matchedTotal,
           holisticTotal: holistic.plan.totalTiyin,
-          target: receipt.sum,
+          target: effectiveTarget,
         },
       )
       const holisticMatched = holistic.plan.totalTiyin
@@ -206,7 +244,7 @@ export async function buildMatch(
         receipt,
         positions: matches,
         overallStrategy,
-        totalDiffTiyin: holisticMatched - receipt.sum, // должен быть 0
+        totalDiffTiyin: holisticMatched - effectiveTarget, // должен быть 0
         originalTotalTiyin: receipt.sum,
         matchedTotalTiyin: holisticMatched,
         canAutoFiscalize: false, // holistic = всегда требует подтверждения кассира
@@ -216,7 +254,7 @@ export async function buildMatch(
           ...warnings,
           `Подбор переключён в режим holistic: classic не сошёлся ` +
             `(${matches.filter((m) => m.candidates.length === 0).length} неподобранных, ` +
-            `сумма ${tiyinToSumDisplay(matchedTotal)} ≠ ${tiyinToSumDisplay(receipt.sum)}). ` +
+            `сумма ${tiyinToSumDisplay(matchedTotal)} ≠ ${tiyinToSumDisplay(effectiveTarget)}). ` +
             `Чек собран целиком на сумму, фискальные строки см. справа.`,
           ...holistic.plan.notes,
         ],
@@ -227,7 +265,7 @@ export async function buildMatch(
     void log.warn(
       'matcher',
       `[holistic] fallback отклонён: ${holistic.reason} — ${holistic.detail}`,
-      { mode, target: receipt.sum },
+      { mode, target: effectiveTarget },
     )
     warnings.push(
       `Holistic-режим не справился (${holistic.reason}): ${holistic.detail}. ` +
@@ -248,6 +286,9 @@ export async function buildMatch(
     positions: matches,
     overallStrategy,
     totalDiffTiyin: totalDiff,
+    // originalTotalTiyin = ВСЕГДА receipt.sum (для UI «оригинал из МС» это
+    // настоящая МС-сумма, не effectiveTarget). matchedTotalTiyin =
+    // effectiveTarget (или близко к нему через bump/discount).
     originalTotalTiyin: receipt.sum,
     matchedTotalTiyin: matchedTotal,
     canAutoFiscalize,
@@ -328,7 +369,14 @@ export function recalculateAfterSwap(
   // Поднимаем лимит до 500k тийинов (5000 сум) — это совпадает с swapTolerance
   // в `tryPriceBucket`, так что любая выбранная альтернатива гарантированно
   // компенсируется и итог чека будет = receipt.sum.
-  const target_sum = result.receipt.sum
+  // target_sum уважает Click/Payme exclude (opts.targetSumOverrideTiyin):
+  // после swap/split/manual чек должен сойтись на фискальную, а не МС-сумму.
+  const target_sum =
+    typeof opts.targetSumOverrideTiyin === 'number' &&
+    opts.targetSumOverrideTiyin >= 0 &&
+    opts.targetSumOverrideTiyin <= result.receipt.sum
+      ? opts.targetSumOverrideTiyin
+      : result.receipt.sum
   const swapOpts: MatcherOptions = {
     ...opts,
     discountForExactSum: true, // forced ON для swap — иначе сумма съедет
@@ -426,7 +474,14 @@ export function rebuildPositionWithSplit(
 
   // Те же расширенные лимиты что и для swap — split может дать большую
   // погрешность по сумме чем 2000 сум, особенно при N=4-5.
-  const target_sum = result.receipt.sum
+  // target_sum уважает Click/Payme exclude (opts.targetSumOverrideTiyin):
+  // после swap/split/manual чек должен сойтись на фискальную, а не МС-сумму.
+  const target_sum =
+    typeof opts.targetSumOverrideTiyin === 'number' &&
+    opts.targetSumOverrideTiyin >= 0 &&
+    opts.targetSumOverrideTiyin <= result.receipt.sum
+      ? opts.targetSumOverrideTiyin
+      : result.receipt.sum
   const adjustOpts: MatcherOptions = {
     ...opts,
     discountForExactSum: true,
@@ -565,7 +620,14 @@ export function replacePositionManual(
   })
 
   // Distribute discount/bump чтобы сумма чека сошлась 1-в-1
-  const target_sum = result.receipt.sum
+  // target_sum уважает Click/Payme exclude (opts.targetSumOverrideTiyin):
+  // после swap/split/manual чек должен сойтись на фискальную, а не МС-сумму.
+  const target_sum =
+    typeof opts.targetSumOverrideTiyin === 'number' &&
+    opts.targetSumOverrideTiyin >= 0 &&
+    opts.targetSumOverrideTiyin <= result.receipt.sum
+      ? opts.targetSumOverrideTiyin
+      : result.receipt.sum
   const manualOpts: MatcherOptions = {
     ...opts,
     maxDiscountPerItemTiyin: Math.max(

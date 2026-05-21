@@ -314,4 +314,20 @@ export interface MatcherOptions {
    * (greedy крупного). По умолчанию 2 000 000 (20 000 сум).
    */
   holisticFillerThresholdTiyin?: Tiyin
+  /**
+   * Альтернативная таргет-сумма для подбора (в тийинах).
+   *
+   * Если задана — matcher работает по этой сумме вместо `receipt.sum`:
+   * скейлинг позиций, holistic-fallback, distributeDiscount/Bump, проверка
+   * `canAutoFiscalize` — все используют этот override.
+   *
+   * Зачем: магазин принимает Click/Payme отдельно от ОФД. Кассир в UI
+   * вводит «Сумма через Click/Payme» = X, и matcher должен собрать чек
+   * на `receipt.sum − X`. Сам `receipt.sum` мы не мутируем (это сырые
+   * данные МС, используются в Refund и других местах) — а просто говорим
+   * matcher'у: «делай вид что чек на сумму Y».
+   *
+   * Если не задана — поведение как раньше (`receipt.sum` это правда).
+   */
+  targetSumOverrideTiyin?: Tiyin
 }

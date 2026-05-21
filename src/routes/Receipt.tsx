@@ -114,6 +114,24 @@ export default function Receipt() {
    * doFiscalize() запускается с переданным cardKind.
    */
   const [cardKindModal, setCardKindModal] = useState(false)
+  /**
+   * Сумма (тийины) которую кассир пометил как Click/Payme — НЕ фискализируется.
+   *
+   * Эффективный фискальный target = rd.sum − excludeTiyin. Поле редактируется
+   * в мини-карточке над сравнительными колонками; при изменении matcher
+   * перезапускается (debounced 400ms) и пересобирает план на новую сумму.
+   *
+   * Default = 0 — поведение идентично текущему (фискализируется вся ms_sum).
+   * Если excludeTiyin = rd.sum (или больше) — фискализировать нечего, кнопка
+   * «Фискализировать» меняется на «Отметить как не фискальный».
+   */
+  const [excludeTiyin, setExcludeTiyin] = useState(0)
+  /**
+   * Текстовый ввод поля «Сумма через Click/Payme» (в сумах, для UX).
+   * Хранится отдельно от excludeTiyin чтобы пользователь мог печатать
+   * частично («10», «100», «1000») без преждевременного парсинга.
+   */
+  const [excludeInputStr, setExcludeInputStr] = useState('')
 
   const rd: MsRetailDemand | null = useMemo(() => {
     if (!receipt) return null
@@ -201,6 +219,32 @@ export default function Receipt() {
   useEffect(() => {
     void load()
   }, [id])
+
+  /**
+   * Debounced rebuild при изменении excludeTiyin.
+   *
+   * Когда кассир редактирует поле «Сумма через Click/Payme» — ждём 400ms
+   * после последнего нажатия и перезапускаем `load()`. matcher пересоберёт
+   * план с новым `effectiveTarget = rd.sum − excludeTiyin`.
+   *
+   * Skip первый рендер (когда excludeTiyin=0 — это default, чек только что
+   * загрузился через основной useEffect выше). Skip пока match не загружен.
+   */
+  useEffect(() => {
+    if (!match) return
+    // Защита: не пересобирать если excludeTiyin не меняется (например при
+    // первом монтировании когда default=0 совпадает с тем что было). Сравним
+    // с тем что matcher уже использовал.
+    const lastOverride = matcherOpts.targetSumOverrideTiyin
+    const expected = (rd?.sum ?? 0) - excludeTiyin
+    if (lastOverride === expected) return
+    const t = setTimeout(() => {
+      void load()
+    }, 400)
+    return () => clearTimeout(t)
+    // load() сам подхватит свежий excludeTiyin через замыкание.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [excludeTiyin])
 
   async function load() {
     setBusy(true)
@@ -336,6 +380,11 @@ export default function Receipt() {
         return 'auto'
       })()
 
+      // Click/Payme: если кассир пометил часть оплаты как электронную —
+      // matcher работает с уменьшенной таргет-суммой. Передаём через override,
+      // не мутируя parsed.sum (его читает ещё Refund.tsx, history и т.д.).
+      const effectiveTarget = Math.max(0, parsed.sum - excludeTiyin)
+
       const opts: MatcherOptions = {
         toleranceTiyin: tolerance,
         markupPercent,
@@ -346,6 +395,11 @@ export default function Receipt() {
         defaultVatPercent,
         matcherMode,
         excludeServerItemIds: excludedServerIds.length > 0 ? excludedServerIds : undefined,
+        // Если excludeTiyin > 0 — matcher собирает план на rd.sum − exclude.
+        // Если excludeTiyin = 0 — override не передаём (matcher работает по rd.sum
+        // как всегда). Это сохраняет старое поведение для чеков без Click/Payme.
+        targetSumOverrideTiyin:
+          excludeTiyin > 0 && effectiveTarget >= 0 ? effectiveTarget : undefined,
       }
       const result = await buildMatch(parsed, opts)
       setMatch(result)
@@ -363,6 +417,35 @@ export default function Receipt() {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(false)
+    }
+  }
+
+  /**
+   * Пометить чек как «не фискальный» — вся сумма прошла через Click/Payme
+   * (или иные не-фискализируемые электронные платежи). В ОФД ничего не
+   * отправляется, ms_receipt получает status='not_required'.
+   *
+   * Условие активации этой кнопки: excludeTiyin >= rd.sum.
+   */
+  async function markNotRequired(): Promise<void> {
+    if (!receipt || !rd) return
+    setFiscalizing(true)
+    setError(null)
+    try {
+      await setMsReceiptStatus(receipt.id, 'not_required')
+      void log.info(
+        'fiscalize',
+        `Чек ${receipt.ms_name} помечен как не фискальный (Click/Payme)`,
+        { msReceiptId: receipt.id, msSum: rd.sum, excludeTiyin },
+      )
+      toast.success('Чек помечен как не фискальный (Click/Payme)', {
+        duration: 4000,
+      })
+      nav('/history')
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setFiscalizing(false)
     }
   }
 
@@ -393,6 +476,10 @@ export default function Receipt() {
       const result = await fiscalize(match, {
         msReceiptId: receipt.id,
         cardKind,
+        // Click/Payme exclude — пробрасываем в fiscalize чтобы:
+        // 1. determinePaymentFromMs вычел из noCashSum/qrSum
+        // 2. сохранилось в fiscal_receipts.excluded_payment_tiyin для аудита
+        excludePaymentTiyin: excludeTiyin > 0 ? excludeTiyin : undefined,
       })
       if (testMode) {
         const total = match.matchedTotalTiyin / 100
@@ -497,34 +584,51 @@ export default function Receipt() {
             >
               Назад
             </Button>
-            <Button
-              variant="primary"
-              loading={fiscalizing}
-              disabled={
-                fiscalizing ||
-                match.positions.length === 0 ||
-                itemsWithoutIkpu.length > 0 ||
-                hasUnmatched ||
-                !!alreadyFiscalized
-              }
-              onClick={onFiscalizeClick}
-              icon={!fiscalizing ? <Send size={14} /> : undefined}
-              title={
-                alreadyFiscalized
-                  ? 'Чек уже фискализирован — повторная фискализация запрещена'
-                  : hasUnmatched
-                    ? 'Есть неподобранные позиции — подберите их вручную'
-                    : itemsWithoutIkpu.length > 0
-                      ? `Невозможно фискализировать: ${itemsWithoutIkpu.length} товаров без ИКПУ`
-                      : undefined
-              }
-            >
-              {alreadyFiscalized
-                ? 'Уже фискализирован'
-                : testMode
-                  ? 'Тестовая фискализация'
-                  : 'Фискализировать'}
-            </Button>
+            {/* Если кассир пометил всю сумму как Click/Payme — фискализировать
+                нечего. Кнопка меняется на «Отметить как не фискальный»: ставим
+                ms_receipt.status='not_required', в ОФД ничего не уходит. */}
+            {excludeTiyin >= rd.sum && rd.sum > 0 ? (
+              <Button
+                variant="secondary"
+                loading={fiscalizing}
+                disabled={fiscalizing || !!alreadyFiscalized}
+                onClick={markNotRequired}
+                title="Вся сумма прошла через Click/Payme — фискальный чек не выдаётся"
+              >
+                {alreadyFiscalized
+                  ? 'Уже фискализирован'
+                  : 'Отметить как не фискальный'}
+              </Button>
+            ) : (
+              <Button
+                variant="primary"
+                loading={fiscalizing}
+                disabled={
+                  fiscalizing ||
+                  match.positions.length === 0 ||
+                  itemsWithoutIkpu.length > 0 ||
+                  hasUnmatched ||
+                  !!alreadyFiscalized
+                }
+                onClick={onFiscalizeClick}
+                icon={!fiscalizing ? <Send size={14} /> : undefined}
+                title={
+                  alreadyFiscalized
+                    ? 'Чек уже фискализирован — повторная фискализация запрещена'
+                    : hasUnmatched
+                      ? 'Есть неподобранные позиции — подберите их вручную'
+                      : itemsWithoutIkpu.length > 0
+                        ? `Невозможно фискализировать: ${itemsWithoutIkpu.length} товаров без ИКПУ`
+                        : undefined
+                }
+              >
+                {alreadyFiscalized
+                  ? 'Уже фискализирован'
+                  : testMode
+                    ? 'Тестовая фискализация'
+                    : 'Фискализировать'}
+              </Button>
+            )}
           </div>
         }
       />
@@ -689,6 +793,102 @@ export default function Receipt() {
           </Card.Body>
         </Card>
       )}
+
+      {/* Click/Payme exclude — мини-карточка. При вводе суммы matcher
+          пересобирает план на rd.sum - exclude (debounced 400ms).
+          В ОФД ничего не отправляется, на ленте упоминаний Click/Payme нет.
+          Только фискализируется уменьшенная сумма + сохраняется
+          excluded_payment_tiyin в БД для аудита. */}
+      <Card>
+        <Card.Body className="space-y-3">
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div>
+              <div className="text-body font-medium text-ink">
+                Сумма через Click / Payme
+              </div>
+              <div className="mt-0.5 text-caption text-ink-muted">
+                Введите сумму электронной оплаты которая НЕ фискализируется.
+                Фискальный чек будет на оставшуюся сумму{' '}
+                <span className="font-mono">
+                  ({tiyinToSumDisplay(rd.sum)} сум) − введённая
+                </span>
+                .
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                inputMode="numeric"
+                placeholder="0"
+                className="w-40 rounded-md border border-border bg-canvas px-3 py-2 text-right font-mono text-body text-ink focus:border-primary focus:outline-none"
+                value={excludeInputStr}
+                onChange={(e) => {
+                  // Принимаем цифры, пробелы, запятую. Парсим в целые сум.
+                  const raw = e.target.value
+                  setExcludeInputStr(raw)
+                  const cleaned = raw.replace(/[^\d]/g, '')
+                  const sumValue = cleaned === '' ? 0 : Number.parseInt(cleaned, 10) || 0
+                  // Ограничиваем 0 ≤ value ≤ rd.sum (в тийинах ×100)
+                  const tiyinValue = Math.max(
+                    0,
+                    Math.min(sumValue * 100, rd.sum),
+                  )
+                  setExcludeTiyin(tiyinValue)
+                }}
+                aria-label="Сумма через Click/Payme (не фискализируется)"
+              />
+              <span className="text-body text-ink-muted">сум</span>
+              {excludeTiyin > 0 && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setExcludeInputStr('')
+                    setExcludeTiyin(0)
+                  }}
+                  title="Сбросить — фискализировать всю сумму"
+                >
+                  Сбросить
+                </Button>
+              )}
+            </div>
+          </div>
+          {excludeTiyin > 0 && (
+            <div className="rounded-md bg-warning-soft p-3 text-caption text-ink space-y-1">
+              <div>
+                <strong className="text-warning">Внимание:</strong> МС-чек на{' '}
+                <span className="font-mono">
+                  {tiyinToSumDisplay(rd.sum)} сум
+                </span>
+                , фискализируется только{' '}
+                <span className="font-mono font-semibold">
+                  {tiyinToSumDisplay(Math.max(0, rd.sum - excludeTiyin))} сум
+                </span>{' '}
+                (исключено{' '}
+                <span className="font-mono">
+                  {tiyinToSumDisplay(excludeTiyin)} сум
+                </span>{' '}
+                как Click/Payme).
+              </div>
+              {excludeTiyin >= rd.sum && (
+                <div className="text-warning font-medium">
+                  Вся сумма электронная — фискальный чек не выдаётся. Нажмите
+                  «Отметить как не фискальный».
+                </div>
+              )}
+              {/* Sanity-check: exclude больше чем безналичная часть МС. Не блок,
+                  только информация — кассир знает что делает. */}
+              {excludeTiyin > (rd.noCashSum ?? 0) + (rd.qrSum ?? 0) && (
+                <div className="text-ink-muted">
+                  Примечание: введённая сумма больше безналичной части по МС
+                  ({tiyinToSumDisplay((rd.noCashSum ?? 0) + (rd.qrSum ?? 0))}{' '}
+                  сум). Проверьте.
+                </div>
+              )}
+            </div>
+          )}
+        </Card.Body>
+      </Card>
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <Side title="Оригинал из МойСклад" sumTiyin={rd.sum}>
