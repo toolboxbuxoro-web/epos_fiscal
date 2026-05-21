@@ -324,6 +324,10 @@ function buildReceiptDataFromHistory(
     total_vat_str: formatTiyinForPrint(totalVatTiyin),
     cash_str: formatTiyinForPrint(receivedCash),
     card_str: formatTiyinForPrint(receivedCard),
+    // Тип карты — берём из БД (был выбран кассиром при первичной фискализации,
+    // сохранён в migration 009). Для legacy-чеков до 009 — null, строка не
+    // печатается. Для оплат чисто наличкой (receivedCard=0) тоже не печатаем.
+    karta_turi: receivedCard > 0 ? (receipt.card_kind ?? '') : '',
     cashier: settings[SettingKey.MoyskladEmployeeName] ?? '',
     terminal_id: receipt.terminal_id,
     fiscal_sign: receipt.fiscal_sign,

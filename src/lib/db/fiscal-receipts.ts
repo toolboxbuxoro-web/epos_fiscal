@@ -12,6 +12,13 @@ export interface NewFiscalReceipt {
   applet_version: string | null
   request_json: string
   response_json: string
+  /**
+   * Тип карты, выбранный кассиром перед фискализацией. Для оплат чисто
+   * наличкой и для тестового режима — `null`. Используется для печати
+   * строки «Karta turi» на refund-чеке и копии из Истории.
+   * В ОФД не отправляется.
+   */
+  card_kind?: 'fiz' | 'corp' | null
 }
 
 export async function insertFiscalReceipt(input: NewFiscalReceipt): Promise<number> {
@@ -19,8 +26,8 @@ export async function insertFiscalReceipt(input: NewFiscalReceipt): Promise<numb
   const result = await db.execute(
     `INSERT INTO fiscal_receipts (
        ms_receipt_id, match_id, terminal_id, receipt_seq, fiscal_sign, qr_code_url,
-       fiscal_datetime, applet_version, request_json, response_json, fiscalized_at
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+       fiscal_datetime, applet_version, request_json, response_json, fiscalized_at, card_kind
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
     [
       input.ms_receipt_id,
       input.match_id,
@@ -33,9 +40,25 @@ export async function insertFiscalReceipt(input: NewFiscalReceipt): Promise<numb
       input.request_json,
       input.response_json,
       now(),
+      input.card_kind ?? null,
     ],
   )
   return result.lastInsertId ?? 0
+}
+
+/**
+ * Получить fiscal_receipt по id (для refund flow / печати копии).
+ * Возвращает null если запись не найдена.
+ */
+export async function getFiscalReceiptById(
+  id: number,
+): Promise<FiscalReceiptRow | null> {
+  const db = await getDb()
+  const rows = await db.select<FiscalReceiptRow[]>(
+    `SELECT * FROM fiscal_receipts WHERE id = $1 LIMIT 1`,
+    [id],
+  )
+  return rows[0] ?? null
 }
 
 export async function getFiscalReceiptByMsId(msReceiptId: number): Promise<FiscalReceiptRow | null> {

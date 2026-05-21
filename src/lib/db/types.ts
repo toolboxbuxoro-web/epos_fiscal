@@ -291,6 +291,16 @@ export interface FiscalReceiptRow {
   request_json: string
   response_json: string
   fiscalized_at: EpochSec
+  /**
+   * Тип карты, выбранный кассиром при первичной фискализации
+   * (для печати на ленте). `null` для оплат чисто наличкой и для
+   * legacy-чеков до миграции 009.
+   *   'fiz'  → «Karta turi: Jismoniy shaxs»
+   *   'corp' → «Karta turi: Korporativ»
+   * В ОФД не отправляется. Используется на печать в History.tsx и
+   * при печати refund-чека (Refund.tsx).
+   */
+  card_kind: 'fiz' | 'corp' | null
 }
 
 // ── replacement_log ──────────────────────────────────────────────

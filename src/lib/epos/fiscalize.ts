@@ -312,7 +312,7 @@ export async function fiscalize(
   // Server is authoritative. SSE придёт обратно и обновит локальный кэш.
   await confirmRemote(reserveResult.reservations, fiscal.FiscalSign)
 
-  // 5. Сохранить fiscal_receipt.
+  // 5. Сохранить fiscal_receipt (включая card_kind для refund/reprint flow).
   const fiscalReceiptDbId = await insertFiscalReceipt({
     ms_receipt_id: msReceiptId,
     match_id: matchDbId,
@@ -324,6 +324,9 @@ export async function fiscalize(
     applet_version: fiscal.AppletVersion ?? null,
     request_json: requestJson,
     response_json: JSON.stringify(fiscal),
+    // card_kind пишем только если оплата картой реально была. Для cash-only
+    // чеков и тестового режима — null (строка «Karta turi» не печатается).
+    card_kind: receivedCard > 0 ? (opts.cardKind ?? null) : null,
   })
 
   // 6. Статус.

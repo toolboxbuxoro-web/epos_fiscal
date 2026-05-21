@@ -542,6 +542,11 @@ async function buildRefundReceiptData(
     total_vat_str: formatTiyinForPrint(totalVatTiyin),
     cash_str: formatTiyinForPrint(refundCash),
     card_str: formatTiyinForPrint(refundCard),
+    // Тип карты для печати — берём из оригинального чека (был выбран кассиром
+    // при первичной фискализации). Печатается только если в refund реально
+    // есть карточная часть (refundCard > 0) и оригинал имел сохранённый тип.
+    // Для legacy-чеков до миграции 009 card_kind=null → строка не печатается.
+    karta_turi: refundCard > 0 ? (original.fr.card_kind ?? '') : '',
     cashier,
     terminal_id: fiscal.TerminalID,
     fiscal_sign: fiscal.FiscalSign,
