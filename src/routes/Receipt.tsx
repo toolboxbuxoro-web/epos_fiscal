@@ -712,56 +712,6 @@ export default function Receipt() {
       )}
 
 
-      {/* Holistic-режим: чек собран целостно на сумму (авто-fallback или
-          ручная сборка кассиром). Фискальные строки = match.holistic.lines
-          (правая колонка). Текст баннера зависит от источника — авто или ручной
-          (различаем по notes, см. ManualReceiptModal). */}
-      {match.mode === 'holistic' && match.holistic && (() => {
-        const isManual = match.holistic.notes.some((n) =>
-          n.includes('вручную'),
-        )
-        const lineCount = match.holistic.lines.length
-        const sumStr = (match.matchedTotalTiyin / 100).toLocaleString('ru-RU')
-        return (
-          <Card className="border-warning/30 bg-warning-soft">
-            <Card.Body className="flex items-start gap-3">
-              <TriangleAlert size={18} className="text-warning shrink-0 mt-0.5" />
-              <div className="flex-1">
-                <div className="text-body font-medium text-warning">
-                  {isManual
-                    ? 'Чек собран вручную'
-                    : 'Чек собран совокупно (holistic-режим)'}
-                </div>
-                <div className="mt-1 text-caption text-ink">
-                  {isManual ? (
-                    <>
-                      Кассир собрал чек вручную: {lineCount}{' '}
-                      {lineCount === 1 ? 'товар' : 'товаров'} на{' '}
-                      <span className="font-mono">{sumStr} сум</span>. Список
-                      фискальных строк — справа.
-                    </>
-                  ) : (
-                    <>
-                      Подбор «позиция-в-позицию» не сошёлся ({' '}
-                      {
-                        match.positions.filter(
-                          (p) => p.candidates.length === 0,
-                        ).length
-                      }{' '}
-                      из {match.positions.length} не нашлось индивидуально).
-                      Matcher собрал чек целиком на сумму{' '}
-                      <span className="font-mono">{sumStr} сум</span> из{' '}
-                      {lineCount} {lineCount === 1 ? 'товара' : 'товаров'}.
-                      Список фискальных строк — справа.
-                    </>
-                  )}
-                </div>
-              </div>
-            </Card.Body>
-          </Card>
-        )
-      })()}
-
       {error && (
         <Card className="border-danger/20 bg-danger-soft">
           <Card.Body className="flex items-start gap-3">
@@ -1073,10 +1023,53 @@ export default function Receipt() {
         )
       })()}
 
+      {/* Holistic-режим — компактный сворачиваемый блок внизу. Свёрнут по
+          умолчанию (одна строка), кассир разворачивает за деталями. Сами
+          фискальные строки и так видны в правой колонке. */}
+      {match.mode === 'holistic' && match.holistic && (() => {
+        const isManual = match.holistic.notes.some((n) =>
+          n.includes('вручную'),
+        )
+        const lineCount = match.holistic.lines.length
+        const sumStr = (match.matchedTotalTiyin / 100).toLocaleString('ru-RU')
+        return (
+          <details className="rounded-md border border-warning/20 bg-warning-soft px-3 py-2">
+            <summary className="flex cursor-pointer select-none items-center gap-2 text-caption text-warning">
+              <TriangleAlert size={13} className="shrink-0" />
+              {isManual
+                ? 'Чек собран вручную'
+                : 'Чек собран совокупно (holistic)'}
+            </summary>
+            <div className="mt-2 text-caption text-ink">
+              {isManual ? (
+                <>
+                  Кассир собрал чек вручную: {lineCount}{' '}
+                  {lineCount === 1 ? 'товар' : 'товаров'} на{' '}
+                  <span className="font-mono">{sumStr} сум</span>. Список
+                  фискальных строк — справа.
+                </>
+              ) : (
+                <>
+                  Подбор «позиция-в-позицию» не сошёлся ({' '}
+                  {
+                    match.positions.filter(
+                      (p) => p.candidates.length === 0,
+                    ).length
+                  }{' '}
+                  из {match.positions.length} не нашлось индивидуально).
+                  Matcher собрал чек целиком на сумму{' '}
+                  <span className="font-mono">{sumStr} сум</span> из{' '}
+                  {lineCount} {lineCount === 1 ? 'товара' : 'товаров'}.
+                  Список фискальных строк — справа.
+                </>
+              )}
+            </div>
+          </details>
+        )
+      })()}
+
       {/* Предупреждения — компактный сворачиваемый блок. Свёрнут по умолчанию
-          (одна строка), кассир разворачивает только если интересны детали.
-          Раньше это была большая карточка с заголовком — занимала много места
-          внизу под нужное-не-нужное. */}
+          (одна строка), кассир разворачивает только если интересны детали. */}
       {match.warnings.length > 0 && (
         <details className="rounded-md border border-warning/20 bg-warning-soft px-3 py-2">
           <summary className="flex cursor-pointer select-none items-center gap-2 text-caption text-warning">
