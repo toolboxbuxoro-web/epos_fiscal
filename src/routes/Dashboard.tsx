@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   ArrowRight,
+  ChevronLeft,
+  ChevronRight,
   Receipt as ReceiptIcon,
   RefreshCcw,
   Wifi,
@@ -15,6 +17,7 @@ import {
 } from '@/lib/db'
 import {
   ensurePollerStarted,
+  pollMoyskladNow,
   subscribePollerStatus,
 } from '@/lib/poller-runtime'
 import type { PollerStatus } from '@/lib/moysklad/poller'
@@ -48,9 +51,12 @@ function getShiftIdFromRawJson(raw: string): string | null {
   }
 }
 
+// «Подобраны» (matched) убран: статус нигде не выставляется — поллер
+// пишет 'pending', после фискализации сразу 'fiscalized'. Вкладка всегда
+// показывала 0 и только путала кассира. Сам статус 'matched' оставлен
+// в enum на случай будущего использования.
 const STATUS_FILTERS: { value: MsReceiptStatus | 'all'; label: string }[] = [
   { value: 'pending', label: 'Ожидают' },
-  { value: 'matched', label: 'Подобраны' },
   { value: 'fiscalized', label: 'Готовы' },
   { value: 'failed', label: 'Ошибки' },
   { value: 'all', label: 'Все' },
@@ -71,6 +77,51 @@ const STATUS_TO_BADGE: Record<
 
 type Scope = 'shift' | 'all'
 
+/** Сколько чеков на странице в режиме «Все чеки». */
+const ALL_PAGE_SIZE = 50
+
+/** Тип оплаты чека — определяется по cashSum/noCashSum/qrSum из raw_json МС. */
+type PayKind = 'cash' | 'card' | 'qr' | 'mixed' | null
+
+/**
+ * Определить способ оплаты из raw_json МС-чека.
+ *
+ * МС возвращает три поля: cashSum (наличные), noCashSum (банк.карта),
+ * qrSum (QR — Click/Payme/Uzcard QR). Логика та же что в Receipt.tsx::paymentKind.
+ *   - есть нал И есть безнал → 'mixed' (смешанная)
+ *   - только qr → 'qr'
+ *   - только карта → 'card'
+ *   - только нал → 'cash'
+ *   - всё по нулям / битый json → null
+ */
+function getPaymentKind(rawJson: string): PayKind {
+  try {
+    const rd = JSON.parse(rawJson) as {
+      cashSum?: number
+      noCashSum?: number
+      qrSum?: number
+    }
+    const cash = rd.cashSum ?? 0
+    const card = rd.noCashSum ?? 0
+    const qr = rd.qrSum ?? 0
+    const hasCard = card > 0 || qr > 0
+    if (cash > 0 && hasCard) return 'mixed'
+    if (qr > 0) return 'qr'
+    if (card > 0) return 'card'
+    if (cash > 0) return 'cash'
+    return null
+  } catch {
+    return null
+  }
+}
+
+const PAY_LABEL: Record<'cash' | 'card' | 'qr' | 'mixed', string> = {
+  cash: 'Наличные',
+  card: 'Карта',
+  qr: 'QR',
+  mixed: 'Смешанная',
+}
+
 export default function Dashboard() {
   const navigate = useNavigate()
   const [filter, setFilter] = useState<MsReceiptStatus | 'all'>('pending')
@@ -89,6 +140,8 @@ export default function Dashboard() {
   const [pollerStatus, setPollerStatus] = useState<PollerStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  /** Страница (0-based) для режима «Все чеки». В режиме смены не используется. */
+  const [page, setPage] = useState(0)
 
   useEffect(() => {
     void ensurePollerStarted().catch((e) => {
@@ -106,20 +159,39 @@ export default function Dashboard() {
       void load()
     }, 5000)
     return () => clearInterval(t)
-  }, [filter])
+    // scope/filter/page в deps:
+    //   - «Текущая смена» — load() грузит широкое окно чеков для in-memory
+    //     подсчёта по смене (page игнорируется)
+    //   - «Все чеки» — постраничный SQL-запрос (offset = page × PAGE_SIZE)
+    //     + глобальный аггрегат счётчиков
+  }, [filter, scope, page])
 
   async function load() {
     setLoading(true)
     try {
-      const [rows, byStatus] = await Promise.all([
-        listMsReceipts({
-          status: filter === 'all' ? undefined : filter,
-          limit: 100,
-        }),
-        countMsReceiptsByStatus(),
-      ])
-      setItems(rows)
-      setCounts(byStatus)
+      if (scope === 'all') {
+        // Глобально: ПОСТРАНИЧНЫЙ список + SQL-аггрегат счётчиков.
+        const [rows, byStatus] = await Promise.all([
+          listMsReceipts({
+            status: filter === 'all' ? undefined : filter,
+            limit: ALL_PAGE_SIZE,
+            offset: page * ALL_PAGE_SIZE,
+          }),
+          countMsReceiptsByStatus(),
+        ])
+        setItems(rows)
+        setCounts(byStatus)
+      } else {
+        // По смене: грузим окно последних чеков (одна смена заведомо < 1000),
+        // дальше фильтрация по shiftId + по статусу и подсчёт бейджей идут
+        // in-memory (см. shiftItems / visibleItems / displayCounts). Это
+        // нужно потому что shiftId лежит внутри raw_json (JSON), и SQL им
+        // фильтровать нельзя.
+        const rows = await listMsReceipts({ limit: 1000 })
+        setItems(rows)
+        // counts (глобальный) в shift-scope не используется — displayCounts
+        // считает из shiftItems. Но обновим чтобы не висело старое значение.
+      }
       setError(null)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -128,13 +200,76 @@ export default function Dashboard() {
     }
   }
 
-  // Локальный фильтр по retailShift.id из raw_json. Поллер тащит все чеки
-  // в БД (для истории), а UI показывает текущую смену по умолчанию.
+  // Чеки ТЕКУЩЕЙ смены (все статусы) — фильтр по retailShift.id из raw_json.
+  // Поллер тащит все чеки в БД (для истории), UI по умолчанию показывает смену.
+  // В scope='all' пусто — там работаем напрямую с items.
+  const shiftItems = useMemo(() => {
+    if (scope !== 'shift') return []
+    if (!shift.shiftId) return []
+    return items.filter(
+      (it) => getShiftIdFromRawJson(it.raw_json) === shift.shiftId,
+    )
+  }, [items, scope, shift.shiftId])
+
+  // Что показывать в таблице:
+  //   scope='all'   — items уже отфильтрованы по статусу в load()
+  //   scope='shift' — shiftItems + ручной фильтр по выбранному статусу
   const visibleItems = useMemo(() => {
     if (scope === 'all') return items
-    if (!shift.shiftId) return []
-    return items.filter((it) => getShiftIdFromRawJson(it.raw_json) === shift.shiftId)
-  }, [items, scope, shift.shiftId])
+    if (filter === 'all') return shiftItems
+    return shiftItems.filter((it) => it.status === filter)
+  }, [items, shiftItems, scope, filter])
+
+  // Счётчики на бейджах — теперь УВАЖАЮТ scope:
+  //   scope='all'   — глобальный SQL-аггрегат (counts из load())
+  //   scope='shift' — пересчёт по чекам текущей смены (shiftItems)
+  // Раньше бейджи всегда показывали глобал → «Готовы 49» при пустой смене.
+  const displayCounts = useMemo<Record<MsReceiptStatus, number>>(() => {
+    if (scope === 'all') return counts
+    const c: Record<MsReceiptStatus, number> = {
+      pending: 0,
+      matched: 0,
+      fiscalized: 0,
+      failed: 0,
+      manual: 0,
+      skipped: 0,
+      not_required: 0,
+    }
+    for (const r of shiftItems) c[r.status]++
+    return c
+  }, [scope, counts, shiftItems])
+
+  // ── Пагинация режима «Все чеки» ───────────────────────────────────
+  // Всего записей под текущий фильтр: для конкретного статуса — counts[X],
+  // для «Все» — сумма всех. Берём из глобального аггрегата counts.
+  const allTotal = useMemo(() => {
+    if (filter === 'all') {
+      return Object.values(counts).reduce((s, n) => s + n, 0)
+    }
+    return counts[filter]
+  }, [filter, counts])
+  const allPageCount = Math.max(1, Math.ceil(allTotal / ALL_PAGE_SIZE))
+  const allRangeFrom = allTotal === 0 ? 0 : page * ALL_PAGE_SIZE + 1
+  const allRangeTo = Math.min(allTotal, page * ALL_PAGE_SIZE + items.length)
+
+  /**
+   * Кнопка «Обновить»: раньше только перечитывала локальную БД — кассир
+   * жал и «ничего не происходило», потому что новые чеки из МойСклад
+   * подтягивает поллер (раз в 30 сек), а не эта кнопка.
+   *
+   * Теперь кнопка сначала ПРИНУДИТЕЛЬНО опрашивает МойСклад (pollMoyskladNow),
+   * затем перечитывает БД (load). Так клик реально подтягивает свежие чеки.
+   */
+  async function refreshNow(): Promise<void> {
+    setLoading(true)
+    try {
+      await pollMoyskladNow()
+    } catch {
+      // Ошибки опроса отражаются в PollerIndicator — здесь глушим,
+      // load() ниже всё равно покажет что есть в БД.
+    }
+    await load()
+  }
 
   const subtitle = (() => {
     const total = visibleItems.length
@@ -170,6 +305,23 @@ export default function Dashboard() {
       ),
     },
     {
+      key: 'payment',
+      label: 'Оплата',
+      width: '130px',
+      cell: (r) => {
+        const k = getPaymentKind(r.raw_json)
+        if (!k) return <span className="text-ink-subtle">—</span>
+        // Смешанная — выделяем (кассиру важно: там может быть Click/Payme).
+        return (
+          <span
+            className={k === 'mixed' ? 'text-warning font-medium' : 'text-ink-muted'}
+          >
+            {PAY_LABEL[k]}
+          </span>
+        )
+      },
+    },
+    {
       key: 'status',
       label: 'Статус',
       width: '140px',
@@ -199,7 +351,8 @@ export default function Dashboard() {
           <Button
             variant="ghost"
             size="sm"
-            onClick={() => void load()}
+            onClick={() => void refreshNow()}
+            disabled={loading}
             icon={<RefreshCcw size={14} />}
           >
             Обновить
@@ -210,7 +363,13 @@ export default function Dashboard() {
       {/* Top row: scope selector + poller indicator */}
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div className="flex flex-wrap items-center gap-1.5">
-          <ScopeButton active={scope === 'shift'} onClick={() => setScope('shift')}>
+          <ScopeButton
+            active={scope === 'shift'}
+            onClick={() => {
+              setScope('shift')
+              setPage(0)
+            }}
+          >
             Текущая смена
             {shift.shiftId && shift.openedAt && (
               <span className="ml-1.5 text-ink-subtle">
@@ -221,7 +380,13 @@ export default function Dashboard() {
               </span>
             )}
           </ScopeButton>
-          <ScopeButton active={scope === 'all'} onClick={() => setScope('all')}>
+          <ScopeButton
+            active={scope === 'all'}
+            onClick={() => {
+              setScope('all')
+              setPage(0)
+            }}
+          >
             Все чеки
           </ScopeButton>
           {scope === 'shift' && !shift.shiftId && shift.ready && (
@@ -237,11 +402,15 @@ export default function Dashboard() {
       <div className="flex flex-wrap gap-2">
         {STATUS_FILTERS.map((f) => {
           const isActive = filter === f.value
-          const count = f.value === 'all' ? null : counts[f.value as MsReceiptStatus]
+          const count =
+            f.value === 'all' ? null : displayCounts[f.value as MsReceiptStatus]
           return (
             <button
               key={f.value}
-              onClick={() => setFilter(f.value)}
+              onClick={() => {
+                setFilter(f.value)
+                setPage(0)
+              }}
               className={cn(
                 'inline-flex items-center gap-2 rounded-md border px-3 py-1.5 text-caption transition-colors',
                 isActive
@@ -299,6 +468,39 @@ export default function Dashboard() {
           />
         )}
       </Card>
+
+      {/* Пагинация — только в режиме «Все чеки». В режиме смены весь
+          набор смены уже на экране (load грузит окно), страницы не нужны. */}
+      {scope === 'all' && allTotal > 0 && (
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <div className="text-caption text-ink-muted">
+            {allRangeFrom}–{allRangeTo} из {allTotal}
+          </div>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="ghost"
+              size="sm"
+              icon={<ChevronLeft size={14} />}
+              disabled={page <= 0 || loading}
+              onClick={() => setPage((p) => Math.max(0, p - 1))}
+            >
+              Назад
+            </Button>
+            <span className="text-caption text-ink-muted tabular-nums select-none">
+              Страница {page + 1} из {allPageCount}
+            </span>
+            <Button
+              variant="ghost"
+              size="sm"
+              iconRight={<ChevronRight size={14} />}
+              disabled={page >= allPageCount - 1 || loading}
+              onClick={() => setPage((p) => Math.min(allPageCount - 1, p + 1))}
+            >
+              Вперёд
+            </Button>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

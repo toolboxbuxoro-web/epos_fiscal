@@ -96,6 +96,7 @@ export async function countMsReceiptsByStatus(): Promise<Record<MsReceiptStatus,
     failed: 0,
     manual: 0,
     skipped: 0,
+    not_required: 0,
   } as Record<MsReceiptStatus, number>
   for (const row of rows) result[row.status] = row.c
   return result

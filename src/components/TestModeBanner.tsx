@@ -47,10 +47,8 @@ export function TestModeBanner() {
       <div className="mx-auto flex max-w-6xl items-center gap-3 px-6 py-2.5 text-body">
         <TriangleAlert size={16} className="shrink-0" />
         <div className="flex-1">
-          <strong>Тестовый режим включён.</strong>
-          <span className="ml-1 text-ink-muted">
-            Фискализация имитируется — в ОФД ничего не уходит.
-          </span>
+          <strong>Тестовый режим</strong>
+          <span className="ml-1 text-ink-muted">— в ОФД ничего не уходит</span>
         </div>
         <Button
           variant="ghost"

@@ -17,6 +17,7 @@ import { stopShiftRuntime } from '@/lib/moysklad'
 import { SystemStatusPanel } from './SystemStatusPanel'
 import { TestModeBanner, TestModeDot } from './TestModeBanner'
 import { DevMarker } from './DevMarker'
+import logoUrl from '@/assets/toolbox-fiscal.png'
 
 /**
  * Layout приложения — sidebar (слева) + outlet (контент).
@@ -90,9 +91,11 @@ export default function Layout() {
         {/* Шапка */}
         <div className="border-b border-border px-4 py-4">
           <div className="flex items-center gap-2.5">
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-primary text-ink-inverse">
-              <ReceiptIcon size={16} />
-            </div>
+            <img
+              src={logoUrl}
+              alt="Toolbox Fiscal"
+              className="h-9 w-9 shrink-0 rounded-lg object-cover"
+            />
             <div className="min-w-0 flex-1">
               <div className="text-caption text-ink-muted leading-tight">
                 Toolbox Fiscal

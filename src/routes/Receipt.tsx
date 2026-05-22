@@ -7,10 +7,6 @@ import {
   Check,
   ChevronLeft,
   ChevronRight,
-  Hand,
-  Minus,
-  Plus,
-  Scissors,
   CreditCard,
   QrCode,
   Send,
@@ -32,13 +28,11 @@ import {
   extractPositions,
   loadMatcherPool,
   recalculateAfterSwap,
-  rebuildPositionWithSplit,
-  replacePositionManual,
   type BuildMatchResult,
   type MatcherPool,
 } from '@/lib/matcher'
-import type { MatcherOptions } from '@/lib/matcher/types'
-import { ManualPickerModal } from './Receipt/ManualPickerModal'
+import type { HolisticPlan, MatcherOptions } from '@/lib/matcher/types'
+import { ManualReceiptModal } from './Receipt/ManualReceiptModal'
 import {
   fiscalize,
   AlreadyFiscalizedError,
@@ -75,17 +69,14 @@ export default function Receipt() {
 
   const [receipt, setReceipt] = useState<MsReceiptRow | null>(null)
   const [match, setMatch] = useState<BuildMatchResult | null>(null)
-  // Сохраняем опции последнего вызова buildMatch — нужны при swap/split
-  // (recalculateAfterSwap / rebuildPositionWithSplit вызывают distribute
-  // c теми же лимитами).
+  // Сохраняем опции последнего вызова buildMatch — нужны при swap
+  // (recalculateAfterSwap вызывает distribute с теми же лимитами).
   const [matcherOpts, setMatcherOpts] = useState<MatcherOptions>({})
-  // Кэш пула товаров — переиспользуется при swap/split чтобы не перегружать
-  // SQLite каждый клик. Загружается параллельно с buildMatch.
+  // Пул товаров справочника — нужен модалке ручной сборки чека
+  // (поиск + planHolistic для «Дособрать»). Грузится в load().
   const [pool, setPool] = useState<MatcherPool | null>(null)
-  // Тост для UX «не получилось раздробить» / «нет альтернатив».
-  const [splitToast, setSplitToast] = useState<string | null>(null)
-  // Индекс позиции для которой открыта модалка ручного подбора (null = закрыта).
-  const [manualPickerForPos, setManualPickerForPos] = useState<number | null>(null)
+  // Открыта ли модалка ручной сборки чека целиком.
+  const [manualModalOpen, setManualModalOpen] = useState(false)
   const [busy, setBusy] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [fiscalizing, setFiscalizing] = useState(false)
@@ -404,10 +395,9 @@ export default function Receipt() {
       const result = await buildMatch(parsed, opts)
       setMatch(result)
       setMatcherOpts(opts)
-      // Кэшируем пул для swap/split — заново не загружаем при каждом клике.
-      // buildMatch внутри тоже грузит pool, но эту копию из state мы используем
-      // в UI helpers (rebuildPositionWithSplit). Это +50ms при первом open
-      // приемлемо — у юзера всё равно идёт fetch МС-чека и тяжёлый buildMatch.
+      // Пул для модалки ручной сборки. buildMatch грузит его внутри, но
+      // нам нужна копия для UI (поиск + «Дособрать»). +50ms при открытии
+      // чека — приемлемо на фоне fetch МС-чека и самого buildMatch.
       const freshPool = await loadMatcherPool(opts)
       setPool(freshPool)
 
@@ -584,6 +574,16 @@ export default function Receipt() {
             >
               Назад
             </Button>
+            {/* Ручная сборка чека целиком — кассир сам набирает товары на
+                сумму. Недоступно если чек уже фискализирован. */}
+            <Button
+              variant="secondary"
+              onClick={() => setManualModalOpen(true)}
+              disabled={!pool || !!alreadyFiscalized || fiscalizing}
+              title="Собрать чек вручную: добавить/убрать товары, дособрать остаток"
+            >
+              Собрать вручную
+            </Button>
             {/* Если кассир пометил всю сумму как Click/Payme — фискализировать
                 нечего. Кнопка меняется на «Отметить как не фискальный»: ставим
                 ms_receipt.status='not_required', в ОФД ничего не уходит. */}
@@ -711,47 +711,56 @@ export default function Receipt() {
         </Card>
       )}
 
-      {testMode && (
-        <Card className="border-warning/20 bg-warning-soft">
-          <Card.Body className="flex items-start gap-3">
-            <TriangleAlert size={18} className="text-warning shrink-0 mt-0.5" />
-            <div className="text-body text-ink">
-              <strong className="text-warning">Тестовый режим включён.</strong>{' '}
-              Фискализация будет имитирована, в ОФД ничего не уйдёт. Чтобы
-              пробивать реально — выключите режим в{' '}
-              <em className="not-italic font-medium">Admin → Настройки</em>.
-            </div>
-          </Card.Body>
-        </Card>
-      )}
 
-      {/* Holistic-режим: classic per-position не сошёлся, чек собран целостно
-          на сумму. Фискальные строки = match.holistic.lines (правая колонка),
-          ручной подбор по позиции в этом режиме недоступен. */}
-      {match.mode === 'holistic' && match.holistic && (
-        <Card className="border-warning/30 bg-warning-soft">
-          <Card.Body className="flex items-start gap-3">
-            <TriangleAlert size={18} className="text-warning shrink-0 mt-0.5" />
-            <div className="flex-1">
-              <div className="text-body font-medium text-warning">
-                Чек собран совокупно (holistic-режим)
+      {/* Holistic-режим: чек собран целостно на сумму (авто-fallback или
+          ручная сборка кассиром). Фискальные строки = match.holistic.lines
+          (правая колонка). Текст баннера зависит от источника — авто или ручной
+          (различаем по notes, см. ManualReceiptModal). */}
+      {match.mode === 'holistic' && match.holistic && (() => {
+        const isManual = match.holistic.notes.some((n) =>
+          n.includes('вручную'),
+        )
+        const lineCount = match.holistic.lines.length
+        const sumStr = (match.matchedTotalTiyin / 100).toLocaleString('ru-RU')
+        return (
+          <Card className="border-warning/30 bg-warning-soft">
+            <Card.Body className="flex items-start gap-3">
+              <TriangleAlert size={18} className="text-warning shrink-0 mt-0.5" />
+              <div className="flex-1">
+                <div className="text-body font-medium text-warning">
+                  {isManual
+                    ? 'Чек собран вручную'
+                    : 'Чек собран совокупно (holistic-режим)'}
+                </div>
+                <div className="mt-1 text-caption text-ink">
+                  {isManual ? (
+                    <>
+                      Кассир собрал чек вручную: {lineCount}{' '}
+                      {lineCount === 1 ? 'товар' : 'товаров'} на{' '}
+                      <span className="font-mono">{sumStr} сум</span>. Список
+                      фискальных строк — справа.
+                    </>
+                  ) : (
+                    <>
+                      Подбор «позиция-в-позицию» не сошёлся ({' '}
+                      {
+                        match.positions.filter(
+                          (p) => p.candidates.length === 0,
+                        ).length
+                      }{' '}
+                      из {match.positions.length} не нашлось индивидуально).
+                      Matcher собрал чек целиком на сумму{' '}
+                      <span className="font-mono">{sumStr} сум</span> из{' '}
+                      {lineCount} {lineCount === 1 ? 'товара' : 'товаров'}.
+                      Список фискальных строк — справа.
+                    </>
+                  )}
+                </div>
               </div>
-              <div className="mt-1 text-caption text-ink">
-                Подбор «позиция-в-позицию» не сошёлся ({' '}
-                {match.positions.filter((p) => p.candidates.length === 0).length}{' '}
-                из {match.positions.length} не нашлось индивидуально). Matcher
-                собрал чек целиком на сумму{' '}
-                <span className="font-mono">
-                  {(match.matchedTotalTiyin / 100).toLocaleString('ru-RU')} сум
-                </span>{' '}
-                из {match.holistic.lines.length}{' '}
-                {match.holistic.lines.length === 1 ? 'товара' : 'товаров'}.
-                Список фискальных строк — справа.
-              </div>
-            </div>
-          </Card.Body>
-        </Card>
-      )}
+            </Card.Body>
+          </Card>
+        )
+      })()}
 
       {error && (
         <Card className="border-danger/20 bg-danger-soft">
@@ -798,7 +807,15 @@ export default function Receipt() {
           пересобирает план на rd.sum - exclude (debounced 400ms).
           В ОФД ничего не отправляется, на ленте упоминаний Click/Payme нет.
           Только фискализируется уменьшенная сумма + сохраняется
-          excluded_payment_tiyin в БД для аудита. */}
+          excluded_payment_tiyin в БД для аудита.
+
+          Показывается ТОЛЬКО когда в чеке есть карточная/QR/смешанная оплата.
+          Click/Payme — электронный платёж, он всегда в безналичной части МС
+          (noCashSum/qrSum). Для чеков чисто наличкой исключать нечего —
+          поле было бы лишним. paymentKind считается выше через useMemo. */}
+      {(paymentKind === 'card' ||
+        paymentKind === 'qr' ||
+        paymentKind === 'mixed') && (
       <Card>
         <Card.Body className="space-y-3">
           <div className="flex items-center justify-between gap-3 flex-wrap">
@@ -889,6 +906,7 @@ export default function Receipt() {
           )}
         </Card.Body>
       </Card>
+      )}
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <Side title="Оригинал из МойСклад" sumTiyin={rd.sum}>
@@ -929,9 +947,10 @@ export default function Receipt() {
           ) : (
           <PositionsTable
             positions={match.positions.flatMap((pm, posIdx): DisplayPosition[] => {
-              // Не подобрано (matcher ничего не нашёл) — одна строка-заглушка
-              // с кнопкой «Подобрать вручную». Без этого позиция была бы
-              // только в warnings, и кассир не смог бы её закрыть руками.
+              // Не подобрано (matcher ничего не нашёл) — одна строка-заглушка.
+              // Ручной подбор убран: при разреженном пуле срабатывает holistic
+              // (Настройки → Режим подбора). Если и он не справился — нужно
+              // дозаполнить склад. Фискализация блокируется через hasUnmatched.
               if (pm.candidates.length === 0) {
                 return [
                   {
@@ -941,21 +960,15 @@ export default function Receipt() {
                     vatPercent: pm.source.vatPercent,
                     meta: pm.source.classCode ?? '— не подобрано —',
                     matched: false,
-                    manual: pool
-                      ? { onPick: () => setManualPickerForPos(posIdx) }
-                      : undefined,
                   },
                 ]
               }
               return pm.candidates.map((c, candIdx) => {
-                // Стрелки swap рисуем только на ПЕРВОМ candidate в группе
-                // и только когда позиция не дроблёная (splitLevel=1).
-                // При splitLevel>1 несколько строк — нечего свапать одной кнопкой.
+                // Стрелки swap рисуем только на ПЕРВОМ candidate в группе.
                 const isFirstCand = candIdx === 0
                 const swap =
                   pm.swappable &&
                   isFirstCand &&
-                  pm.splitLevel === 1 &&
                   pm.alternatives.length > 1
                     ? {
                         altIndex: pm.selectedAlternativeIndex,
@@ -986,59 +999,6 @@ export default function Receipt() {
                             : undefined,
                       }
                     : undefined
-                // Split-контрол показывается только на ПЕРВОМ candidate группы.
-                // Кнопки enabled зависят от splitLevel + canSplitMore.
-                const split =
-                  pm.splittable && isFirstCand
-                    ? {
-                        level: pm.splitLevel,
-                        onMore:
-                          pm.canSplitMore && pool
-                            ? () => {
-                                const next = rebuildPositionWithSplit(
-                                  match,
-                                  posIdx,
-                                  pm.splitLevel + 1,
-                                  pool,
-                                  matcherOpts,
-                                )
-                                if (next) {
-                                  setMatch(next)
-                                  setSplitToast(null)
-                                } else {
-                                  setSplitToast(
-                                    `Не получилось раздробить позицию «${pm.source.name}» на ${pm.splitLevel + 1} товаров — недостаточно товаров на эту цену в справочнике.`,
-                                  )
-                                }
-                              }
-                            : undefined,
-                        onLess:
-                          pm.splitLevel > 1 && pool
-                            ? () => {
-                                const next = rebuildPositionWithSplit(
-                                  match,
-                                  posIdx,
-                                  pm.splitLevel - 1,
-                                  pool,
-                                  matcherOpts,
-                                )
-                                if (next) {
-                                  setMatch(next)
-                                  setSplitToast(null)
-                                }
-                              }
-                            : undefined,
-                      }
-                    : undefined
-                // Ручной подбор — открывает модалку с поиском по приходам.
-                // Доступен на первой строке группы для любой стратегии — даже
-                // когда у matcher уже что-то подобрано, кассир может пере-выбрать.
-                const manual =
-                  isFirstCand && pool
-                    ? {
-                        onPick: () => setManualPickerForPos(posIdx),
-                      }
-                    : undefined
                 return {
                   name: c.esfItem.name,
                   quantity: c.quantity,
@@ -1049,8 +1009,6 @@ export default function Receipt() {
                   meta: c.esfItem.class_code,
                   matched: true,
                   swap,
-                  split,
-                  manual,
                 }
               })
             })}
@@ -1058,24 +1016,6 @@ export default function Receipt() {
           )}
         </Side>
       </div>
-
-      {/* Баннер «не получилось раздробить» — показывается когда matcher не нашёл
-          достаточно товаров для запрошенного уровня split. */}
-      {splitToast && (
-        <Card className="border-warning/30 bg-warning-soft">
-          <Card.Body className="flex items-start gap-3">
-            <TriangleAlert size={18} className="text-warning shrink-0 mt-0.5" />
-            <div className="flex-1 text-body text-ink">{splitToast}</div>
-            <button
-              type="button"
-              onClick={() => setSplitToast(null)}
-              className="text-caption text-ink-muted hover:text-ink shrink-0"
-            >
-              Закрыть
-            </button>
-          </Card.Body>
-        </Card>
-      )}
 
       {(() => {
         // В holistic-режиме «N подобранных» по позициям не применимо —
@@ -1108,8 +1048,8 @@ export default function Receipt() {
                   <li className="flex gap-2">
                     <span className="text-warning shrink-0">·</span>
                     <span>
-                      <strong>Подобрать вручную</strong> — кнопка на
-                      неподобранной позиции (рекомендуется)
+                      Проверьте <strong>Режим подбора</strong> в Настройках —
+                      «Авто» включит holistic-подбор на сумму чека
                     </span>
                   </li>
                   <li className="flex gap-2">
@@ -1133,74 +1073,25 @@ export default function Receipt() {
         )
       })()}
 
+      {/* Предупреждения — компактный сворачиваемый блок. Свёрнут по умолчанию
+          (одна строка), кассир разворачивает только если интересны детали.
+          Раньше это была большая карточка с заголовком — занимала много места
+          внизу под нужное-не-нужное. */}
       {match.warnings.length > 0 && (
-        <Card className="border-warning/20 bg-warning-soft">
-          <Card.Header className="border-warning/20">
-            <div className="flex items-center gap-2">
-              <TriangleAlert size={16} className="text-warning" />
-              <Card.Title className="text-warning">
-                Предупреждения (детали)
-              </Card.Title>
-            </div>
-          </Card.Header>
-          <Card.Body>
-            <ul className="space-y-1.5 text-body text-ink">
-              {match.warnings.map((w, i) => (
-                <li key={i} className="flex gap-2">
-                  <span className="text-warning shrink-0">·</span>
-                  <span>{w}</span>
-                </li>
-              ))}
-            </ul>
-          </Card.Body>
-        </Card>
-      )}
-
-      {/* Модалка ручного подбора — открыта когда manualPickerForPos !== null.
-          Загруженный pool переиспользуем, не делаем нового запроса. */}
-      {manualPickerForPos !== null && pool && match.positions[manualPickerForPos] && (
-        <ManualPickerModal
-          pool={pool}
-          positionName={match.positions[manualPickerForPos]!.source.name}
-          targetPriceTiyin={match.positions[manualPickerForPos]!.source.totalTiyin}
-          targetQuantityMilli={match.positions[manualPickerForPos]!.source.quantity}
-          onClose={() => setManualPickerForPos(null)}
-          onPick={(result) => {
-            const outcome = replacePositionManual(
-              match,
-              manualPickerForPos,
-              result.item,
-              matcherOpts,
-            )
-            if (outcome.ok) {
-              setMatch(outcome.result)
-              setManualPickerForPos(null)
-              toast.success(`Выбран вручную: ${result.item.name}`, {
-                duration: 3000,
-              })
-              return
-            }
-            if (outcome.reason === 'below_cost') {
-              toast.error(
-                `Нельзя выбрать «${result.item.name}»: себестоимость с НДС ` +
-                  `${tiyinToSumDisplay(outcome.costTiyin)} сум выше суммы позиции ` +
-                  `${tiyinToSumDisplay(outcome.targetTiyin)} сум — продажа в убыток запрещена.`,
-                { duration: 6000 },
-              )
-            } else if (outcome.reason === 'not_enough_stock') {
-              toast.error(
-                `Не получилось подобрать «${result.item.name}» — остатка ` +
-                  `${milliQtyToDisplay(outcome.available)} шт, нужно ` +
-                  `${milliQtyToDisplay(outcome.needed)} шт.`,
-                { duration: 5000 },
-              )
-            } else {
-              toast.error('Не получилось подобрать (некорректная позиция).', {
-                duration: 5000,
-              })
-            }
-          }}
-        />
+        <details className="rounded-md border border-warning/20 bg-warning-soft px-3 py-2">
+          <summary className="flex cursor-pointer select-none items-center gap-2 text-caption text-warning">
+            <TriangleAlert size={13} className="shrink-0" />
+            Предупреждения ({match.warnings.length})
+          </summary>
+          <ul className="mt-2 space-y-1 text-caption text-ink">
+            {match.warnings.map((w, i) => (
+              <li key={i} className="flex gap-2">
+                <span className="text-warning shrink-0">·</span>
+                <span>{w}</span>
+              </li>
+            ))}
+          </ul>
+        </details>
       )}
 
       {/* Модалка «Karta turi» — выбор типа карты перед фискализацией.
@@ -1216,6 +1107,45 @@ export default function Receipt() {
           onPick={(kind) => {
             setCardKindModal(false)
             void doFiscalize(kind)
+          }}
+        />
+      )}
+
+      {/* Модалка ручной сборки чека целиком. Стартует планом программы,
+          кассир правит, «Дособрать» добивает остаток через holistic,
+          «Готово» → результат становится holistic-планом чека. */}
+      {manualModalOpen && pool && (
+        <ManualReceiptModal
+          targetTiyin={Math.max(0, rd.sum - excludeTiyin)}
+          pool={pool}
+          opts={matcherOpts}
+          initialLines={(match.mode === 'holistic' && match.holistic
+            ? match.holistic.lines
+            : match.positions.flatMap((pm) => pm.candidates)
+          ).map((c) => ({
+            esfItemId: c.esfItem.id,
+            qtyPcs: Math.round(c.quantity / 1000),
+          }))}
+          onClose={() => setManualModalOpen(false)}
+          onDone={(plan: HolisticPlan) => {
+            // Ручной план становится фискальным — holistic-режим. fiscalize()
+            // и печать уже умеют обрабатывать match.holistic.
+            const target = Math.max(0, rd.sum - excludeTiyin)
+            setMatch({
+              ...match,
+              mode: 'holistic',
+              holistic: plan,
+              matchedTotalTiyin: plan.totalTiyin,
+              totalDiffTiyin: plan.totalTiyin - target,
+              canAutoFiscalize: false,
+            })
+            setManualModalOpen(false)
+            toast.success(
+              `Чек собран вручную: ${plan.lines.length} ` +
+                `${plan.lines.length === 1 ? 'товар' : 'товаров'} на ` +
+                `${(plan.totalTiyin / 100).toLocaleString('ru-RU')} сум`,
+              { duration: 4000 },
+            )
           }}
         />
       )}
@@ -1333,26 +1263,6 @@ interface DisplayPosition {
     onPrev?: () => void
     onNext?: () => void
   }
-  /**
-   * Контрол дробления — кассир может разбить один товар на несколько меньших
-   * или собрать обратно. Показывается только на первой строке группы и
-   * только для splittable позиций (НЕ passthrough).
-   *
-   * `onMore` undefined если в пуле уже не хватит товаров на следующий уровень
-   * (canSplitMore=false). `onLess` undefined при splitLevel=1.
-   */
-  split?: {
-    level: number
-    onMore?: () => void
-    onLess?: () => void
-  }
-  /**
-   * Контрол ручного подбора — открывает модалку со списком всех приходов
-   * с поиском по тексту и сумме. Показывается на первой строке группы.
-   */
-  manual?: {
-    onPick: () => void
-  }
 }
 
 function PositionsTable({ positions }: { positions: DisplayPosition[] }) {
@@ -1398,10 +1308,6 @@ function PositionsTable({ positions }: { positions: DisplayPosition[] }) {
               </div>
               <div className="font-mono text-caption text-ink-subtle mt-0.5">
                 {p.meta} · НДС {p.vatPercent}%
-              </div>
-              <div className="flex items-center gap-2 flex-wrap mt-1">
-                {p.split && <SplitControl split={p.split} />}
-                {p.manual && <ManualPickControl onPick={p.manual.onPick} />}
               </div>
             </td>
             <td className="px-3 py-3 text-right tabular-nums text-ink-muted">
@@ -1480,85 +1386,6 @@ function SwapControl({
         <ChevronRight size={14} />
       </button>
     </div>
-  )
-}
-
-/**
- * Контрол `[Раздробить] − N +` — позволяет разбить один товар на несколько
- * на ту же сумму или собрать обратно.
- *
- * Размещается под названием товара/ИКПУ строки. Показывается только на
- * ПЕРВОЙ строке группы (так что для split=3 кнопка одна на 3 товара).
- */
-function SplitControl({
-  split,
-}: {
-  split: { level: number; onMore?: () => void; onLess?: () => void }
-}) {
-  return (
-    <div className="inline-flex items-center gap-1.5">
-      <span className="inline-flex items-center gap-1 text-caption text-ink-muted">
-        <Scissors size={11} />
-        Раздробить:
-      </span>
-      <button
-        type="button"
-        onClick={split.onLess}
-        disabled={!split.onLess}
-        title="Собрать в один товар"
-        className={cn(
-          'inline-flex h-6 w-6 items-center justify-center rounded-md border border-border',
-          'hover:bg-surface-hover transition-colors',
-          'disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent',
-        )}
-      >
-        <Minus size={12} />
-      </button>
-      <span className="text-caption text-ink tabular-nums w-5 text-center font-medium select-none">
-        {split.level}
-      </span>
-      <button
-        type="button"
-        onClick={split.onMore}
-        disabled={!split.onMore}
-        title="Раздробить ещё на один товар"
-        className={cn(
-          'inline-flex h-6 w-6 items-center justify-center rounded-md border border-border',
-          'hover:bg-surface-hover transition-colors',
-          'disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent',
-        )}
-      >
-        <Plus size={12} />
-      </button>
-    </div>
-  )
-}
-
-/**
- * Кнопка-чип «Подобрать вручную» — открывает модалку с индексированным
- * поиском по всем приходам справочника. Размещается рядом с SplitControl.
- *
- * Используется когда:
- *   - matcher не угадал товар точно (кассир хочет именно этот HR-2470, а
- *     не похожий по цене)
- *   - кассир хочет проверить какие альтернативы есть в пуле
- *   - подбор «не сошёлся» по цене → ищем по сумме чека
- */
-function ManualPickControl({ onPick }: { onPick: () => void }) {
-  return (
-    <button
-      type="button"
-      onClick={onPick}
-      title="Открыть поиск по всем приходам — выбрать товар вручную"
-      className={cn(
-        'inline-flex items-center gap-1.5 rounded-md border border-border',
-        'px-2 py-0.5 text-caption text-ink-muted',
-        'hover:bg-surface-hover hover:text-ink transition-colors',
-      )}
-    >
-      <Hand size={11} />
-      Подобрать вручную
-    </button>
   )
 }
 

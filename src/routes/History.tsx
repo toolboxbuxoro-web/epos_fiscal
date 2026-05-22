@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Undo2 } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Undo2 } from 'lucide-react'
 import {
+  countFiscalReceipts,
   getAllSettings,
   getRefundedFiscalIds,
   listFiscalReceipts,
@@ -18,6 +19,9 @@ import {
 } from '@/lib/printer'
 import { Button } from '@/components/ui/Button'
 
+/** Сколько чеков на одной странице Истории. */
+const PAGE_SIZE = 50
+
 export default function History() {
   const nav = useNavigate()
   const [rows, setRows] = useState<FiscalReceiptRow[]>([])
@@ -28,17 +32,26 @@ export default function History() {
   const [printMsg, setPrintMsg] = useState<Record<number, string>>({})
   /** id чека → busy-флаг (чтобы не дёргать дважды). */
   const [printing, setPrinting] = useState<Record<number, boolean>>({})
+  /** Текущая страница (0-based). */
+  const [page, setPage] = useState(0)
+  /** Общее число чеков — для расчёта количества страниц. */
+  const [total, setTotal] = useState(0)
 
   useEffect(() => {
     void load()
-  }, [])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page])
 
   async function load() {
     setLoading(true)
     setError(null)
     try {
-      const list = await listFiscalReceipts(200)
+      const [list, count] = await Promise.all([
+        listFiscalReceipts(PAGE_SIZE, page * PAGE_SIZE),
+        countFiscalReceipts(),
+      ])
       setRows(list)
+      setTotal(count)
       // Bulk-проверка какие чеки уже возвращены — чтобы дисэйблить кнопку.
       const refunded = await getRefundedFiscalIds(list.map((r) => r.id))
       setRefundedIds(refunded)
@@ -48,6 +61,12 @@ export default function History() {
       setLoading(false)
     }
   }
+
+  // Кол-во страниц (минимум 1, чтобы «Страница 1 из 1» при пустой Истории).
+  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE))
+  // Диапазон строк текущей страницы для подписи «11–20 из 134».
+  const rangeFrom = total === 0 ? 0 : page * PAGE_SIZE + 1
+  const rangeTo = Math.min(total, page * PAGE_SIZE + rows.length)
 
   /**
    * Перепечатать ранее фискализированный чек как копию ("Chek nusxasi").
@@ -206,6 +225,40 @@ export default function History() {
           </tbody>
         </table>
       </div>
+
+      {/* Пагинация — показываем всегда когда есть хотя бы одна страница
+          с данными. При total ≤ PAGE_SIZE кнопки disabled, но строка
+          «N из M» полезна как индикатор сколько всего чеков. */}
+      {total > 0 && (
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <div className="text-sm text-ink-muted">
+            {rangeFrom}–{rangeTo} из {total}
+          </div>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="ghost"
+              size="sm"
+              icon={<ChevronLeft size={14} />}
+              disabled={page <= 0 || loading}
+              onClick={() => setPage((p) => Math.max(0, p - 1))}
+            >
+              Назад
+            </Button>
+            <span className="text-sm text-ink-muted tabular-nums select-none">
+              Страница {page + 1} из {pageCount}
+            </span>
+            <Button
+              variant="ghost"
+              size="sm"
+              iconRight={<ChevronRight size={14} />}
+              disabled={page >= pageCount - 1 || loading}
+              onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))}
+            >
+              Вперёд
+            </Button>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

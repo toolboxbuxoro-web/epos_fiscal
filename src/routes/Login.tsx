@@ -1,5 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react'
-import { LogIn, Receipt, Settings as SettingsIcon } from 'lucide-react'
+import { LogIn, Settings as SettingsIcon } from 'lucide-react'
+import logoUrl from '@/assets/toolbox-fiscal.png'
 import { Button, Field, Input, Card } from '@/components/ui'
 import { getSetting, setSetting, SettingKey } from '@/lib/db'
 import { signInWithMs } from '@/lib/inventory'
@@ -92,10 +93,12 @@ export default function Login() {
       <div className="w-full max-w-md">
         {/* Логотип / название */}
         <div className="flex items-center justify-center mb-6">
-          <div className="flex items-center gap-2 text-ink">
-            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary text-ink-inverse">
-              <Receipt size={20} />
-            </div>
+          <div className="flex items-center gap-2.5 text-ink">
+            <img
+              src={logoUrl}
+              alt="Toolbox Fiscal"
+              className="h-11 w-11 rounded-lg object-cover"
+            />
             <span className="text-heading font-semibold">Toolbox Fiscal</span>
           </div>
         </div>

@@ -86,3 +86,12 @@ export async function listFiscalReceipts(limit = 100, offset = 0): Promise<Fisca
     [limit, offset],
   )
 }
+
+/** Общее число фискальных чеков — для пагинации в Истории. */
+export async function countFiscalReceipts(): Promise<number> {
+  const db = await getDb()
+  const rows = await db.select<{ c: number }[]>(
+    `SELECT COUNT(*) AS c FROM fiscal_receipts`,
+  )
+  return rows[0]?.c ?? 0
+}

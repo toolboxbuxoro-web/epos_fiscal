@@ -1,9 +1,12 @@
 import { useEffect, useState } from 'react'
 import {
   countEsfItems,
+  getSetting,
   listEsfItems,
+  SettingKey,
   type EsfItemWithAvailable,
 } from '@/lib/db'
+import { calculateSellingPrice } from '@/lib/matcher/strategies'
 import { Button, Card, toast } from '@/components/ui'
 import { Input } from '@/components/ui/Input'
 import { CloudUpload, Loader2, RefreshCw } from 'lucide-react'
@@ -35,22 +38,41 @@ export default function Catalog() {
   // призраков). Сервер — источник правды; Справочник всегда показывает
   // ровно то что на сервере.
   const [syncing, setSyncing] = useState(false)
+  // Параметры ценообразования (наценка / шаг округления / ставка НДС) —
+  // нужны для расчёта ПРОДАЖНОЙ цены в колонке таблицы. Те же что matcher
+  // использует в loadMatcherPool. Дефолты: 10% / 1000 сум / 12%.
+  const [pricing, setPricing] = useState({ markup: 10, roundUp: 1000, vat: 12 })
 
   async function load() {
     setLoading(true)
     setError(null)
     try {
-      const [rows, count, stats] = await Promise.all([
+      const [rows, count, stats, markupS, roundS, vatS] = await Promise.all([
         // source='remote' — показываем только синкнутые из mytoolbox.
         // Legacy excel-импорты (если ещё не удалены миграцией 004) фильтруем —
         // чтобы кассир не путался какие товары актуальны.
         listEsfItems({ search: search || undefined, limit: 200, source: 'remote' }),
         countEsfItems(),
         getMigrationStats(),
+        getSetting(SettingKey.MarkupPercent),
+        getSetting(SettingKey.RoundUpToSum),
+        getSetting(SettingKey.DefaultVatPercent),
       ])
       setItems(rows)
       setTotal(count)
       setUnmigratedCount(stats.unmigratedCount)
+      // Важно: не `|| def` — иначе валидный 0 (НДС упрощёнки) превратился бы
+      // в дефолт 12. Проверяем Number.isFinite явно.
+      const parseNum = (v: string | null, def: number) => {
+        if (v == null || v === '') return def
+        const n = Number.parseInt(v, 10)
+        return Number.isFinite(n) ? n : def
+      }
+      setPricing({
+        markup: parseNum(markupS, 10),
+        roundUp: parseNum(roundS, 1000),
+        vat: parseNum(vatS, 12),
+      })
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -229,7 +251,8 @@ export default function Catalog() {
             <tr>
               <Th>Наименование</Th>
               <Th>ИКПУ</Th>
-              <Th>Цена</Th>
+              <Th>Приходная</Th>
+              <Th>Продажная</Th>
               <Th>Получено</Th>
               <Th>Доступно</Th>
               <Th>НДС</Th>
@@ -239,13 +262,13 @@ export default function Catalog() {
           <tbody className="divide-y divide-border">
             {loading && items.length === 0 ? (
               <tr>
-                <td className="px-3 py-8 text-center text-sm text-ink-muted" colSpan={7}>
+                <td className="px-3 py-8 text-center text-sm text-ink-muted" colSpan={8}>
                   Загрузка…
                 </td>
               </tr>
             ) : items.length === 0 ? (
               <tr>
-                <td className="px-3 py-8 text-center text-sm text-ink-muted" colSpan={7}>
+                <td className="px-3 py-8 text-center text-sm text-ink-muted" colSpan={8}>
                   {search
                     ? 'По запросу ничего не найдено.'
                     : 'Справочник пуст. Бухгалтер загружает приходы через mytoolbox админку.'}
@@ -261,7 +284,19 @@ export default function Catalog() {
                     )}
                   </Td>
                   <Td className="font-mono text-xs">{item.class_code}</Td>
-                  <Td className="text-right">{tiyinToSumDisplay(item.unit_price_tiyin)}</Td>
+                  <Td className="text-right text-ink-muted">
+                    {tiyinToSumDisplay(item.unit_price_tiyin)}
+                  </Td>
+                  <Td className="text-right font-medium text-ink">
+                    {tiyinToSumDisplay(
+                      calculateSellingPrice(
+                        item.unit_price_tiyin,
+                        pricing.vat,
+                        pricing.markup,
+                        pricing.roundUp,
+                      ),
+                    )}
+                  </Td>
                   <Td className="text-right">{milliQtyToDisplay(item.qty_received)}</Td>
                   <Td className="text-right">
                     <span

@@ -46,6 +46,15 @@ export class MoyskladPoller {
     return { ...this.status }
   }
 
+  /**
+   * Принудительно выполнить один опрос МойСклад сейчас, не дожидаясь
+   * следующего тика по таймеру. Используется кнопкой «Обновить» в Кассе.
+   * Обычный interval-таймер при этом не сбрасывается — просто внеплановый тик.
+   */
+  async pollNow(): Promise<void> {
+    await this.tick()
+  }
+
   async start(): Promise<void> {
     if (this.status.running) return
     this.status.running = true
