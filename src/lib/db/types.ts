@@ -178,6 +178,22 @@ export const SettingKey = {
    * См. `src/lib/matcher/holistic.ts`.
    */
   MatcherMode: 'matcher.mode',
+  /**
+   * Отправлять ли error-логи на mytoolbox-сервер для централизованного
+   * debugging'а. 'true' / 'false'. По умолчанию 'true'.
+   *
+   * Что шлётся:
+   *   - level='error' (включая 🚨 CRITICAL refund-в-ОФД-но-не-сохранён)
+   *   - PII (tin, pinfl, clientName, phoneNumber) предварительно убирается
+   *     через `scrubPii` в `src/lib/telemetry.ts`
+   *   - Батч до 50 строк раз в 30 сек
+   *
+   * Что НЕ шлётся: debug, info, warn — остаются локально.
+   *
+   * Магазин может отключить если беспокоится о приватности (Настройки →
+   * «Отправлять логи об ошибках на сервер»).
+   */
+  TelemetryEnabled: 'telemetry.enabled',
 } as const
 
 export type SettingKey = (typeof SettingKey)[keyof typeof SettingKey]

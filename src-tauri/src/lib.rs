@@ -65,6 +65,12 @@ pub fn run() {
             sql: include_str!("../migrations/010_fiscal_receipts_excluded_payment.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 11,
+            description: "logs_telemetry",
+            sql: include_str!("../migrations/011_logs_telemetry.sql"),
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()

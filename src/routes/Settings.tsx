@@ -72,6 +72,7 @@ interface FormState {
   invServerUrl: string
   invShopSlug: string
   invShopApiKey: string
+  telemetryEnabled: 'true' | 'false'
 }
 
 const empty: FormState = {
@@ -105,6 +106,7 @@ const empty: FormState = {
   invServerUrl: '',
   invShopSlug: '',
   invShopApiKey: '',
+  telemetryEnabled: 'true',
 }
 
 export default function Settings() {
@@ -217,6 +219,9 @@ export default function Settings() {
       invServerUrl: all[SettingKey.InventoryServerUrl] ?? '',
       invShopSlug: all[SettingKey.InventoryShopSlug] ?? '',
       invShopApiKey: all[SettingKey.InventoryShopApiKey] ?? '',
+      telemetryEnabled: (all[SettingKey.TelemetryEnabled] ?? 'true') as
+        | 'true'
+        | 'false',
     }))
     // если уже есть credentials — подгрузим списки
     const creds = all[SettingKey.MoyskladCredentials]
@@ -353,6 +358,7 @@ export default function Settings() {
         [SettingKey.InventoryServerUrl]: form.invServerUrl.replace(/\/$/, ''),
         [SettingKey.InventoryShopSlug]: form.invShopSlug.trim(),
         [SettingKey.InventoryShopApiKey]: form.invShopApiKey.trim(),
+        [SettingKey.TelemetryEnabled]: form.telemetryEnabled,
       })
       setSaved(true)
     } catch (e) {
@@ -589,6 +595,27 @@ export default function Settings() {
           />
           <div className="mt-1 text-xs text-ink-muted">
             Выдаётся админом в mytoolbox при создании магазина (показывается один раз).
+          </div>
+        </Field>
+
+        <Field label="Отправлять ошибки на сервер для анализа">
+          <Select
+            value={form.telemetryEnabled}
+            onChange={(e) =>
+              setField(
+                'telemetryEnabled',
+                e.target.value as 'true' | 'false',
+              )
+            }
+          >
+            <option value="true">Включено (рекомендуется)</option>
+            <option value="false">Выключено</option>
+          </Select>
+          <div className="mt-1 text-xs text-ink-muted">
+            Раз в 30 сек шлёт error-логи в admin-панель mytoolbox для
+            централизованного debugging'а. ПИНФЛ/ИНН/телефоны/email
+            автоматически вычищаются перед отправкой. info/debug/warn
+            остаются локально. Можно выключить для приватности.
           </div>
         </Field>
 

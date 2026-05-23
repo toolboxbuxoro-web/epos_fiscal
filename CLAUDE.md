@@ -419,6 +419,118 @@ fiscal_receipts INSERT:
 - `src/routes/Receipt.tsx` — input UI + `markNotRequired()` handler
 - `src-tauri/migrations/010_fiscal_receipts_excluded_payment.sql` — ALTER ADD COLUMN
 
+## Телеметрия — error-логи на mytoolbox
+
+С 0.10.31 шлём `level='error'` логи на сервер для централизованного
+debugging'а 4 магазинов. Админ видит ошибки всех в одной admin-панели
+mytoolbox без подключения к каждой Win-машине отдельно. Critical-ошибки
+типа `🚨 refund в ОФД но не сохранён локально` → Telegram-алерт сразу.
+
+### Что шлётся
+
+- `level='error'` (включая помеченные как CRITICAL — это всё ещё error
+  по уровню, но с маркером 🚨 в message)
+- info/debug/warn остаются **локально** в `logs` таблице SQLite
+- ПД клиента (`pinfl`, `tin`, телефон, email) предварительно убираются
+  `scrubText` через regex-замену
+
+### Архитектура
+
+```
+log.error(...) → INSERT logs (sent_to_server=0)
+                       │
+                       ▼  раз в 30 сек
+              src/lib/telemetry.ts::flushLogsToServer
+                       │
+                       ├─ listUnsentLogsForServer(limit=50)
+                       ├─ scrubText(message) + scrubText(details)
+                       ├─ POST /api/v1/telemetry/logs
+                       │     Bearer <InventoryShopApiKey>
+                       │     { shop_slug, app_version, logs: [...] }
+                       ├─ 200 OK → markLogsSentToServer(ids)
+                       ├─ 404 → markSent (endpoint не задеплоен — не циклимся)
+                       └─ 5xx/network → exp backoff (1/2, 1/4, ... шанс на следующий тик)
+                       ▼
+              mytoolbox.shop_logs (TTL 90 дней)
+                       │
+                       ▼
+              admin UI + Telegram-бот на CRITICAL
+```
+
+### Серверный контракт (для mytoolbox-репо)
+
+**Endpoint:** `POST /api/v1/telemetry/logs`
+
+**Auth:** `Authorization: Bearer <api_key>` — тот же что для inventory.
+
+**Request body:**
+```json
+{
+  "shop_slug": "toolbox-honabod",
+  "app_version": "0.10.31",
+  "logs": [
+    {
+      "ts": 1735056000,
+      "level": "error",
+      "source": "refund",
+      "message": "🚨 КРИТИЧНО: refund в ОФД (FiscalSign=ABC123) ...",
+      "details": "{\"fiscal\":{...},\"originalFiscalId\":42}",
+      "local_log_id": 1234
+    }
+  ]
+}
+```
+
+**Response:** `{ "ok": true }` на success. Body не обязателен для клиента —
+Tauri проверяет только status 2xx.
+
+**Серверная таблица (примерная схема):**
+```sql
+CREATE TABLE shop_logs (
+  id              BIGSERIAL PRIMARY KEY,
+  shop_id         INT NOT NULL REFERENCES inv_shops(id),
+  ts              TIMESTAMP NOT NULL,
+  level           VARCHAR(10) NOT NULL,
+  source          VARCHAR(50) NOT NULL,
+  message         TEXT NOT NULL,
+  details         JSONB,
+  app_version     VARCHAR(20),
+  local_log_id    INT, -- для дедупа + трассировки
+  received_at     TIMESTAMP DEFAULT NOW(),
+
+  UNIQUE (shop_id, local_log_id)  -- дедуп при retry клиента
+);
+CREATE INDEX idx_shop_logs_ts ON shop_logs(ts DESC);
+CREATE INDEX idx_shop_logs_critical ON shop_logs(received_at)
+  WHERE message LIKE '%🚨%' OR message LIKE '%КРИТИЧНО%';
+```
+
+**TTL:** удалять `received_at < NOW() - 90 days` (job раз в день).
+
+**Telegram-бот** слушает `INSERT` через triggers/notify где message
+содержит `🚨` или `КРИТИЧНО` → шлёт в чат админа. Spam-protection:
+дедуп по message-fingerprint не чаще 1/час.
+
+**Дедуп:** на сервере `UNIQUE(shop_id, local_log_id)` — повторный
+POST одного и того же лога (например после ретрая при network glitch)
+не создаст дубликат.
+
+### Opt-out
+
+`SettingKey.TelemetryEnabled` (default 'true'). Магазин может выключить
+через Настройки → секция «Inventory» → «Отправлять ошибки на сервер
+для анализа». Tauri-клиент мгновенно остановит flush на следующем тике
+(не сразу — настройка читается каждый цикл).
+
+### Файлы
+
+- `src-tauri/migrations/011_logs_telemetry.sql` — ALTER TABLE logs ADD COLUMN sent_to_server
+- `src/lib/log.ts` — `listUnsentLogsForServer`, `markLogsSentToServer`
+- `src/lib/telemetry.ts` — главный модуль, flusher, scrubText, ensureTelemetryStarted
+- `src/lib/db/types.ts` — `SettingKey.TelemetryEnabled`
+- `src/routes/Settings.tsx` — selector «Отправлять ошибки на сервер»
+- `src/App.tsx` — `ensureTelemetryStarted()` в useEffect
+
 ## Тестовый режим (`SettingKey.TestMode`)
 
 Флаг в Настройках. Если включён — fiscalize.ts:

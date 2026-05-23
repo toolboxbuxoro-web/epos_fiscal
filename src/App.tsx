@@ -17,6 +17,7 @@ import {
   ensureInventoryRuntime,
   stopInventoryRuntime,
 } from '@/lib/inventory'
+import { ensureTelemetryStarted } from '@/lib/telemetry'
 import { Toaster } from '@/components/ui'
 
 export default function App() {
@@ -30,6 +31,11 @@ export default function App() {
     // подписывается на SSE-обновления, гоняет periodic sync. Если выключен —
     // тихо ничего не делает. Idempotent — можно дёргать несколько раз.
     void ensureInventoryRuntime()
+
+    // Телеметрия: error-логи на mytoolbox-сервер для centralized debugging.
+    // Background-flusher раз в 30 сек, opt-out через Настройки.
+    // Idempotent. Никогда не throw — не ломает основной поток.
+    void ensureTelemetryStarted()
 
     return () => {
       stopInventoryRuntime()

@@ -24,6 +24,13 @@ export interface LogRow {
   source: LogSource
   message: string
   details: string | null
+  /**
+   * Отправлен ли лог на mytoolbox-сервер (телеметрия для centralized
+   * debugging). 0 — ещё нет, 1 — отправлен. Заполняется только для
+   * level='error' (см. src/lib/telemetry.ts). info/debug/warn остаются
+   * локальными — на сервер не шлём чтобы не засорять трафик.
+   */
+  sent_to_server?: number
 }
 
 /**
@@ -141,4 +148,46 @@ export async function vacuumOldLogs(daysToKeep = 7): Promise<void> {
   const db = await getDb()
   const cutoff = now() - daysToKeep * 24 * 3600
   await db.execute('DELETE FROM logs WHERE ts < $1', [cutoff])
+}
+
+// ── Телеметрия: централизованный сбор error на mytoolbox ──────────────
+
+/**
+ * Выбрать unsent error-логи для отправки на сервер.
+ *
+ * Только level='error' — info/debug/warn оставляем локальными чтобы
+ * не засорять сетевой трафик и хранилище. Сортировка по ts ASC чтобы
+ * сначала отправить старые (FIFO порядок для админа на сервере).
+ *
+ * Лимит — батч-размер flusher'а (по умолчанию 50). Если ошибок
+ * накопилось больше — flusher пройдёт несколько итераций.
+ */
+export async function listUnsentLogsForServer(limit = 50): Promise<LogRow[]> {
+  const db = await getDb()
+  return db.select<LogRow[]>(
+    `SELECT id, ts, level, source, message, details, sent_to_server
+     FROM logs
+     WHERE sent_to_server = 0
+       AND level IN ('error')
+     ORDER BY ts ASC, id ASC
+     LIMIT $1`,
+    [limit],
+  )
+}
+
+/**
+ * Пометить логи как отправленные на сервер. Вызывается после успешного
+ * POST /api/v1/telemetry/logs. Идемпотентно — повторный UPDATE на
+ * sent_to_server=1 безопасен.
+ */
+export async function markLogsSentToServer(ids: number[]): Promise<void> {
+  if (ids.length === 0) return
+  const db = await getDb()
+  // Параметризованные плейсхолдеры — защита от SQL-injection даже если
+  // id'ы вдруг прилетят откуда-то снаружи.
+  const placeholders = ids.map((_, i) => `$${i + 1}`).join(', ')
+  await db.execute(
+    `UPDATE logs SET sent_to_server = 1 WHERE id IN (${placeholders})`,
+    ids,
+  )
 }
