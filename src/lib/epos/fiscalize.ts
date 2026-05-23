@@ -488,6 +488,70 @@ async function tryRemoteReserve(
     items.push({ inv_item_id: sid, quantity: c.quantity })
   }
 
+  // ── PREFLIGHT: проверяем что серверный кэш совпадает с нашим планом ────
+  //
+  // Зачем: cashier 19:14 (Хонабод) получал «Остатки изменились» в 70%
+  // случаев потому что локальный кэш отставал от сервера (другой магазин
+  // забрал товар, SSE не догнал). Решение: ДО reserve запросить свежее
+  // состояние именно тех items которые мы собираемся резервировать. Если
+  // хоть один insufficient — конвертируем в InventoryConflictError БЕЗ
+  // reserve-запроса. UI сделает exclude + rematch.
+  //
+  // Цена: +1 GET (~80мс на быстром Wi-Fi). Экономим time-to-rollback на
+  // сервере + retry на клиенте. Net win.
+  try {
+    const itemIds = items.map((it) => it.inv_item_id)
+    const fresh = await client.listItems({ limit: itemIds.length })
+    // listItems возвращает ВСЕ items до limit — нам нужны только наши.
+    // TODO: backend нужно расширить чтобы поддерживать ?ids=1,2,3 фильтр.
+    // Пока — фильтруем локально.
+    const freshById = new Map<number, { qty_received: number; qty_consumed: number; qty_reserved: number }>()
+    for (const f of fresh.items) {
+      if (itemIds.includes(f.id)) {
+        freshById.set(f.id, {
+          qty_received: f.qty_received,
+          qty_consumed: f.qty_consumed,
+          qty_reserved: f.qty_reserved,
+        })
+      }
+    }
+    const insufficient: Array<{ inv_item_id: number; available: number; requested: number }> = []
+    for (const it of items) {
+      const f = freshById.get(it.inv_item_id)
+      if (!f) continue // не нашли в свежем — пропускаем, пусть reserve сам решает
+      const available = f.qty_received - f.qty_consumed - f.qty_reserved
+      if (available < it.quantity) {
+        insufficient.push({ inv_item_id: it.inv_item_id, available, requested: it.quantity })
+      }
+    }
+    if (insufficient.length > 0) {
+      // Локальный кэш отстал — сразу выкидываем conflict БЕЗ reserve-запроса.
+      // UI добавит failed ids в excludedServerIds и попробует пересобрать чек
+      // с другими товарами.
+      await log
+        .info(
+          'fiscalize',
+          `preflight: ${insufficient.length} items insufficient на сервере — пропускаем reserve`,
+          { insufficient },
+        )
+        .catch(() => {})
+      throw new InventoryConflictError(insufficient.map((i) => ({
+        inv_item_id: i.inv_item_id,
+        requested: i.requested,
+        available: i.available,
+      })))
+    }
+  } catch (e) {
+    // Если listItems упал по сети — не блокируем reserve. Падение GET'а не
+    // должно тормозить флоу; reserve сам выловит проблему через 409 или 500.
+    // НО: если это InventoryConflictError от нас — пробрасываем дальше.
+    if (e instanceof InventoryConflictError) throw e
+    const msg = e instanceof Error ? e.message : String(e)
+    await log
+      .warn('fiscalize', `preflight listItems упал: ${msg} — продолжаем без preflight`)
+      .catch(() => {})
+  }
+
   let resp
   try {
     resp = await client.reserve({ ms_receipt_id, items })

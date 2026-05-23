@@ -12,6 +12,9 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "typecheck": "tsc -b --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:ui": "vitest --ui",
     "release:dev": "gh workflow run dev-build.yml && echo 'Запущено. gh run watch — следить за прогрессом. gh run download <id> --name toolbox-fiscal-dev-* — скачать .exe (~4 мин)'"
   },
   "dependencies": {
@@ -35,10 +38,12 @@
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
+    "@vitest/ui": "^4.1.7",
     "autoprefixer": "^10.4.20",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.17",
     "typescript": "^5.7.2",
-    "vite": "^6.0.5"
+    "vite": "^6.0.5",
+    "vitest": "^4.1.7"
   }
 }
