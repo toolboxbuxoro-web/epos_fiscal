@@ -148,6 +148,17 @@ export interface BuildMatchResult {
    * См. `src/lib/matcher/holistic.ts`.
    */
   holistic?: HolisticPlan
+  /**
+   * Маркер «план собран кассиром вручную через ManualReceiptModal».
+   *
+   * Используется в Receipt.tsx чтобы при `InventoryStaleError` НЕ перетирать
+   * ручной выбор авто-подбором. Если флаг true — после sync показываем
+   * кассиру конкретно какой товар закончился, но сам план не трогаем —
+   * кассир сам решит что менять.
+   *
+   * Для авто-планов флаг отсутствует/false — `load()` пересобирает как раньше.
+   */
+  manuallyBuilt?: boolean
 }
 
 /**

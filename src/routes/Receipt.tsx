@@ -538,30 +538,72 @@ export default function Receipt() {
         return
       }
       // Сервер вернул Postgres-инвариант inv_items_check — кэш справочника
-      // разъехался с реальностью. Первый раз — тихий forceFull sync + rebuild
-      // (как было). Если ошибка повторяется (2+ раза подряд) — авто-подбор
-      // зацикливается (matcher → тот же sold-out товар → inv_items_check).
-      // Показываем persistent карточку с подсказкой «Собрать вручную»
-      // (модалка грузит свежий pool, кассир выбирает реально доступное).
+      // разъехался с реальностью.
+      //
+      // Стратегия восстановления зависит от типа плана:
+      //
+      // 1. **Ручной план** (match.manuallyBuilt) — кассир уже потратил время
+      //    на ручную сборку. НЕ перетираем его авто-подбором. Делаем sync +
+      //    показываем КОНКРЕТНО какие товары закончились (по suspectIds из
+      //    ошибки) → кассир сам открывает модалку и меняет именно их.
+      //
+      // 2. **Авто-план** (canAutoFiscalize или auto-holistic) — добавляем
+      //    suspect inv_item_ids в excludedServerIds (matcher их пропустит)
+      //    и пересобираем. Это разрывает цикл «matcher → те же sold-out →
+      //    inv_items_check → ...».
+      //
+      // 3. **2+ ошибки подряд** (счётчик не ресетится при открытии модалки —
+      //    важно!) — persistent-карточка «Собрать вручную». Только пользователь
+      //    в модалке видит свежие остатки и может выбрать новые товары.
+      //    Снимается с persistent только кнопкой «Закрыть» или после успешной
+      //    фискализации (re-mount компонента при навигации).
       if (e instanceof InventoryStaleError) {
         staleErrorCountRef.current += 1
+
+        // Suspect ids → excludedServerIds (для будущих авто-подборов).
+        const newExcludes = e.suspectInvItemIds.length
+          ? [...new Set([...excludedServerIds, ...e.suspectInvItemIds])]
+          : excludedServerIds
+        if (newExcludes !== excludedServerIds) {
+          setExcludedServerIds(newExcludes)
+        }
+
+        // forceFull sync — обязательно ДО всех веток ниже.
+        try {
+          await syncFromServer({ forceFull: true })
+        } catch {
+          // Если sync упал — продолжаем; load всё равно пересмотрит локальный кэш.
+        }
+
+        // 2+ ошибки подряд → persistent (одинаково для manual/auto)
         if (staleErrorCountRef.current >= 2) {
           setStaleErrorPersistent(true)
           toast.error(
-            'Авто-подбор зацикливается. Откройте «Собрать вручную» — ' +
-              'там свежие остатки.',
+            'Остатки повторно разошлись. Откройте «Собрать вручную» — ' +
+              'там свежие данные.',
             { duration: 8000 },
           )
           return
         }
-        toast.error('Остатки изменились, обновляю справочник…', {
-          duration: 4000,
-        })
-        try {
-          await syncFromServer({ forceFull: true })
-        } catch {
-          // Если sync упал — всё равно попробуем load(), вдруг помогло.
+
+        // Ручной план — сохраняем, не пересобираем
+        if (match?.manuallyBuilt) {
+          const conflictCount = e.suspectInvItemIds.length
+          toast.error(
+            conflictCount === 1
+              ? '1 товар из ручного выбора закончился на сервере. ' +
+                  'Откройте «Собрать вручную» — там обновлённые остатки.'
+              : `${conflictCount} товара из ручного выбора закончились на ` +
+                'сервере. Откройте «Собрать вручную» — там обновлённые остатки.',
+            { duration: 7000 },
+          )
+          // План в state не трогаем — кассир увидит подсказку и сам решит
+          return
         }
+
+        // Авто-план — стандартный путь: sync уже сделан, перезагружаем match
+        // с обновлённым excludedServerIds (matcher пропустит suspect ids).
+        toast.error('Остатки изменились, подбираю замены…', { duration: 4000 })
         setTimeout(() => void load(), 300)
         return
       }
@@ -751,8 +793,10 @@ export default function Receipt() {
                   size="sm"
                   onClick={() => {
                     setManualModalOpen(true)
+                    // Только снимаем persistent-карточку. Счётчик НЕ ресетим —
+                    // если ручной выбор тоже упадёт со stale, это всё ещё
+                    // продолжение того же эпизода race-condition.
                     setStaleErrorPersistent(false)
-                    staleErrorCountRef.current = 0
                   }}
                 >
                   Открыть «Собрать вручную»
@@ -1241,6 +1285,11 @@ export default function Receipt() {
           onDone={(plan: HolisticPlan) => {
             // Ручной план становится фискальным — holistic-режим. fiscalize()
             // и печать уже умеют обрабатывать match.holistic.
+            //
+            // Флаг `manuallyBuilt: true` критичен — при InventoryStaleError
+            // мы НЕ перетираем выбор кассира авто-подбором, а сохраняем план
+            // и просим кассира открыть модалку повторно. Без флага load()
+            // вернёт авто-collection и кассир потеряет работу.
             const target = Math.max(0, rd.sum - excludeTiyin)
             setMatch({
               ...match,
@@ -1249,6 +1298,7 @@ export default function Receipt() {
               matchedTotalTiyin: plan.totalTiyin,
               totalDiffTiyin: plan.totalTiyin - target,
               canAutoFiscalize: false,
+              manuallyBuilt: true,
             })
             setManualModalOpen(false)
             toast.success(

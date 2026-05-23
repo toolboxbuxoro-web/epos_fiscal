@@ -405,11 +405,19 @@ export class AlreadyFiscalizedError extends Error {
  * рассинхронизирован с сервером — фактического остатка меньше чем мы думали.
  *
  * Отличается от `InventoryConflictError` тем что сервер не вернул `failed[]` —
- * мы не знаем какой конкретно товар «застрял». Поэтому UI делает полную
- * пересинхронизацию справочника + перематч, вместо exclude-логики.
+ * мы не знаем какой конкретно товар «застрял». Но мы знаем все `inv_item_id`'ы
+ * которые были в reserve-запросе (`suspectInvItemIds`) — один из них точно
+ * виноват. UI может добавить весь набор в excluded, чтобы не зацикливаться
+ * на тех же товарах при следующем подборе.
  */
 export class InventoryStaleError extends Error {
-  constructor() {
+  /**
+   * inv_item_id'ы, которые были в reserve-запросе. Хотя бы один из них
+   * стал недоступен на сервере. UI добавляет ВЕСЬ список в excludedServerIds —
+   * консервативно, но гарантированно разрывает цикл «matcher → те же
+   * товары → inv_items_check → matcher → те же товары».
+   */
+  constructor(public readonly suspectInvItemIds: number[] = []) {
     super(
       'Остатки на сервере изменились. Обновляем справочник и пересобираем чек…',
     )
@@ -491,7 +499,10 @@ async function tryRemoteReserve(
     // — UI сделает forceFull sync + перематчит.
     const msg = e instanceof Error ? e.message : String(e)
     if (/inv_items_check|violates check constraint/i.test(msg)) {
-      throw new InventoryStaleError()
+      // Передаём все inv_item_id'ы из reserve-запроса. UI добавит их в exclude
+      // чтобы пересборка не выбрала те же позиции и не упёрлась в ту же
+      // ошибку (см. Receipt.tsx InventoryStaleError handler).
+      throw new InventoryStaleError(items.map((it) => it.inv_item_id))
     }
     throw e
   }
