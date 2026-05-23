@@ -501,13 +501,16 @@ async function tryRemoteReserve(
   // сервере + retry на клиенте. Net win.
   try {
     const itemIds = items.map((it) => it.inv_item_id)
-    const fresh = await client.listItems({ limit: itemIds.length })
-    // listItems возвращает ВСЕ items до limit — нам нужны только наши.
-    // TODO: backend нужно расширить чтобы поддерживать ?ids=1,2,3 фильтр.
-    // Пока — фильтруем локально.
+    // ВАЖНО: backend listItems пока не поддерживает фильтр ?ids=. Запрашиваем
+    // ВЕСЬ пул (limit=5000, как PAGE_LIMIT в админке mytoolbox), потом
+    // фильтруем по itemIds локально. У реальных магазинов 100-500 items,
+    // получение 5000 — несколько KB, ~80мс. Когда backend подучится фильтру
+    // `?ids=1,2,3` — изменить здесь и убрать локальный filter.
+    const fresh = await client.listItems({ limit: 5000 })
     const freshById = new Map<number, { qty_received: number; qty_consumed: number; qty_reserved: number }>()
+    const itemIdsSet = new Set(itemIds)
     for (const f of fresh.items) {
-      if (itemIds.includes(f.id)) {
+      if (itemIdsSet.has(f.id)) {
         freshById.set(f.id, {
           qty_received: f.qty_received,
           qty_consumed: f.qty_consumed,
