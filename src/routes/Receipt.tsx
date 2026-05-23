@@ -189,6 +189,21 @@ export default function Receipt() {
   }, [match])
 
   /**
+   * «Грязный» excludeTiyin — введённый кассиром, но matcher ещё не успел
+   * пересобрать план (debounce 400ms). Блокируем «Фискализировать»: иначе
+   * matchedTotal в match и payment split в fiscalize() считались бы на
+   * разных target → Communicator отвергнет чек как несбалансированный
+   * (сырьём «illegal argument»). Сравниваем applied (то с чем последний
+   * раз буился match) и expected (то что в поле сейчас).
+   */
+  const excludeDirty = useMemo(() => {
+    if (!rd || !match) return false
+    const applied = matcherOpts.targetSumOverrideTiyin ?? rd.sum
+    const expected = Math.max(0, rd.sum - excludeTiyin)
+    return applied !== expected
+  }, [rd, match, matcherOpts.targetSumOverrideTiyin, excludeTiyin])
+
+  /**
    * Тип оплаты из МойСклад — для бейджа над заголовком.
    * См. подробное описание правил в коммитах прошлых релизов.
    */
@@ -620,6 +635,7 @@ export default function Receipt() {
                   match.positions.length === 0 ||
                   itemsWithoutIkpu.length > 0 ||
                   hasUnmatched ||
+                  excludeDirty ||
                   !!alreadyFiscalized
                 }
                 onClick={onFiscalizeClick}
@@ -627,11 +643,13 @@ export default function Receipt() {
                 title={
                   alreadyFiscalized
                     ? 'Чек уже фискализирован — повторная фискализация запрещена'
-                    : hasUnmatched
-                      ? 'Есть неподобранные позиции — подберите их вручную'
-                      : itemsWithoutIkpu.length > 0
-                        ? `Невозможно фискализировать: ${itemsWithoutIkpu.length} товаров без ИКПУ`
-                        : undefined
+                    : excludeDirty
+                      ? 'Пересобираю план под новую сумму Click/Payme — подождите секунду'
+                      : hasUnmatched
+                        ? 'Есть неподобранные позиции — подберите их вручную'
+                        : itemsWithoutIkpu.length > 0
+                          ? `Невозможно фискализировать: ${itemsWithoutIkpu.length} товаров без ИКПУ`
+                          : undefined
                 }
               >
                 {alreadyFiscalized

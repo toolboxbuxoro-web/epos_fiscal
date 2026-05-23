@@ -381,12 +381,23 @@ export async function syncShopConfig(): Promise<{
  * В нашей модели local.qty_received хранит *available* — поэтому здесь
  * просто UPDATE qty_received = available для существующих server_item_id.
  */
+/**
+ * Счётчик подряд-failed UPDATE'ов SSE. Если кэш разъезжается с сервером
+ * (UPDATE падает из-за FK / BUSY / soft-void строки) — тихие skip'ы могут
+ * привести к ситуации «локально available больше чем на сервере → reserve
+ * упирается в inv_items_check». При накоплении N failed подряд триггерим
+ * `syncFromServer({forceFull:true})` — пересинхронизация лечит расхождение.
+ */
+let consecutiveUpdateFailures = 0
+const FAILED_UPDATES_THRESHOLD = 5
+
 export async function applyItemsUpdate(
   items: Array<{ id: number; available: number }>,
 ): Promise<void> {
   if (!Array.isArray(items) || items.length === 0) return
   const db = await getDb()
   const ts = now()
+  let failedThisBatch = 0
   for (const it of items) {
     try {
       await db.execute(
@@ -396,8 +407,39 @@ export async function applyItemsUpdate(
         [it.available, ts, it.id],
       )
     } catch (e) {
-      // не критично — если не нашли локальный server_item_id, просто скипнем.
-      // На следующем `syncFromServer` догоним.
+      failedThisBatch++
+      await log
+        .warn(
+          'inventory.sse',
+          `UPDATE esf_items упал для server_item_id=${it.id}: ` +
+            (e instanceof Error ? e.message : String(e)),
+        )
+        .catch(() => {})
     }
+  }
+  if (failedThisBatch > 0) {
+    consecutiveUpdateFailures += failedThisBatch
+    if (consecutiveUpdateFailures >= FAILED_UPDATES_THRESHOLD) {
+      await log
+        .warn(
+          'inventory.sse',
+          `Накоплено ${consecutiveUpdateFailures} failed UPDATE — ` +
+            `триггерим forceFull-синк чтобы кэш не разъезжался с сервером.`,
+        )
+        .catch(() => {})
+      consecutiveUpdateFailures = 0
+      // forceFull в фоне — не ждём, чтобы SSE-handler не блокировался.
+      void syncFromServer({ forceFull: true }).catch((e) => {
+        log
+          .error(
+            'inventory.sse',
+            `forceFull-recovery упал: ${e instanceof Error ? e.message : String(e)}`,
+          )
+          .catch(() => {})
+      })
+    }
+  } else {
+    // Сброс счётчика на успешном батче — считаем только подряд-failures.
+    consecutiveUpdateFailures = 0
   }
 }

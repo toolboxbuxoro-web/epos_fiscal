@@ -572,5 +572,9 @@ function parseFiscalDateTime(s: string): number {
   const h = Number(s.slice(8, 10))
   const mi = Number(s.slice(10, 12))
   const se = Number(s.slice(12, 14))
-  return Math.floor(Date.UTC(y, m, d, h, mi, se) / 1000)
+  // ВАЖНО: Communicator возвращает время в локальной TZ магазина (Asia/Tashkent
+  // +5). Раньше использовали Date.UTC(...) — это интерпретировало строку как
+  // UTC, что давало смещение в 5 часов (продажа в 14:00 показывалась как 09:00).
+  // Используем локальный конструктор Date — он трактует поля как локальное время.
+  return Math.floor(new Date(y, m, d, h, mi, se).getTime() / 1000)
 }

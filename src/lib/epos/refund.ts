@@ -336,9 +336,22 @@ export async function processRefund(opts: ProcessRefundOptions): Promise<Process
  * Стратегия: выкинуть ВСЕ нецифры и взять первые 14. Это корректно для
  * всех трёх форматов и не делает timezone-математику (Communicator и так
  * отдаёт локальное время терминала Asia/Tashkent — пересчёт сломал бы).
+ *
+ * Бросает осмысленную ошибку если результат < 14 цифр (битый
+ * `fiscal_datetime` в БД, повреждение данных). Без проверки refund уходил
+ * бы в «бириктирилмаган» в soliq.uz — теперь fail-fast с понятной
+ * причиной чтобы кассир не молча терял refund.
  */
 function toRefundDateTime(raw: string | null | undefined): string {
-  return (raw ?? '').replace(/\D/g, '').slice(0, 14)
+  const result = (raw ?? '').replace(/\D/g, '').slice(0, 14)
+  if (result.length !== 14) {
+    throw new Error(
+      `fiscal_datetime оригинала повреждён или пустой («${raw ?? ''}» → ` +
+        `${result.length} цифр вместо 14). Refund не может быть привязан ` +
+        `к оригинальному чеку в ОФД. Обратитесь в саппорт.`,
+    )
+  }
+  return result
 }
 
 interface OriginalContext {
@@ -632,9 +645,22 @@ export async function getDefaultRefundAmounts(
 ): Promise<{ cash: number; card: number; qr: number }> {
   // Если refund уже есть на этот fiscal_receipts.id — берём ровно его суммы
   // (но в UI всё равно поля будут disabled — повторный refund невозможен).
-  const refund = await getRefundByOriginalFiscalId(originalFiscalId).catch(
-    () => null,
-  )
+  // Не глотаем ошибки молча: при БД-locked логируем, чтобы знать о проблеме.
+  // Возвращаем null — это безопасный fallback (поля заполнятся из ms_receipt
+  // ниже). Безопасность гарантирует processRefund — там check без .catch.
+  let refund = null
+  try {
+    refund = await getRefundByOriginalFiscalId(originalFiscalId)
+  } catch (e) {
+    await log
+      .warn(
+        'refund',
+        `getRefundByOriginalFiscalId упал в getDefaultRefundAmounts: ` +
+          (e instanceof Error ? e.message : String(e)),
+        { originalFiscalId },
+      )
+      .catch(() => {})
+  }
   if (refund) {
     return {
       cash: refund.refund_cash_tiyin,
