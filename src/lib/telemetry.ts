@@ -24,7 +24,7 @@
  *   4. На ошибке сети — exp backoff, retry на следующем тике
  *
  * Серверная сторона (mytoolbox, отдельный репо):
- *   - Endpoint: POST /api/v1/telemetry/logs
+ *   - Endpoint: POST /api/v1/inventory/telemetry/logs
  *   - Auth: Bearer <SettingKey.InventoryShopApiKey>
  *   - Body: { shop_slug, app_version, logs: [{ts, level, source, message, details}] }
  *   - Response: { ok: true }
@@ -118,7 +118,10 @@ export async function flushLogsToServer(): Promise<void> {
       local_log_id: row.id, // для дедупа на сервере + трассировки
     }))
 
-    const url = serverUrl.replace(/\/$/, '') + '/api/v1/telemetry/logs'
+    // Endpoint живёт ВНУТРИ shopRouter inventory (mytoolbox), чтобы наследовать
+    // существующий `requireShopApiKey` middleware. URL получается длинным,
+    // но не плодим дублирующий middleware на сервере.
+    const url = serverUrl.replace(/\/$/, '') + '/api/v1/inventory/telemetry/logs'
     const res = await fetch(url, {
       method: 'POST',
       headers: {
@@ -151,7 +154,7 @@ export async function flushLogsToServer(): Promise<void> {
     // Другие не-2xx — учитываем как failure, не помечаем sent (повторим).
     consecutiveFailures += 1
     consoleWarn(
-      `telemetry: HTTP ${res.status} при POST /api/v1/telemetry/logs ` +
+      `telemetry: HTTP ${res.status} при POST /api/v1/inventory/telemetry/logs ` +
         `(подряд-ошибок ${consecutiveFailures})`,
     )
   } catch (e) {

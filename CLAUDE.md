@@ -444,7 +444,7 @@ log.error(...) → INSERT logs (sent_to_server=0)
                        │
                        ├─ listUnsentLogsForServer(limit=50)
                        ├─ scrubText(message) + scrubText(details)
-                       ├─ POST /api/v1/telemetry/logs
+                       ├─ POST /api/v1/inventory/telemetry/logs
                        │     Bearer <InventoryShopApiKey>
                        │     { shop_slug, app_version, logs: [...] }
                        ├─ 200 OK → markLogsSentToServer(ids)
@@ -459,7 +459,7 @@ log.error(...) → INSERT logs (sent_to_server=0)
 
 ### Серверный контракт (для mytoolbox-репо)
 
-**Endpoint:** `POST /api/v1/telemetry/logs`
+**Endpoint:** `POST /api/v1/inventory/telemetry/logs`
 
 **Auth:** `Authorization: Bearer <api_key>` — тот же что для inventory.
 
