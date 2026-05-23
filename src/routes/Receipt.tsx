@@ -37,8 +37,10 @@ import {
   fiscalize,
   AlreadyFiscalizedError,
   InventoryConflictError,
+  InventoryStaleError,
   ShiftNotOpenError,
 } from '@/lib/epos'
+import { syncFromServer } from '@/lib/inventory'
 import {
   MoyskladClient,
   enrichWithVariants,
@@ -513,6 +515,21 @@ export default function Receipt() {
       if (e instanceof AlreadyFiscalizedError) {
         toast.error(e.message, { duration: 6000 })
         void load()
+        return
+      }
+      // Сервер вернул Postgres-инвариант inv_items_check — кэш справочника
+      // разъехался с реальностью. Делаем форс-синк + перематч (не failed —
+      // чек валиден, просто данные нужно освежить).
+      if (e instanceof InventoryStaleError) {
+        toast.error('Остатки изменились, обновляю справочник…', {
+          duration: 4000,
+        })
+        try {
+          await syncFromServer({ forceFull: true })
+        } catch {
+          // Если sync упал — всё равно попробуем load(), вдруг помогло.
+        }
+        setTimeout(() => void load(), 300)
         return
       }
       // Смена не открыта — НЕ failed (чек валиден, просто нет смены).

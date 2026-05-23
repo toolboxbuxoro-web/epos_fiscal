@@ -400,6 +400,24 @@ export class AlreadyFiscalizedError extends Error {
 }
 
 /**
+ * Сервер вернул ошибку Postgres-инварианта `inv_items_check` (qty_consumed +
+ * qty_reserved <= qty_received). Это значит локальный кэш справочника
+ * рассинхронизирован с сервером — фактического остатка меньше чем мы думали.
+ *
+ * Отличается от `InventoryConflictError` тем что сервер не вернул `failed[]` —
+ * мы не знаем какой конкретно товар «застрял». Поэтому UI делает полную
+ * пересинхронизацию справочника + перематч, вместо exclude-логики.
+ */
+export class InventoryStaleError extends Error {
+  constructor() {
+    super(
+      'Остатки на сервере изменились. Обновляем справочник и пересобираем чек…',
+    )
+    this.name = 'InventoryStaleError'
+  }
+}
+
+/**
  * Многошаговая ошибка: «не хватило остатков на сервере».
  * UI ловит её и показывает «товар закончился, перематчите».
  */
@@ -462,7 +480,21 @@ async function tryRemoteReserve(
     items.push({ inv_item_id: sid, quantity: c.quantity })
   }
 
-  const resp = await client.reserve({ ms_receipt_id, items })
+  let resp
+  try {
+    resp = await client.reserve({ ms_receipt_id, items })
+  } catch (e) {
+    // Сервер может вернуть Postgres-инвариант inv_items_check (qty_consumed +
+    // qty_reserved <= qty_received) сырым текстом если сам не успел проверить
+    // available и UPDATE упал на constraint. Это значит локальный кэш
+    // справочника разъехался с сервером. Конвертируем в InventoryStaleError
+    // — UI сделает forceFull sync + перематчит.
+    const msg = e instanceof Error ? e.message : String(e)
+    if (/inv_items_check|violates check constraint/i.test(msg)) {
+      throw new InventoryStaleError()
+    }
+    throw e
+  }
   if (!resp.ok) {
     throw new InventoryConflictError(resp.failed)
   }
