@@ -80,6 +80,30 @@ printer.rs::print_fiscal_receipt (ESC/POS + Karta turi + сумма без exclu
         → печать «ВОЗВРАТ ТОВАРА»
 ```
 
+## Связанные проекты (где искать что)
+
+| Проект | Локально | GitHub | Что там |
+|---|---|---|---|
+| **epos_fiscal** (этот) | `~/Desktop/Toolbox-projects/epos_fiscal` | `toolboxbuxoro-web/epos_fiscal` | Tauri-клиент магазинов — этот репо |
+| **mytoolbox** (backend+frontend) | `~/Desktop/Toolbox-projects/My_toobox` | `toolboxbuxoro-web/mytoolbox` | Backend Express + Postgres + admin UI Next.js. **Это и есть «сервер mytoolbox»** на который мы ходим за inventory/telemetry. Деплой через Railway (auto-deploy при push в main) |
+
+**Где что в mytoolbox-репо:**
+- `backend/src/routes/inventory.js` — `shopRouter` (наш Tauri-клиент сюда ходит, auth по api_key через `requireShopApiKey`) + `adminRouter` (admin UI по JWT). Эндпоинты: `/reserve`, `/confirm`, `/release`, `/extend`, `/unconsume`, `/items`, `/shop/me`, `/events` (SSE), `/telemetry/logs`
+- `backend/src/services/inventory/reservations.js` — атомарный reserve/confirm/release с `BEGIN/SELECT FOR UPDATE`
+- `backend/src/services/inventory/items.js` — bulk import, item CRUD
+- `backend/src/services/inventory/sse.js` — SSE broadcaster для `inv.items.updated`
+- `backend/src/middleware/inventoryAuth.js` — `requireShopApiKey` (Bearer)
+- `frontend/app/(admin)/inventory/` — admin-страница для бухгалтера (импорт Excel, корректировка приходов)
+- `backend/src/db.js` — pg Pool, `db.query(text, params)` интерфейс
+
+**Production-сервер:** Railway, Postgres @ `gondola.proxy.rlwy.net:30902` (login/pass в `mytoolbox/.env` или Railway Variables). Креды для админ-доступа есть в Postgres → Variables → Reset (см. секцию «Безопасность» внизу).
+
+**Когда что менять:**
+- Изменения в API контракте → сначала backend (mytoolbox), потом клиент (epos_fiscal)
+- Новые поля в `inv_items` / `fiscal_receipts` локально → миграция в epos_fiscal `migrations/`
+- Новые поля в `inv_items` / `inv_shops` / `inv_reservations` / `shop_logs` на сервере → миграция в Postgres напрямую (psql) + код в mytoolbox/backend
+- Cross-cutting feature (телеметрия, refund-unconsume) → коммит в оба репо, проверить порядок: сначала задеплоить серверную часть, потом тегнуть клиент
+
 ## Multi-shop
 
 Каждый магазин = своя Win-машина = свой USB-фискальный модуль = своя
