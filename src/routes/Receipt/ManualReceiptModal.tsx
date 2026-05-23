@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react'
-import { Minus, Plus, RotateCcw, Wand2, X } from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
+import { AlertCircle, Loader2, Minus, Plus, RotateCcw, Wand2, X } from 'lucide-react'
 import { planHolistic } from '@/lib/matcher'
 import {
   costWithVat,
@@ -19,11 +19,19 @@ export interface ManualReceiptInitialLine {
   qtyPcs: number
 }
 
-interface Props {
+interface OuterProps {
   /** Целевая сумма чека (rd.sum − Click/Payme exclude), тийины. */
   targetTiyin: number
-  /** Пул товаров справочника (с предрасчитанными продажными ценами). */
-  pool: MatcherPool
+  /**
+   * Колбек который грузит СВЕЖИЙ пул товаров с уже-предрасчитанными
+   * продажными ценами. Вызывается при открытии модалки. Раньше pool
+   * передавался один раз из Receipt.tsx::load() — за время сессии
+   * (модалка открыта 10+ минут) SSE мог обновить qty_received, и
+   * pool разъезжался с реальностью. «Готово» → reserve упирался в
+   * inv_items_check на сервере. Теперь модалка ВСЕГДА работает со
+   * свежим снимком пула.
+   */
+  loadPool: () => Promise<MatcherPool>
   /** Стартовый набор — план который собрала программа. */
   initialLines: ManualReceiptInitialLine[]
   /** Опции matcher — для planHolistic в «Дособрать оставшееся». */
@@ -31,6 +39,11 @@ interface Props {
   onClose: () => void
   /** Кассир нажал «Готово» — отдаём собранный holistic-план. */
   onDone: (plan: HolisticPlan) => void
+}
+
+/** Внутренние props body — после того как pool уже загружен (не-null). */
+interface BodyProps extends Omit<OuterProps, 'loadPool'> {
+  pool: MatcherPool
 }
 
 /** Сколько штук товара доступно на складе (available в миллидолях → штуки). */
@@ -57,7 +70,116 @@ function rejectMessage(reason: string): string {
 }
 
 /**
- * Модалка ручной сборки чека ЦЕЛИКОМ.
+ * Внешний компонент — грузит свежий пул и рендерит loading/error/body.
+ * При открытии модалки делает `loadPool()`, показывает спиннер, потом
+ * передаёт пул в `ManualReceiptModalBody`. Если pool не загрузился —
+ * показывает ошибку, не даёт собирать чек на устаревших данных.
+ */
+export function ManualReceiptModal(props: OuterProps) {
+  const [pool, setPool] = useState<MatcherPool | null>(null)
+  const [poolError, setPoolError] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      try {
+        const fresh = await props.loadPool()
+        if (!cancelled) setPool(fresh)
+      } catch (e) {
+        if (!cancelled) {
+          setPoolError(e instanceof Error ? e.message : String(e))
+        }
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  if (poolError) {
+    return (
+      <ModalShell onClose={props.onClose} title="Ручная сборка чека">
+        <div className="flex flex-col items-center gap-3 px-5 py-8 text-center">
+          <AlertCircle size={36} className="text-danger" />
+          <div className="text-body font-medium text-ink">
+            Не удалось загрузить справочник
+          </div>
+          <div className="text-caption text-ink-muted max-w-md">
+            {poolError}. Попробуйте закрыть и открыть снова, или
+            синхронизируйте справочник вручную в разделе «Справочник».
+          </div>
+          <Button variant="ghost" onClick={props.onClose}>
+            Закрыть
+          </Button>
+        </div>
+      </ModalShell>
+    )
+  }
+
+  if (!pool) {
+    return (
+      <ModalShell onClose={props.onClose} title="Ручная сборка чека">
+        <div className="flex flex-col items-center gap-3 px-5 py-12 text-center">
+          <Loader2 size={32} className="animate-spin text-primary" />
+          <div className="text-body text-ink-muted">
+            Загружаю свежий справочник…
+          </div>
+        </div>
+      </ModalShell>
+    )
+  }
+
+  return (
+    <ManualReceiptModalBody
+      pool={pool}
+      targetTiyin={props.targetTiyin}
+      initialLines={props.initialLines}
+      opts={props.opts}
+      onClose={props.onClose}
+      onDone={props.onDone}
+    />
+  )
+}
+
+/**
+ * Минимальная обёртка-overlay для loading/error состояний модалки.
+ * Тело модалки рендерит свой собственный layout с тем же стилем —
+ * выносить общий ModalShell для них пока не стоит, разные требования.
+ */
+function ModalShell(props: {
+  onClose: () => void
+  title: string
+  children: React.ReactNode
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4"
+      onClick={props.onClose}
+    >
+      <div
+        className="w-full max-w-md rounded-lg bg-canvas shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between gap-3 border-b border-border px-5 py-4">
+          <div className="text-h4 font-medium text-ink">{props.title}</div>
+          <button
+            type="button"
+            onClick={props.onClose}
+            className="rounded-md p-1 text-ink-muted hover:bg-surface-hover hover:text-ink"
+            aria-label="Закрыть"
+          >
+            <X size={18} />
+          </button>
+        </div>
+        {props.children}
+      </div>
+    </div>
+  )
+}
+
+/**
+ * Модалка ручной сборки чека ЦЕЛИКОМ (тело — после загрузки пула).
  *
  * Кассир открывает с планом который собрала программа, дальше:
  *   - меняет количество (+/−), удаляет, добавляет товары из справочника
@@ -69,7 +191,7 @@ function rejectMessage(reason: string): string {
  * Результат — `HolisticPlan`, тот же формат что у авто-holistic. Фискализация,
  * печать, refund, история уже умеют его обрабатывать.
  */
-export function ManualReceiptModal(props: Props) {
+function ManualReceiptModalBody(props: BodyProps) {
   const { targetTiyin, pool, initialLines, opts, onClose, onDone } = props
 
   // Индекс пула по id товара — для быстрого lookup при рендере карточек.

@@ -29,7 +29,6 @@ import {
   loadMatcherPool,
   recalculateAfterSwap,
   type BuildMatchResult,
-  type MatcherPool,
 } from '@/lib/matcher'
 import type { HolisticPlan, MatcherOptions } from '@/lib/matcher/types'
 import { ManualReceiptModal } from './Receipt/ManualReceiptModal'
@@ -74,10 +73,8 @@ export default function Receipt() {
   // Сохраняем опции последнего вызова buildMatch — нужны при swap
   // (recalculateAfterSwap вызывает distribute с теми же лимитами).
   const [matcherOpts, setMatcherOpts] = useState<MatcherOptions>({})
-  // Пул товаров справочника — нужен модалке ручной сборки чека
-  // (поиск + planHolistic для «Дособрать»). Грузится в load().
-  const [pool, setPool] = useState<MatcherPool | null>(null)
-  // Открыта ли модалка ручной сборки чека целиком.
+  // Открыта ли модалка ручной сборки чека целиком. Пул товаров модалка
+  // грузит сама на open (свежий снимок), чтобы не работать со stale-данными.
   const [manualModalOpen, setManualModalOpen] = useState(false)
   const [busy, setBusy] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -397,12 +394,8 @@ export default function Receipt() {
       const result = await buildMatch(parsed, opts)
       setMatch(result)
       setMatcherOpts(opts)
-      // Пул для модалки ручной сборки. buildMatch грузит его внутри, но
-      // нам нужна копия для UI (поиск + «Дособрать»). +50ms при открытии
-      // чека — приемлемо на фоне fetch МС-чека и самого buildMatch.
-      const freshPool = await loadMatcherPool(opts)
-      setPool(freshPool)
-
+      // Пул для модалки ручной сборки больше не кэшируем тут — модалка
+      // сама грузит свежий снимок при открытии (см. HIGH #6 review).
       const test = (await getSetting(SettingKey.TestMode)) === 'true'
       setTestMode(test)
     } catch (e) {
@@ -592,11 +585,12 @@ export default function Receipt() {
               Назад
             </Button>
             {/* Ручная сборка чека целиком — кассир сам набирает товары на
-                сумму. Недоступно если чек уже фискализирован. */}
+                сумму. Недоступно если чек уже фискализирован. Пул модалка
+                загружает сама на open (свежий снимок), отсюда pool не передаём. */}
             <Button
               variant="secondary"
               onClick={() => setManualModalOpen(true)}
-              disabled={!pool || !!alreadyFiscalized || fiscalizing}
+              disabled={!!alreadyFiscalized || fiscalizing}
               title="Собрать чек вручную: добавить/убрать товары, дособрать остаток"
             >
               Собрать вручную
@@ -1123,11 +1117,12 @@ export default function Receipt() {
 
       {/* Модалка ручной сборки чека целиком. Стартует планом программы,
           кассир правит, «Дособрать» добивает остаток через holistic,
-          «Готово» → результат становится holistic-планом чека. */}
-      {manualModalOpen && pool && (
+          «Готово» → результат становится holistic-планом чека.
+          loadPool — модалка грузит свежий снимок справочника сама. */}
+      {manualModalOpen && (
         <ManualReceiptModal
           targetTiyin={Math.max(0, rd.sum - excludeTiyin)}
-          pool={pool}
+          loadPool={() => loadMatcherPool(matcherOpts)}
           opts={matcherOpts}
           initialLines={(match.mode === 'holistic' && match.holistic
             ? match.holistic.lines

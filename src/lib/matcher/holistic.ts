@@ -247,8 +247,17 @@ export function planHolistic(
     const sorted = [...lines].sort((a, b) => b.priceTiyin - a.priceTiyin)
     for (const line of sorted) {
       if (toBump <= 0) break
-      const room = maxBumpPerLine // без cost-floor — bump = больше наценка, всегда легально
+      // Двойной cap чтобы цена строки не «надулась» в 11× при большом delta
+      // и маленьком sellingPrice:
+      //   1. абсолютный — maxBumpPerLine из настроек (default 10 000 сум)
+      //   2. относительный — не более 50% от текущей цены строки
+      //      (иначе на ленте 1 шт = 1.1M сум при реальной розничной 100k
+      //       выглядит подозрительно для покупателя + ГНК при сверке).
+      const RELATIVE_CAP_RATIO = 0.5
+      const relativeCap = Math.floor(line.priceTiyin * RELATIVE_CAP_RATIO)
+      const room = Math.min(maxBumpPerLine, relativeCap)
       const take = Math.min(toBump, room)
+      if (take <= 0) continue
       line.priceTiyin += take
       line.vatTiyin = vatIncluded(
         line.priceTiyin - line.discountTiyin,
@@ -258,7 +267,8 @@ export function planHolistic(
     }
     if (toBump > 0) {
       notes.push(
-        `bump не покрыл delta ${toBump} тийинов — расширьте maxBumpPerItemTiyin`,
+        `bump не покрыл delta ${toBump} тийинов (cap 50% от цены строки + ` +
+          `maxBumpPerItemTiyin). Добавьте мелкие товары в справочник.`,
       )
     }
     remaining = toBump
