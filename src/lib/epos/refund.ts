@@ -227,9 +227,18 @@ export async function processRefund(opts: ProcessRefundOptions): Promise<Process
     qr: fiscal.QRCodeURL,
   })
 
-  // 6. INSERT fiscal_refunds.
+  // 6. INSERT fiscal_refunds с RETRY.
+  //
+  // Refund УЖЕ в ОФД (Communicator вернул FiscalSign). Если INSERT упадёт
+  // (SQLite BUSY, диск, FK violation) — UNIQUE-защита от двойного refund
+  // НЕ сработает, кассир кликнет «Возврат» снова → refund уйдёт в ОФД
+  // ВТОРОЙ раз (реальная потеря денег магазина).
+  //
+  // До 3 попыток с exp backoff (500 / 1000 ms). Если все упали — CRITICAL
+  // в логи с полным контекстом + явная ошибка для UI «обратитесь в саппорт».
+  // Админ восстановит запись вручную по FiscalSign из логов.
   const cashier = (await getSetting(SettingKey.MoyskladEmployeeName)) ?? null
-  const refundDbId = await insertFiscalRefund({
+  const refundPayload = {
     original_fiscal_id: opts.originalFiscalId,
     ms_return_id: null, // на MVP МС не интегрирован
     terminal_id: fiscal.TerminalID,
@@ -246,7 +255,56 @@ export async function processRefund(opts: ProcessRefundOptions): Promise<Process
     response_json: JSON.stringify(fiscal),
     reason: opts.reason ?? null,
     cashier_name: cashier,
-  })
+  }
+  let refundDbId: number | null = null
+  let lastInsertErr: unknown = null
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      refundDbId = await insertFiscalRefund(refundPayload)
+      lastInsertErr = null
+      break
+    } catch (e) {
+      lastInsertErr = e
+      await log.warn(
+        'refund',
+        `INSERT fiscal_refunds попытка ${attempt}/3 упала: ` +
+          (e instanceof Error ? e.message : String(e)),
+        { fiscalSign: fiscal.FiscalSign, attempt },
+      )
+      if (attempt < 3) {
+        await new Promise((r) => setTimeout(r, attempt * 500))
+      }
+    }
+  }
+  if (refundDbId === null) {
+    // CRITICAL — refund в ОФД, локально не сохранён. Кладём в логи ВСЁ
+    // что нужно для ручного восстановления записи админом.
+    await log.error(
+      'refund',
+      `🚨 КРИТИЧНО: refund фискализирован в ОФД (FiscalSign=${fiscal.FiscalSign}), ` +
+        `но НЕ сохранён в fiscal_refunds после 3 попыток. Срочно восстановите ` +
+        `запись вручную (original_fiscal_id=${opts.originalFiscalId}). Иначе ` +
+        `повторный «Возврат» на этот чек пройдёт ВТОРОЙ раз в ОФД!`,
+      {
+        fiscal,
+        originalFiscalId: opts.originalFiscalId,
+        refundCash,
+        refundCard,
+        refundQr,
+        requestJson,
+        lastError:
+          lastInsertErr instanceof Error
+            ? lastInsertErr.message
+            : String(lastInsertErr),
+      },
+    )
+    throw new Error(
+      `Refund прошёл в ОФД (FiscalSign ${fiscal.FiscalSign}), но локально ` +
+        `не сохранён из-за ошибки БД. НЕ нажимайте «Возврат» повторно — ` +
+        `refund уйдёт в ОФД второй раз. Обратитесь в саппорт с этим ` +
+        `FiscalSign для восстановления записи.`,
+    )
+  }
 
   // 7. Возврат остатков на сервер (best-effort).
   await tryUnconsume(original, refundDbId, fiscal.FiscalSign)

@@ -18,7 +18,7 @@
  *   - Кнопка «Вернуть» disabled пока сумма = 0
  */
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { AlertCircle, ArrowLeft, Undo2 } from 'lucide-react'
 import {
@@ -75,6 +75,15 @@ export default function Refund() {
   const [busy, setBusy] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
+  /**
+   * Синхронный lock против двойного клика «Подтвердить возврат».
+   * `setSubmitting(true)` асинхронен — между двумя быстрыми кликами оба
+   * обработчика стартуют ДО того как `submitting` стало true. UNIQUE на
+   * `original_fiscal_id` в БД защищает локально, НО Communicator получит
+   * два refund-запроса параллельно — двойной refund в ОФД, реальная потеря
+   * денег. Ref проверяется СИНХРОННО в самом начале doRefund.
+   */
+  const submitLockRef = useRef(false)
 
   // Поля формы
   const [refundCashStr, setRefundCashStr] = useState('')
@@ -173,9 +182,38 @@ export default function Refund() {
 
   async function doRefund() {
     if (!fiscalReceipt) return
+    // СИНХРОННЫЙ lock против двойного клика — отрабатывает до любого await,
+    // когда setSubmitting ещё не успел зафиксироваться в React state.
+    // Без него два клика подряд → два refund в ОФД (реальная потеря денег).
+    if (submitLockRef.current) return
+    submitLockRef.current = true
     setSubmitting(true)
     setError(null)
     try {
+      // TOCTOU-защита: между загрузкой страницы и кликом мог пройти большой
+      // промежуток времени — другой пользователь/сессия могла оформить refund.
+      // Перечитываем существующий refund СИНХРОННО до Communicator. Если упало
+      // (БД locked) — не глотаем, абортим: не уверены = не шлём refund.
+      let fresh: FiscalRefundRow | null
+      try {
+        fresh = await getRefundByOriginalFiscalId(fiscalReceipt.id)
+      } catch (checkErr) {
+        setError(
+          'Не удалось проверить существующий возврат: ' +
+            (checkErr instanceof Error ? checkErr.message : String(checkErr)) +
+            '. Попробуйте ещё раз.',
+        )
+        return
+      }
+      if (fresh) {
+        setExisting(fresh)
+        toast.error(
+          `Этот чек уже был возвращён ранее (FiscalSign ${fresh.fiscal_sign}). ` +
+            `Повторный refund запрещён.`,
+          { duration: 6000 },
+        )
+        return
+      }
       const res = await processRefund({
         originalFiscalId: fiscalReceipt.id,
         refundCashTiyin: parsedCash,
@@ -195,6 +233,7 @@ export default function Refund() {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
       setSubmitting(false)
+      submitLockRef.current = false
     }
   }
 
