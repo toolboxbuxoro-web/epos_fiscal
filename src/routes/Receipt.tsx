@@ -1212,7 +1212,23 @@ export default function Receipt() {
       {manualModalOpen && (
         <ManualReceiptModal
           targetTiyin={Math.max(0, rd.sum - excludeTiyin)}
-          loadPool={() => loadMatcherPool(matcherOpts)}
+          loadPool={async () => {
+            // ВАЖНО: перед загрузкой пула делаем forceFull-синк с сервера.
+            // loadMatcherPool читает локальную SQLite-таблицу esf_items —
+            // если кэш разъехался с реальностью (товар на сервере
+            // распродан, локально ещё available>0), модалка покажет
+            // призрачный товар → «Готово» → reserve в ОФД упадёт на
+            // inv_items_check. forceFull-синк гарантирует что локальная
+            // БД отражает СЕРВЕРНЫЕ остатки. Модалка показывает loader
+            // пока идёт синк (~1-3 сек на сети + БД).
+            try {
+              await syncFromServer({ forceFull: true })
+            } catch {
+              // Если sync упал — всё равно грузим pool из того что есть.
+              // Лучше показать кассиру stale данные чем вообще ничего.
+            }
+            return loadMatcherPool(matcherOpts)
+          }}
           opts={matcherOpts}
           initialLines={(match.mode === 'holistic' && match.holistic
             ? match.holistic.lines

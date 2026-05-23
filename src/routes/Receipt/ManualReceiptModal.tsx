@@ -123,7 +123,11 @@ export function ManualReceiptModal(props: OuterProps) {
         <div className="flex flex-col items-center gap-3 px-5 py-12 text-center">
           <Loader2 size={32} className="animate-spin text-primary" />
           <div className="text-body text-ink-muted">
-            Загружаю свежий справочник…
+            Синхронизирую справочник с сервером…
+          </div>
+          <div className="text-caption text-ink-subtle max-w-md">
+            Получаем актуальные остатки прямо сейчас, чтобы вы видели
+            именно то что реально доступно на складе.
           </div>
         </div>
       </ModalShell>
