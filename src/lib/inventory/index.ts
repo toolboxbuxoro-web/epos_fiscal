@@ -46,6 +46,8 @@ export {
 } from './runtime'
 export { signInWithMs, signOut, hasActiveSession } from './login'
 export type { LoginErrorCode, LoginSuccess, LoginFailure } from './login'
+export { onItemsUpdated, emitItemsUpdated } from './event-bus'
+export type { ItemsUpdatedPayload } from './event-bus'
 export {
   migrateLocalToServer,
   getMigrationStats,

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { AlertCircle, Loader2, Minus, Plus, RotateCcw, Wand2, X } from 'lucide-react'
 import { planHolistic } from '@/lib/matcher'
 import {
@@ -12,6 +12,7 @@ import { tiyinToSumDisplay } from '@/lib/format'
 import { Button, toast } from '@/components/ui'
 import { Input } from '@/components/ui/Input'
 import { cn } from '@/lib/cn'
+import { onItemsUpdated } from '@/lib/inventory/event-bus'
 
 /** Одна строка стартового плана (то что подобрала программа). */
 export interface ManualReceiptInitialLine {
@@ -44,6 +45,12 @@ interface OuterProps {
 /** Внутренние props body — после того как pool уже загружен (не-null). */
 interface BodyProps extends Omit<OuterProps, 'loadPool'> {
   pool: MatcherPool
+  /**
+   * Сколько раз SSE приносил апдейт. 0 — нет апдейтов. Показывается в
+   * шапке модалки как «🔄 Остатки обновились». Тело не пересоздаёт useState,
+   * только рендерит индикатор и (через useEffect) clamp'ит selected.
+   */
+  liveUpdateCount: number
 }
 
 /** Сколько штук товара доступно на складе (available в миллидолях → штуки). */
@@ -78,6 +85,12 @@ function rejectMessage(reason: string): string {
 export function ManualReceiptModal(props: OuterProps) {
   const [pool, setPool] = useState<MatcherPool | null>(null)
   const [poolError, setPoolError] = useState<string | null>(null)
+  /**
+   * Сколько раз SSE присылал апдейт за время сессии модалки.
+   * Показывается в UI как «🔄 Остатки обновились N раз». 0 — скрыто.
+   * Без этого кассир не знает что под капотом пул меняется.
+   */
+  const [liveUpdateCount, setLiveUpdateCount] = useState(0)
 
   useEffect(() => {
     let cancelled = false
@@ -96,6 +109,45 @@ export function ManualReceiptModal(props: OuterProps) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  /**
+   * Подписка на SSE-апдейты остатков. Когда другой магазин фискализирует/
+   * возвращает товар → сервер шлёт `inv.items.updated` → runtime обновляет
+   * локальную SQLite → emitItemsUpdated → мы патчим item.available в нашем
+   * локальном snapshot пула.
+   *
+   * Что НЕ перезагружаем: minSellingPrice, sellingPrice — они от vat+markup,
+   * не зависят от available. Только qty/available patch'им in-place.
+   */
+  useEffect(() => {
+    if (!pool) return
+    const off = onItemsUpdated((updates) => {
+      setPool((cur) => {
+        if (!cur) return cur
+        const byId = new Map(updates.map((u) => [u.id, u.available]))
+        let touched = false
+        const next = {
+          ...cur,
+          items: cur.items.map((pi) => {
+            const newAvail = byId.get(pi.item.id)
+            if (newAvail === undefined || newAvail === pi.item.available) {
+              return pi
+            }
+            touched = true
+            return {
+              ...pi,
+              item: { ...pi.item, available: newAvail },
+            }
+          }),
+        }
+        if (touched) {
+          setLiveUpdateCount((n) => n + 1)
+        }
+        return touched ? next : cur
+      })
+    })
+    return off
+  }, [pool])
 
   if (poolError) {
     return (
@@ -142,6 +194,7 @@ export function ManualReceiptModal(props: OuterProps) {
       opts={props.opts}
       onClose={props.onClose}
       onDone={props.onDone}
+      liveUpdateCount={liveUpdateCount}
     />
   )
 }
@@ -196,7 +249,7 @@ function ModalShell(props: {
  * печать, refund, история уже умеют его обрабатывать.
  */
 function ManualReceiptModalBody(props: BodyProps) {
-  const { targetTiyin, pool, initialLines, opts, onClose, onDone } = props
+  const { targetTiyin, pool, initialLines, opts, onClose, onDone, liveUpdateCount } = props
 
   // Индекс пула по id товара — для быстрого lookup при рендере карточек.
   const poolById = useMemo(() => {
@@ -221,6 +274,51 @@ function ManualReceiptModalBody(props: BodyProps) {
   // selected: esfItemId → количество штук.
   const [selected, setSelected] = useState<Map<number, number>>(buildInitialSelected)
   const [search, setSearch] = useState('')
+
+  /**
+   * Когда SSE приходит апдейт пула (другой магазин фискализировал товар) —
+   * clamp выбранные количества к новому available. Если кассир выбрал 5 шт,
+   * а на сервере стало 3 → выставляем 3 и показываем toast «X шт. Y стало
+   * недоступно». Если стало 0 → удаляем из selected.
+   *
+   * Запускается ТОЛЬКО когда pool обновлён через SSE — не на initial mount
+   * (liveUpdateCount = 0 → пропускаем).
+   */
+  const clampedRefliveUpdate = useRef(0)
+  useEffect(() => {
+    if (liveUpdateCount === 0) return
+    if (liveUpdateCount === clampedRefliveUpdate.current) return
+    clampedRefliveUpdate.current = liveUpdateCount
+
+    const adjusted: { name: string; was: number; now: number }[] = []
+    const next = new Map(selected)
+    selected.forEach((qty, id) => {
+      const pi = poolById.get(id)
+      if (!pi) {
+        // Товар вообще исчез из пула (reconcile soft-void)
+        adjusted.push({ name: '(удалённый товар)', was: qty, now: 0 })
+        next.delete(id)
+        return
+      }
+      const cap = availablePcs(pi)
+      if (qty > cap) {
+        adjusted.push({ name: pi.item.name, was: qty, now: cap })
+        if (cap <= 0) next.delete(id)
+        else next.set(id, cap)
+      }
+    })
+    if (adjusted.length > 0) {
+      setSelected(next)
+      const first = adjusted[0]!
+      toast.error(
+        adjusted.length === 1
+          ? `«${first.name}» — было ${first.was} шт, стало ${first.now} (другой магазин забрал)`
+          : `${adjusted.length} товаров изменили остаток — количество уменьшено`,
+        { duration: 5000 },
+      )
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [liveUpdateCount])
 
   // ── Расчёты ───────────────────────────────────────────────────────
   const selectedTotal = useMemo(() => {
@@ -379,7 +477,17 @@ function ManualReceiptModalBody(props: BodyProps) {
         <div className="border-b border-border px-5 py-4">
           <div className="flex items-start justify-between gap-3">
             <div>
-              <div className="text-h4 font-medium text-ink">Ручная сборка чека</div>
+              <div className="flex items-center gap-2">
+                <div className="text-h4 font-medium text-ink">Ручная сборка чека</div>
+                {liveUpdateCount > 0 && (
+                  <span
+                    className="inline-flex items-center gap-1 rounded-full bg-warning-soft px-2 py-0.5 text-caption text-warning"
+                    title={`SSE-уведомление: остатки обновлены ${liveUpdateCount} раз. Другие магазины списали/вернули товар прямо сейчас.`}
+                  >
+                    🔄 Остатки обновлены ({liveUpdateCount})
+                  </span>
+                )}
+              </div>
               <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-0.5 text-caption">
                 <span className="text-ink-muted">
                   Цель:{' '}

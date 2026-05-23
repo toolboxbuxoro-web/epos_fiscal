@@ -21,6 +21,7 @@ import {
   subscribeToInventoryEvents,
   syncFromServer,
 } from './index'
+import { emitItemsUpdated } from './event-bus'
 import type { SseEvent } from './sse'
 
 // ── Singleton state ─────────────────────────────────────────────────
@@ -183,6 +184,12 @@ async function handleSseEvent(e: SseEvent): Promise<void> {
 
   try {
     await applyItemsUpdate(items)
+    // После успешного обновления SQLite раздаём событие в UI-event-bus.
+    // ManualReceiptModal (если открыта) обновит свой snapshot пула и
+    // покажет кассиру что остатки изменились прямо во время сборки.
+    emitItemsUpdated(
+      items.map((it) => ({ id: it.id, available: it.available })),
+    )
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     await log.warn('inventory.sse', `applyItemsUpdate failed: ${msg}`).catch(() => {})

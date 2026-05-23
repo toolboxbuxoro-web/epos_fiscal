@@ -6,7 +6,6 @@ import {
   type MsRetailDemand,
   type MsRetailDemandPosition,
 } from '@/lib/moysklad/types'
-import { log } from '@/lib/log'
 import type { NormalizedPosition } from './types'
 
 /** Имена атрибутов МойСклад, в которых обычно хранят ИКПУ. */
@@ -60,20 +59,11 @@ function readLinkedBuhName(
 ): string | null {
   const characteristics = assortment.characteristics
   const attributes = assortment.attributes
-  // DEBUG: лог что приходит от МС — характеристики (variant) И атрибуты (product)
-  // Связка может быть в обоих местах:
-  //   - characteristics у модификации (variant)
-  //   - attributes у базового товара (product) — доп. поле «Бухгалтерское наименование»
+  // Связка может быть в characteristics (variant) ИЛИ attributes (product).
   // Бухгалтер сам выбирает где удобнее заполнить.
-  void log.debug('matcher', `[linked-ms] позиция "${assortment.name}"`, {
-    has_characteristics: !!characteristics,
-    chars_count: characteristics?.length ?? 0,
-    chars: characteristics?.map((c) => ({ name: c.name, value: c.value })) ?? [],
-    has_attributes: !!attributes,
-    attrs_count: attributes?.length ?? 0,
-    attrs: attributes?.map((a) => ({ name: a.name, value: a.value })) ?? [],
-    looking_for: searchName,
-  })
+  //
+  // Лог раньше был — слишком чатти (на каждую позицию по 5+ строк JSON).
+  // Если нужно дебажить — поднять log.debug ниже на конкретный случай.
 
   const lookup = searchName.toLowerCase().trim()
 

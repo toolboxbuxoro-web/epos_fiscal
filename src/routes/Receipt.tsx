@@ -102,6 +102,17 @@ export default function Receipt() {
   const staleErrorCountRef = useRef(0)
   const [staleErrorPersistent, setStaleErrorPersistent] = useState(false)
   /**
+   * Debounce stale-toast: метка времени последнего показанного тоста (ms).
+   * Если в течение 5 сек прилетел второй stale — НЕ показываем второй
+   * toast (только инкрементим счётчик). Без этого busy-shop в race-heavy
+   * момент засыпал бы кассира одинаковыми сообщениями.
+   *
+   * 5 сек — компромисс: достаточно чтобы кассир увидел первый toast и
+   * понял что происходит, но недостаточно чтобы пропустить новую вспышку
+   * stale через минуту (после следующего sync).
+   */
+  const lastStaleToastTsRef = useRef(0)
+  /**
    * server_item_id'ы которые сервер отказал на reserve (другой магазин
    * успел забрать). При rematch matcher их игнорирует — иначе сразу
    * предложил бы те же товары и снова получил 409.
@@ -560,6 +571,15 @@ export default function Receipt() {
       if (e instanceof InventoryStaleError) {
         staleErrorCountRef.current += 1
 
+        // Debounce: показываем toast не чаще раза в 5 сек. Если кассир в
+        // race-heavy момент нажимает Фискализировать несколько раз — он
+        // не утонет в одинаковых сообщениях.
+        const now = Date.now()
+        const STALE_TOAST_DEBOUNCE_MS = 5000
+        const shouldShowToast =
+          now - lastStaleToastTsRef.current >= STALE_TOAST_DEBOUNCE_MS
+        if (shouldShowToast) lastStaleToastTsRef.current = now
+
         // Suspect ids → excludedServerIds (для будущих авто-подборов).
         const newExcludes = e.suspectInvItemIds.length
           ? [...new Set([...excludedServerIds, ...e.suspectInvItemIds])]
@@ -578,32 +598,38 @@ export default function Receipt() {
         // 2+ ошибки подряд → persistent (одинаково для manual/auto)
         if (staleErrorCountRef.current >= 2) {
           setStaleErrorPersistent(true)
-          toast.error(
-            'Остатки повторно разошлись. Откройте «Собрать вручную» — ' +
-              'там свежие данные.',
-            { duration: 8000 },
-          )
+          if (shouldShowToast) {
+            toast.error(
+              'Остатки повторно разошлись. Откройте «Собрать вручную» — ' +
+                'там свежие данные.',
+              { duration: 8000 },
+            )
+          }
           return
         }
 
         // Ручной план — сохраняем, не пересобираем
         if (match?.manuallyBuilt) {
-          const conflictCount = e.suspectInvItemIds.length
-          toast.error(
-            conflictCount === 1
-              ? '1 товар из ручного выбора закончился на сервере. ' +
-                  'Откройте «Собрать вручную» — там обновлённые остатки.'
-              : `${conflictCount} товара из ручного выбора закончились на ` +
-                'сервере. Откройте «Собрать вручную» — там обновлённые остатки.',
-            { duration: 7000 },
-          )
+          if (shouldShowToast) {
+            const conflictCount = e.suspectInvItemIds.length
+            toast.error(
+              conflictCount === 1
+                ? '1 товар из ручного выбора закончился на сервере. ' +
+                    'Откройте «Собрать вручную» — там обновлённые остатки.'
+                : `${conflictCount} товара из ручного выбора закончились на ` +
+                  'сервере. Откройте «Собрать вручную» — там обновлённые остатки.',
+              { duration: 7000 },
+            )
+          }
           // План в state не трогаем — кассир увидит подсказку и сам решит
           return
         }
 
         // Авто-план — стандартный путь: sync уже сделан, перезагружаем match
         // с обновлённым excludedServerIds (matcher пропустит suspect ids).
-        toast.error('Остатки изменились, подбираю замены…', { duration: 4000 })
+        if (shouldShowToast) {
+          toast.error('Остатки изменились, подбираю замены…', { duration: 4000 })
+        }
         setTimeout(() => void load(), 300)
         return
       }

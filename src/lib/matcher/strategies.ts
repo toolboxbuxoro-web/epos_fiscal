@@ -295,17 +295,20 @@ export function tryLinkedMsVariant(
   void opts
   if (pos.totalTiyin <= 0) return null
   if (!pos.linkedBuhName) {
-    void log.debug('matcher', `[linked-ms] skip "${pos.name}" — нет linkedBuhName`)
+    // Normal-case: товар без МС-модификации/характеристики. Не логируем —
+    // matcher пойдёт по passthrough/price-bucket/holistic.
     return null
   }
 
   // Находим всех кандидатов в пуле по имени
   const candidates = findLinkedCandidates(pos.linkedBuhName, pool)
   if (candidates.length === 0) {
-    void log.warn(
+    // Normal-case: бух привязал имя, которого нет в нашем inv_items. Это
+    // бывает у каждого 2-3 чека (свежие модификации МС ещё не импортированы
+    // на склад). Matcher идёт дальше по pipeline. Debug — не warn (не ошибка).
+    void log.debug(
       'matcher',
-      `[linked-ms] "${pos.linkedBuhName}" → 0 кандидатов в пуле`,
-      { pos_name: pos.name, looking_for: pos.linkedBuhName, pool_size: pool.items.length },
+      `[linked-ms] "${pos.linkedBuhName}" → нет кандидатов (fallback на price-bucket/holistic)`,
     )
     return null
   }
@@ -315,16 +318,11 @@ export function tryLinkedMsVariant(
     (p) => p.item.qty_received - p.item.qty_consumed >= pos.quantity,
   )
   if (withStock.length === 0) {
-    void log.warn(
+    // Normal-case: товар связан, но остаток < нужного (например ушло на
+    // другой магазин). Matcher fallback'ит на price-bucket. debug, не warn.
+    void log.debug(
       'matcher',
-      `[linked-ms] "${pos.linkedBuhName}" → найдено ${candidates.length} но нет остатка`,
-      {
-        candidates: candidates.slice(0, 3).map((p) => ({
-          name: p.item.name,
-          available: p.item.qty_received - p.item.qty_consumed,
-          needed: pos.quantity,
-        })),
-      },
+      `[linked-ms] "${pos.linkedBuhName}" — найдено ${candidates.length}, но остатка не хватает`,
     )
     return null
   }
