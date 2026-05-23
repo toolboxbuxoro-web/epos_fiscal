@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { formatErrorForUser } from '@/lib/error-message'
 import { useNavigate } from 'react-router-dom'
 import { ChevronLeft, ChevronRight, Undo2 } from 'lucide-react'
 import {
@@ -56,7 +57,7 @@ export default function History() {
       const refunded = await getRefundedFiscalIds(list.map((r) => r.id))
       setRefundedIds(refunded)
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(formatErrorForUser(e))
     } finally {
       setLoading(false)
     }

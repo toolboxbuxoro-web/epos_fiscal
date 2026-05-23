@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { formatErrorForUser } from '@/lib/error-message'
 import { getAllSettings, setSetting, setSettings, SettingKey } from '@/lib/db'
 import {
   makeBasicCredentials,
@@ -355,7 +356,7 @@ export default function Settings() {
       })
       setSaved(true)
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(formatErrorForUser(e))
     } finally {
       setBusy(false)
     }

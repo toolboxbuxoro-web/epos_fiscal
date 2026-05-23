@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { formatErrorForUser } from '@/lib/error-message'
 import {
   clearLogs,
   listLogs,
@@ -48,7 +49,7 @@ export default function Logs() {
       setRows(r)
       setError(null)
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(formatErrorForUser(e))
     }
   }
 

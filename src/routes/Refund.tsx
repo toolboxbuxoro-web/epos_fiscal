@@ -19,6 +19,7 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { formatErrorForUser } from '@/lib/error-message'
 import { useNavigate, useParams } from 'react-router-dom'
 import { AlertCircle, ArrowLeft, Undo2 } from 'lucide-react'
 import {
@@ -155,7 +156,7 @@ export default function Refund() {
       setRefundCashStr(def.cash > 0 ? Math.round(def.cash / 100).toString() : '')
       setRefundCardStr(def.card > 0 ? Math.round(def.card / 100).toString() : '')
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(formatErrorForUser(e))
     } finally {
       setBusy(false)
     }
@@ -200,8 +201,8 @@ export default function Refund() {
       } catch (checkErr) {
         setError(
           'Не удалось проверить существующий возврат: ' +
-            (checkErr instanceof Error ? checkErr.message : String(checkErr)) +
-            '. Попробуйте ещё раз.',
+            formatErrorForUser(checkErr) +
+            ' Попробуйте ещё раз.',
         )
         return
       }
@@ -230,7 +231,7 @@ export default function Refund() {
         toast.error(e.message, { duration: 5000 })
         return
       }
-      setError(e instanceof Error ? e.message : String(e))
+      setError(formatErrorForUser(e))
     } finally {
       setSubmitting(false)
       submitLockRef.current = false

@@ -48,6 +48,7 @@ import {
   type MsRetailDemand,
 } from '@/lib/moysklad'
 import { log } from '@/lib/log'
+import { formatErrorForUser } from '@/lib/error-message'
 import {
   Badge,
   Button,
@@ -399,7 +400,7 @@ export default function Receipt() {
       const test = (await getSetting(SettingKey.TestMode)) === 'true'
       setTestMode(test)
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(formatErrorForUser(e))
     } finally {
       setBusy(false)
     }
@@ -428,7 +429,7 @@ export default function Receipt() {
       })
       nav('/history')
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(formatErrorForUser(e))
     } finally {
       setFiscalizing(false)
     }
@@ -532,7 +533,7 @@ export default function Receipt() {
         toast.error(e.message, { duration: 6000 })
         return
       }
-      setError(e instanceof Error ? e.message : String(e))
+      setError(formatErrorForUser(e))
       await setMsReceiptStatus(receipt.id, 'failed').catch(() => undefined)
     } finally {
       setFiscalizing(false)

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import { formatErrorForUser } from '@/lib/error-message'
 import { useNavigate } from 'react-router-dom'
 import {
   ArrowRight,
@@ -145,7 +146,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     void ensurePollerStarted().catch((e) => {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(formatErrorForUser(e))
     })
     const unsub = subscribePollerStatus(setPollerStatus)
     return () => {
@@ -194,7 +195,7 @@ export default function Dashboard() {
       }
       setError(null)
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(formatErrorForUser(e))
     } finally {
       setLoading(false)
     }

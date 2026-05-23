@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { formatErrorForUser } from '@/lib/error-message'
 import {
   countEsfItems,
   getSetting,
@@ -74,7 +75,7 @@ export default function Catalog() {
         vat: parseNum(vatS, 12),
       })
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      setError(formatErrorForUser(e))
     } finally {
       setLoading(false)
     }
