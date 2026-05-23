@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import {
   AlertCircle,
@@ -90,6 +90,17 @@ export default function Receipt() {
     useState<FiscalReceiptRow | null>(null)
   /** Communicator сказал «смена не открыта» — баннер с кнопкой в /zreport. */
   const [shiftNotOpen, setShiftNotOpen] = useState(false)
+  /**
+   * Счётчик подряд-stale-ошибок сервера. 1-я → тихий sync+rebuild;
+   * 2-я+ → показываем persistent карточку с подсказкой «Собрать вручную»,
+   * потому что авто-подбор зацикливается на распроданных товарах
+   * (сервер возвращает inv_items_check каждый раз → мы синкаем →
+   * matcher снова берёт те же товары → снова inv_items_check).
+   * Без этого кассир жал бы «Фискализировать» и видел один и тот же
+   * тост бесконечно. Используем ref чтобы не пересоздавать обработчик.
+   */
+  const staleErrorCountRef = useRef(0)
+  const [staleErrorPersistent, setStaleErrorPersistent] = useState(false)
   /**
    * server_item_id'ы которые сервер отказал на reserve (другой магазин
    * успел забрать). При rematch matcher их игнорирует — иначе сразу
@@ -527,9 +538,22 @@ export default function Receipt() {
         return
       }
       // Сервер вернул Postgres-инвариант inv_items_check — кэш справочника
-      // разъехался с реальностью. Делаем форс-синк + перематч (не failed —
-      // чек валиден, просто данные нужно освежить).
+      // разъехался с реальностью. Первый раз — тихий forceFull sync + rebuild
+      // (как было). Если ошибка повторяется (2+ раза подряд) — авто-подбор
+      // зацикливается (matcher → тот же sold-out товар → inv_items_check).
+      // Показываем persistent карточку с подсказкой «Собрать вручную»
+      // (модалка грузит свежий pool, кассир выбирает реально доступное).
       if (e instanceof InventoryStaleError) {
+        staleErrorCountRef.current += 1
+        if (staleErrorCountRef.current >= 2) {
+          setStaleErrorPersistent(true)
+          toast.error(
+            'Авто-подбор зацикливается. Откройте «Собрать вручную» — ' +
+              'там свежие остатки.',
+            { duration: 8000 },
+          )
+          return
+        }
         toast.error('Остатки изменились, обновляю справочник…', {
           duration: 4000,
         })
@@ -695,6 +719,53 @@ export default function Receipt() {
                   onClick={() => nav('/zreport')}
                 >
                   Перейти в Смену
+                </Button>
+              </div>
+            </div>
+          </Card.Body>
+        </Card>
+      )}
+
+      {/* Persistent-карточка когда InventoryStaleError повторяется подряд —
+          авто-подбор зацикливается на распроданных товарах, единственный
+          выход — ручная сборка где модалка грузит свежий снимок пула. */}
+      {staleErrorPersistent && (
+        <Card className="border-danger/30 bg-danger-soft">
+          <Card.Body className="flex items-start gap-3">
+            <AlertCircle size={18} className="text-danger shrink-0 mt-0.5" />
+            <div className="flex-1">
+              <div className="text-body font-medium text-danger">
+                Авто-подбор зацикливается
+              </div>
+              <div className="mt-1 text-caption text-ink">
+                Сервер уже несколько раз отказал в резерве — matcher
+                выбирает товары, которые на сервере уже распроданы (кэш
+                разъехался). Авто-обновление не помогает. Используйте{' '}
+                <strong>«Собрать вручную»</strong>: модалка покажет реально
+                доступные остатки, кассир выберет сам или нажмёт «Дособрать
+                оставшееся».
+              </div>
+              <div className="mt-2 flex gap-2">
+                <Button
+                  variant="primary"
+                  size="sm"
+                  onClick={() => {
+                    setManualModalOpen(true)
+                    setStaleErrorPersistent(false)
+                    staleErrorCountRef.current = 0
+                  }}
+                >
+                  Открыть «Собрать вручную»
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setStaleErrorPersistent(false)
+                    staleErrorCountRef.current = 0
+                  }}
+                >
+                  Закрыть
                 </Button>
               </div>
             </div>
