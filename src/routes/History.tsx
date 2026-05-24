@@ -10,7 +10,7 @@ import {
   SettingKey,
   type FiscalReceiptRow,
 } from '@/lib/db'
-import { formatDateTime } from '@/lib/format'
+import { formatDateTime, tiyinToSumDisplay } from '@/lib/format'
 import {
   formatPrintDate,
   formatQtyForPrint,
@@ -22,6 +22,50 @@ import { Button } from '@/components/ui/Button'
 
 /** Сколько чеков на одной странице Истории. */
 const PAGE_SIZE = 50
+
+/**
+ * Распарсить оплату из `fiscal_receipts.request_json` (это то что мы
+ * отправили в Communicator). Поля payload в JSON-RPC у EPOS:
+ *   Receipt.ReceivedCash — тийины наличными
+ *   Receipt.ReceivedCard — тийины картой/QR (мы их складываем при отправке)
+ *
+ * Возвращаем структуру для UI:
+ *   - cashTiyin, cardTiyin
+ *   - total = cash + card
+ *   - kind: 'cash' | 'card' | 'mixed' (по тому что > 0)
+ *
+ * Если JSON битый — возвращаем null, UI покажет прочерк. Это нормальный
+ * сценарий для очень старых чеков, до миграции на JSON-RPC.
+ */
+function parsePayment(requestJson: string): {
+  cashTiyin: number
+  cardTiyin: number
+  total: number
+  kind: 'cash' | 'card' | 'mixed'
+} | null {
+  try {
+    const req = JSON.parse(requestJson) as {
+      params?: {
+        Receipt?: {
+          ReceivedCash?: number
+          ReceivedCard?: number
+        }
+      }
+    }
+    const r = req?.params?.Receipt
+    if (!r) return null
+    const cash = Math.max(0, r.ReceivedCash ?? 0)
+    const card = Math.max(0, r.ReceivedCard ?? 0)
+    if (cash === 0 && card === 0) return null
+    let kind: 'cash' | 'card' | 'mixed'
+    if (cash > 0 && card > 0) kind = 'mixed'
+    else if (card > 0) kind = 'card'
+    else kind = 'cash'
+    return { cashTiyin: cash, cardTiyin: card, total: cash + card, kind }
+  } catch {
+    return null
+  }
+}
 
 export default function History() {
   const nav = useNavigate()
@@ -142,6 +186,8 @@ export default function History() {
               <Th>Терминал</Th>
               <Th>№ чека</Th>
               <Th>Фискальный признак</Th>
+              <Th>Сумма</Th>
+              <Th>Оплата</Th>
               <Th>QR</Th>
               <Th>Печать</Th>
               <Th>Возврат</Th>
@@ -150,25 +196,58 @@ export default function History() {
           <tbody className="divide-y divide-border">
             {loading && rows.length === 0 ? (
               <tr>
-                <td className="px-3 py-8 text-center text-sm text-ink-muted" colSpan={7}>
+                <td className="px-3 py-8 text-center text-sm text-ink-muted" colSpan={9}>
                   Загрузка…
                 </td>
               </tr>
             ) : rows.length === 0 ? (
               <tr>
-                <td className="px-3 py-8 text-center text-sm text-ink-muted" colSpan={7}>
+                <td className="px-3 py-8 text-center text-sm text-ink-muted" colSpan={9}>
                   Пока нет ни одного фискализированного чека.
                 </td>
               </tr>
             ) : (
               rows.map((r) => {
                 const isRefunded = refundedIds.has(r.id)
+                // Парсим request_json чтобы показать сумму и способ оплаты.
+                // request_json — это payload который мы слали в EPOS (там
+                // ReceivedCash + ReceivedCard). Сумма получается их склейкой.
+                const pay = parsePayment(r.request_json)
                 return (
                 <tr key={r.id} className="hover:bg-canvas">
                   <Td>{formatDateTime(parseFiscalDateTime(r.fiscal_datetime) || r.fiscalized_at)}</Td>
                   <Td className="font-mono text-xs">{r.terminal_id}</Td>
                   <Td className="font-mono text-xs">{r.receipt_seq}</Td>
                   <Td className="font-mono text-xs">{r.fiscal_sign}</Td>
+                  <Td className="text-right font-mono">
+                    {pay ? (
+                      <span>{tiyinToSumDisplay(pay.total)} сум</span>
+                    ) : (
+                      <span className="text-ink-subtle">—</span>
+                    )}
+                  </Td>
+                  <Td>
+                    {pay ? (
+                      pay.kind === 'mixed' ? (
+                        // Смешанная — детализируем: «Нал 200к + Карта 100к».
+                        // Кассиру важно видеть как разделено (особенно когда
+                        // часть была Click/Payme).
+                        <div className="text-xs text-warning">
+                          Смешанная
+                          <div className="text-ink-muted">
+                            нал {tiyinToSumDisplay(pay.cashTiyin)} +{' '}
+                            карта {tiyinToSumDisplay(pay.cardTiyin)}
+                          </div>
+                        </div>
+                      ) : pay.kind === 'card' ? (
+                        <span className="text-ink-muted">Карта</span>
+                      ) : (
+                        <span className="text-ink-muted">Наличные</span>
+                      )
+                    ) : (
+                      <span className="text-ink-subtle">—</span>
+                    )}
+                  </Td>
                   <Td>
                     <a
                       href={r.qr_code_url}
