@@ -41,8 +41,14 @@ import { listUnsentLogsForServer, markLogsSentToServer } from '@/lib/log'
 const FLUSH_INTERVAL_MS = 30_000
 /** Сколько строк за один POST. */
 const BATCH_SIZE = 50
-/** Текущая версия приложения для трассировки на сервере. */
-const APP_VERSION = '0.10.30'
+/**
+ * Текущая версия приложения для трассировки на сервере.
+ *
+ * ⚠️ Должна совпадать с `package.json::version` и
+ * `src-tauri/tauri.conf.json::version`. Все 3 места обновляются при
+ * каждом релизе вручную (package.json не импортируется в браузерный bundle).
+ */
+const APP_VERSION = '0.11.0'
 
 let started = false
 let timer: ReturnType<typeof setInterval> | null = null
