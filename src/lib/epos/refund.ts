@@ -468,7 +468,7 @@ export async function processRefund(opts: ProcessRefundOptions): Promise<Process
 // ── Helpers ────────────────────────────────────────────────────────
 
 /** Формат тийинов как «1 670 000 сум» — для error message'ов. */
-function tiyinFmt(t: number): string {
+export function tiyinFmt(t: number): string {
   return `${(t / 100).toLocaleString('ru-RU')} сум`
 }
 
@@ -477,7 +477,7 @@ function tiyinFmt(t: number): string {
  * Используется processRefund при следующих partial refund'ах для расчёта
  * cumulative qty и проверки over-refund.
  */
-interface RefundSnapshotEntry {
+export interface RefundSnapshotEntry {
   originalItemIndex: number
   qtyMilli: number
   refundTiyin: number
@@ -487,7 +487,7 @@ interface RefundSnapshotEntry {
  * Полный refund: возвращаем ВСЕ позиции оригинала «как есть».
  * Items идентичны тому что было отправлено при sale, ОФД сверяет 1-к-1.
  */
-function buildFullRefundItems(originalItems: JsonRpcItem[]): {
+export function buildFullRefundItems(originalItems: JsonRpcItem[]): {
   refundItems: JsonRpcItem[]
   snapshotEntries: RefundSnapshotEntry[]
   refundItemsTotal: number
@@ -514,7 +514,7 @@ function buildFullRefundItems(originalItems: JsonRpcItem[]): {
  * Получаемые items идут в EPOS как refund Items[]. Сумма по items =
  * Σ(Price - Discount) за все выбранные позиции с пересчитанным qty.
  */
-function buildPartialRefundItems(
+export function buildPartialRefundItems(
   originalItems: JsonRpcItem[],
   selected: PartialRefundItem[],
   alreadyRefunded: Map<number, number>,
@@ -523,23 +523,37 @@ function buildPartialRefundItems(
   snapshotEntries: RefundSnapshotEntry[]
   refundItemsTotal: number
 } {
+  // ШАГ 1: суммируем qty по originalItemIndex (если кассир дважды передал
+  // один index — складываем). Защита от over-refund через дубликаты.
+  const aggregatedByIndex = new Map<number, number>()
+  for (const sel of selected) {
+    if (sel.qtyMilli <= 0) continue
+    aggregatedByIndex.set(
+      sel.originalItemIndex,
+      (aggregatedByIndex.get(sel.originalItemIndex) ?? 0) + sel.qtyMilli,
+    )
+  }
+
   const refundItems: JsonRpcItem[] = []
   const snapshotEntries: RefundSnapshotEntry[] = []
   let refundItemsTotal = 0
 
-  for (const sel of selected) {
-    const orig = originalItems[sel.originalItemIndex]
+  // ШАГ 2: проверяем и строим. Идём по aggregated map отсортированную по
+  // index чтобы порядок refund Items[] был детерминированным (тесты).
+  const sortedIndices = [...aggregatedByIndex.keys()].sort((a, b) => a - b)
+  for (const originalItemIndex of sortedIndices) {
+    const qtyMilli = aggregatedByIndex.get(originalItemIndex)!
+    const orig = originalItems[originalItemIndex]
     if (!orig) {
       throw new Error(
-        `Позиция #${sel.originalItemIndex + 1} не найдена в оригинальном чеке.`,
+        `Позиция #${originalItemIndex + 1} не найдена в оригинальном чеке.`,
       )
     }
-    if (sel.qtyMilli <= 0) continue // skip пустые
     const origAmount = orig.Amount
-    const alreadyForThis = alreadyRefunded.get(sel.originalItemIndex) ?? 0
+    const alreadyForThis = alreadyRefunded.get(originalItemIndex) ?? 0
     const remainingForThis = origAmount - alreadyForThis
-    if (sel.qtyMilli > remainingForThis) {
-      const qtyShtuk = (sel.qtyMilli / 1000).toFixed(3).replace(/\.?0+$/, '')
+    if (qtyMilli > remainingForThis) {
+      const qtyShtuk = (qtyMilli / 1000).toFixed(3).replace(/\.?0+$/, '')
       const remShtuk = (remainingForThis / 1000).toFixed(3).replace(/\.?0+$/, '')
       throw new Error(
         `«${orig.Name}» — пытаетесь вернуть ${qtyShtuk} шт, ` +
@@ -548,14 +562,14 @@ function buildPartialRefundItems(
     }
 
     // Пропорциональный пересчёт Price/Discount/VAT для нового qty.
-    const ratio = sel.qtyMilli / origAmount
+    const ratio = qtyMilli / origAmount
     const newPrice = Math.round(orig.Price * ratio)
     const newDiscount = Math.round((orig.Discount ?? 0) * ratio)
     const newVat = Math.round((orig.VAT ?? 0) * ratio)
 
     refundItems.push({
       ...orig,
-      Amount: sel.qtyMilli,
+      Amount: qtyMilli,
       Price: newPrice,
       Discount: newDiscount,
       VAT: newVat,
@@ -563,8 +577,8 @@ function buildPartialRefundItems(
     const itemRefund = newPrice - newDiscount
     refundItemsTotal += itemRefund
     snapshotEntries.push({
-      originalItemIndex: sel.originalItemIndex,
-      qtyMilli: sel.qtyMilli,
+      originalItemIndex,
+      qtyMilli,
       refundTiyin: itemRefund,
     })
   }
