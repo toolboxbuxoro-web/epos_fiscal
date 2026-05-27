@@ -158,7 +158,13 @@ function isService(pos: MsRetailDemandPosition): boolean {
 }
 
 /** Извлечь все нормализованные позиции из retaildemand.
- * Услуги (service) полностью отфильтровываются — они не товар и не идут в чек.
+ *
+ * Фильтруются:
+ *   - Услуги (service) — `assortment.meta.type === 'service'`. Они не товар.
+ *   - Позиции с нулевой суммой (`totalTiyin <= 0`) — это акция/подарок/
+ *     бесплатный образец (price=0 в МС, или 100% скидка). ОФД не принимает
+ *     товар на 0 сум, фискально это шум. Кассир их не выбирает и matcher
+ *     не должен пытаться подобрать.
  *
  * @param linkCharacteristicName имя характеристики модификации МС с бух-именем
  *   (для стратегии `linked-ms`). Передаётся из настроек магазина.
@@ -172,4 +178,5 @@ export function extractPositions(
   return positions
     .filter((p) => !isService(p))
     .map((p, i) => normalizePosition(p, i, linkCharacteristicName))
+    .filter((p) => p.totalTiyin > 0)
 }
