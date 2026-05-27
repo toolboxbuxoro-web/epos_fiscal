@@ -77,6 +77,12 @@ pub fn run() {
             sql: include_str!("../migrations/012_zero_sum_not_required.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 13,
+            description: "partial_refunds",
+            sql: include_str!("../migrations/013_partial_refunds.sql"),
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()

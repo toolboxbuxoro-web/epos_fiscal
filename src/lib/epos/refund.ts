@@ -34,6 +34,7 @@ import {
   getRefundByOriginalFiscalId,
   getSetting,
   insertFiscalRefund,
+  listRefundsByOriginalFiscalId,
   now,
   SettingKey,
   type FiscalReceiptRow,
@@ -62,6 +63,22 @@ import {
 } from './jsonrpc-client'
 import type { FiscalReceiptInfo } from './types'
 
+/**
+ * Одна позиция для частичного возврата: какой item оригинала и сколько штук.
+ *
+ * `originalItemIndex` — индекс в `originalReceipt.Items[]` (0-based). Использу-
+ * ется потому что один и тот же товар может встречаться несколько раз
+ * в чеке (например клиент купил 2 насадки одной строкой и 3 другой).
+ *
+ * `qtyMilli` — сколько штук вернуть, в миллидолях (1000 = 1 шт). Можно
+ * вернуть дробное (например 0.5 кг из 1 кг → 500). qtyMilli ≤ оригинальный
+ * Amount, иначе ошибка «over-refund».
+ */
+export interface PartialRefundItem {
+  originalItemIndex: number
+  qtyMilli: number
+}
+
 /** Входные параметры для refund (от UI). */
 export interface ProcessRefundOptions {
   /** Оригинальный продажный чек (fiscal_receipts.id). */
@@ -72,6 +89,18 @@ export interface ProcessRefundOptions {
   refundQrTiyin?: number
   /** Свободный текст: причина возврата (для аудита). */
   reason?: string
+  /**
+   * Список позиций для частичного возврата. Если не указан или пустой массив —
+   * возвращаем ВСЕ позиции (full refund). Если есть хоть одна — partial mode.
+   *
+   * При partial:
+   *   - Items[] в refund payload содержит ТОЛЬКО выбранные позиции
+   *   - Их Amount = qtyMilli (может быть меньше оригинала)
+   *   - Price/VAT пересчитываются пропорционально (Amount_new / Amount_orig)
+   *   - is_partial=1 + refunded_items_snapshot в БД
+   *   - Кнопка «Возврат» в History остаётся активной (можно вернуть остаток)
+   */
+  selectedItems?: PartialRefundItem[]
 }
 
 export interface ProcessRefundResult {
@@ -92,27 +121,117 @@ export class RefundAlreadyExistsError extends Error {
 
 /**
  * Главная функция возврата чека.
+ *
+ * Поддерживает два режима:
+ *   1. **Full refund** — `selectedItems` пуст или undefined. Возвращаем ВСЕ
+ *      позиции оригинала, ставим is_partial=0. Кнопка «Возврат» в History
+ *      становится disabled.
+ *   2. **Partial refund** — `selectedItems = [{originalItemIndex, qtyMilli}]`.
+ *      Возвращаем ТОЛЬКО эти позиции с выбранными qty. is_partial=1.
+ *      Можно делать повторно (но не больше original qty в сумме).
  */
 export async function processRefund(opts: ProcessRefundOptions): Promise<ProcessRefundResult> {
-  // 1. Проверка: ещё не возвращали?
-  const existing = await getRefundByOriginalFiscalId(opts.originalFiscalId)
-  if (existing) {
-    throw new RefundAlreadyExistsError(existing)
+  // 1. Грузим оригинал и предыдущие refund'ы (для проверки over-refund).
+  const original = await loadOriginal(opts.originalFiscalId)
+  const previousRefunds = await listRefundsByOriginalFiscalId(opts.originalFiscalId)
+
+  // Если уже был full refund — повторный refund запрещён.
+  const fullExisting = previousRefunds.find((r) => r.is_partial === 0)
+  if (fullExisting) {
+    throw new RefundAlreadyExistsError(fullExisting)
   }
 
-  // 2. Грузим оригинал.
-  const original = await loadOriginal(opts.originalFiscalId)
-
-  // 3. Определяем суммы возврата (по каналам оплаты).
-  // По дефолту = как было оплачено. UI может переопределить.
+  // 2. Парсим оригинальный чек.
   const originalReceipt = parseRequest(original.fr.request_json)
-  const refundCash = opts.refundCashTiyin ?? originalReceipt.ReceivedCash
-  const refundCard = opts.refundCardTiyin ?? originalReceipt.ReceivedCard
-  const refundQr = opts.refundQrTiyin ?? 0 // в JsonRpcReceipt нет отдельного QR
+
+  // 3. Определяем режим: full или partial.
+  const isPartial = !!(opts.selectedItems && opts.selectedItems.length > 0)
+
+  // 4. Считаем какие qty уже были возвращены (для каждого originalItemIndex).
+  // Используется и для проверки over-refund в partial-режиме, и для блокировки
+  // full-refund если есть partial'ы (часть уже вернули).
+  const alreadyRefundedByIndex = new Map<number, number>()
+  for (const r of previousRefunds) {
+    if (!r.refunded_items_snapshot) continue
+    try {
+      const snap = JSON.parse(r.refunded_items_snapshot) as Array<{
+        originalItemIndex: number
+        qtyMilli: number
+      }>
+      for (const s of snap) {
+        alreadyRefundedByIndex.set(
+          s.originalItemIndex,
+          (alreadyRefundedByIndex.get(s.originalItemIndex) ?? 0) + s.qtyMilli,
+        )
+      }
+    } catch {
+      // битый snapshot — пропускаем, пусть refund разрешится
+    }
+  }
+
+  // 5. В full-режиме НЕЛЬЗЯ если уже был partial — иначе двойной refund на
+  // ту же часть. Кассир должен через partial довозвращать остаток.
+  if (!isPartial && previousRefunds.length > 0) {
+    throw new Error(
+      `На этот чек уже был частичный возврат (${previousRefunds.length} шт). ` +
+        `Полный возврат невозможен — оформите частичный на остаток через ` +
+        `«Частичный возврат» с qty оставшегося.`,
+    )
+  }
+
+  // 6. Билдим refund Items[] (либо все, либо selected).
+  const { refundItems, snapshotEntries, refundItemsTotal } = isPartial
+    ? buildPartialRefundItems(originalReceipt.Items, opts.selectedItems!, alreadyRefundedByIndex)
+    : buildFullRefundItems(originalReceipt.Items)
+
+  // 7. Определяем суммы возврата по каналам оплаты.
+  // - При full: по дефолту = как было оплачено (cash/card 1:1 с оригиналом).
+  // - При partial: пропорционально refundItemsTotal / originalTotal.
+  //   Если кассир явно передал refundCashTiyin/CardTiyin — используем их (override).
+  let refundCash: number
+  let refundCard: number
+  let refundQr: number
+  if (opts.refundCashTiyin !== undefined || opts.refundCardTiyin !== undefined) {
+    // Явный override от UI.
+    refundCash = opts.refundCashTiyin ?? 0
+    refundCard = opts.refundCardTiyin ?? 0
+    refundQr = opts.refundQrTiyin ?? 0
+  } else if (isPartial) {
+    // Пропорциональный split: refundCash = origCash * (refundTotal / origTotal).
+    const origTotal = originalReceipt.ReceivedCash + originalReceipt.ReceivedCard
+    if (origTotal <= 0) {
+      refundCash = refundItemsTotal
+      refundCard = 0
+      refundQr = 0
+    } else {
+      const ratio = refundItemsTotal / origTotal
+      refundCash = Math.round(originalReceipt.ReceivedCash * ratio)
+      // Корректировка чтобы cash + card = refundItemsTotal ровно (избегаем
+      // off-by-1 из округления).
+      refundCard = refundItemsTotal - refundCash
+      refundQr = 0
+    }
+  } else {
+    // Full refund без override — берём суммы оригинала как есть.
+    refundCash = originalReceipt.ReceivedCash
+    refundCard = originalReceipt.ReceivedCard
+    refundQr = 0
+  }
 
   const refundTotal = refundCash + refundCard + refundQr
   if (refundTotal <= 0) {
     throw new Error('Сумма возврата = 0. Укажите какую сумму и каким способом возвращаем.')
+  }
+
+  // 8. Sanity-check: refundTotal должен совпадать с items total ± 100 сум
+  // (EPOS tolerance 10000 тийинов). Иначе Communicator вернёт "math error".
+  const itemsVsAmountDiff = Math.abs(refundTotal - refundItemsTotal)
+  if (itemsVsAmountDiff > 10000) {
+    throw new Error(
+      `Сумма возврата ${tiyinFmt(refundTotal)} не совпадает с суммой позиций ` +
+        `${tiyinFmt(refundItemsTotal)} (разница ${tiyinFmt(itemsVsAmountDiff)} > 100 сум). ` +
+        `Скорректируйте Наличные/Карту чтобы итог равнялся сумме выбранных товаров.`,
+    )
   }
 
   // 4. Тестовый режим — skip Communicator + /unconsume.
@@ -138,6 +257,8 @@ export async function processRefund(opts: ProcessRefundOptions): Promise<Process
       refundCash,
       refundCard,
       true,
+      refundItems,
+      isPartial,
     )
     return { fiscal: fakeFiscal, refundDbId: 0 }
   }
@@ -167,9 +288,9 @@ export async function processRefund(opts: ProcessRefundOptions): Promise<Process
   // т.к. в интерфейсе нет lowercase-ключа (он намеренный alias на проводе).
   const refundReceipt = {
     Time: formatGoTime(new Date()),
-    // Items копируем как есть — те же ИКПУ, цены, скидки, НДС.
-    // Это критично: ОФД сверяет с оригиналом, items должны быть идентичны.
-    Items: originalReceipt.Items,
+    // Items — либо все из оригинала (full refund), либо выбранные с
+    // пересчитанным Amount/Price/VAT (partial refund). Построены в шаге 6.
+    Items: refundItems,
     ReceivedCash: refundCash,
     ReceivedCard: refundCard,
     RefundInfo: refundInfo, // PascalCase (на всякий)
@@ -247,7 +368,10 @@ export async function processRefund(opts: ProcessRefundOptions): Promise<Process
     qr_code_url: fiscal.QRCodeURL,
     fiscal_datetime: fiscal.DateTime,
     applet_version: fiscal.AppletVersion ?? null,
-    items_json: JSON.stringify(originalReceipt.Items),
+    // items_json — что РЕАЛЬНО ушло в ОФД (для full = все из оригинала,
+    // для partial = только выбранные). Используется для печати refund-чека
+    // (там показываются именно возвращаемые товары).
+    items_json: JSON.stringify(refundItems),
     refund_cash_tiyin: refundCash,
     refund_card_tiyin: refundCard,
     refund_qr_tiyin: refundQr,
@@ -255,6 +379,8 @@ export async function processRefund(opts: ProcessRefundOptions): Promise<Process
     response_json: JSON.stringify(fiscal),
     reason: opts.reason ?? null,
     cashier_name: cashier,
+    is_partial: isPartial ? 1 : 0,
+    refunded_items_snapshot: isPartial ? JSON.stringify(snapshotEntries) : null,
   }
   let refundDbId: number | null = null
   let lastInsertErr: unknown = null
@@ -307,7 +433,22 @@ export async function processRefund(opts: ProcessRefundOptions): Promise<Process
   }
 
   // 7. Возврат остатков на сервер (best-effort).
-  await tryUnconsume(original, refundDbId, fiscal.FiscalSign)
+  //
+  // Для **полного** refund — возвращаем все match_items на сервер.
+  // Для **частичного** — пропорциональный unconsume по ratio. Это
+  // математически приблизительно (matcher может собрать 1 EPOS-item из
+  // нескольких esf_items), но в типичных случаях корректно.
+  //
+  // Если совсем нет уверенности (refund < 1% или большой sparse-чек)
+  // — кладовщик скорректирует через bulkImport или admin UI.
+  if (isPartial) {
+    const origTotal =
+      originalReceipt.ReceivedCash + originalReceipt.ReceivedCard
+    const ratio = origTotal > 0 ? refundItemsTotal / origTotal : 0
+    await tryUnconsumeProportional(original, refundDbId, fiscal.FiscalSign, ratio)
+  } else {
+    await tryUnconsume(original, refundDbId, fiscal.FiscalSign)
+  }
 
   // 8. Печать на термопринтер.
   await maybePrintRefundReceipt(
@@ -317,12 +458,123 @@ export async function processRefund(opts: ProcessRefundOptions): Promise<Process
     refundCash,
     refundCard,
     false,
+    refundItems,
+    isPartial,
   )
 
   return { fiscal, refundDbId }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
+
+/** Формат тийинов как «1 670 000 сум» — для error message'ов. */
+function tiyinFmt(t: number): string {
+  return `${(t / 100).toLocaleString('ru-RU')} сум`
+}
+
+/**
+ * Snapshot одной возвращённой позиции — пишется в `refunded_items_snapshot`.
+ * Используется processRefund при следующих partial refund'ах для расчёта
+ * cumulative qty и проверки over-refund.
+ */
+interface RefundSnapshotEntry {
+  originalItemIndex: number
+  qtyMilli: number
+  refundTiyin: number
+}
+
+/**
+ * Полный refund: возвращаем ВСЕ позиции оригинала «как есть».
+ * Items идентичны тому что было отправлено при sale, ОФД сверяет 1-к-1.
+ */
+function buildFullRefundItems(originalItems: JsonRpcItem[]): {
+  refundItems: JsonRpcItem[]
+  snapshotEntries: RefundSnapshotEntry[]
+  refundItemsTotal: number
+} {
+  const refundItems = [...originalItems]
+  const refundItemsTotal = refundItems.reduce(
+    (s, it) => s + (it.Price - (it.Discount ?? 0)),
+    0,
+  )
+  // snapshot для full не нужен (refunded_items_snapshot будет null), но
+  // вернём пустой массив для единообразия типа.
+  return { refundItems, snapshotEntries: [], refundItemsTotal }
+}
+
+/**
+ * Частичный refund: пересчитываем Items[] так чтобы Amount был = выбранному
+ * qtyMilli, Price/VAT — пропорционально (qtyMilli / originalAmount).
+ *
+ * Проверки:
+ *   - originalItemIndex существует в оригинале
+ *   - qtyMilli > 0 и ≤ (originalAmount − alreadyRefunded[index])
+ *   - Если over-refund → throw с понятным сообщением для UI
+ *
+ * Получаемые items идут в EPOS как refund Items[]. Сумма по items =
+ * Σ(Price - Discount) за все выбранные позиции с пересчитанным qty.
+ */
+function buildPartialRefundItems(
+  originalItems: JsonRpcItem[],
+  selected: PartialRefundItem[],
+  alreadyRefunded: Map<number, number>,
+): {
+  refundItems: JsonRpcItem[]
+  snapshotEntries: RefundSnapshotEntry[]
+  refundItemsTotal: number
+} {
+  const refundItems: JsonRpcItem[] = []
+  const snapshotEntries: RefundSnapshotEntry[] = []
+  let refundItemsTotal = 0
+
+  for (const sel of selected) {
+    const orig = originalItems[sel.originalItemIndex]
+    if (!orig) {
+      throw new Error(
+        `Позиция #${sel.originalItemIndex + 1} не найдена в оригинальном чеке.`,
+      )
+    }
+    if (sel.qtyMilli <= 0) continue // skip пустые
+    const origAmount = orig.Amount
+    const alreadyForThis = alreadyRefunded.get(sel.originalItemIndex) ?? 0
+    const remainingForThis = origAmount - alreadyForThis
+    if (sel.qtyMilli > remainingForThis) {
+      const qtyShtuk = (sel.qtyMilli / 1000).toFixed(3).replace(/\.?0+$/, '')
+      const remShtuk = (remainingForThis / 1000).toFixed(3).replace(/\.?0+$/, '')
+      throw new Error(
+        `«${orig.Name}» — пытаетесь вернуть ${qtyShtuk} шт, ` +
+          `но осталось доступно для возврата ${remShtuk} шт. Уменьшите qty.`,
+      )
+    }
+
+    // Пропорциональный пересчёт Price/Discount/VAT для нового qty.
+    const ratio = sel.qtyMilli / origAmount
+    const newPrice = Math.round(orig.Price * ratio)
+    const newDiscount = Math.round((orig.Discount ?? 0) * ratio)
+    const newVat = Math.round((orig.VAT ?? 0) * ratio)
+
+    refundItems.push({
+      ...orig,
+      Amount: sel.qtyMilli,
+      Price: newPrice,
+      Discount: newDiscount,
+      VAT: newVat,
+    })
+    const itemRefund = newPrice - newDiscount
+    refundItemsTotal += itemRefund
+    snapshotEntries.push({
+      originalItemIndex: sel.originalItemIndex,
+      qtyMilli: sel.qtyMilli,
+      refundTiyin: itemRefund,
+    })
+  }
+
+  if (refundItems.length === 0) {
+    throw new Error('Не выбрано ни одной позиции для возврата.')
+  }
+  return { refundItems, snapshotEntries, refundItemsTotal }
+}
+
 
 /**
  * Нормализовать дату оригинала к строгому 14-значному YYYYMMDDHHMMSS
@@ -414,6 +666,73 @@ function parseRequest(requestJson: string): JsonRpcReceipt {
       `Не удалось распарсить request_json оригинала: ${e instanceof Error ? e.message : String(e)}`,
     )
   }
+}
+
+/**
+ * Пропорциональный unconsume для **частичного** refund.
+ *
+ * Math: ratio = refund_total / original_total. Для каждого match_item
+ * возвращаем `round(match_qty * ratio)` штук обратно в server pool.
+ *
+ * ⚠️ Это **приблизительная** оценка — matcher мог собрать один EPOS-item
+ * из нескольких esf_items с разной ценой. Точное соответствие originalItem
+ * → match_items потребовало бы доп. поля в match_items (Phase 3).
+ *
+ * Для типичных кейсов (1 EPOS-item = 1 esf_item) — корректно. Для
+ * holistic-чеков с переподбором — погрешность в пределах N×ratio штук.
+ * Кладовщик при инвентаризации увидит расхождение и скорректирует.
+ */
+async function tryUnconsumeProportional(
+  original: OriginalContext,
+  refundDbId: number,
+  refundFiscalSign: string,
+  ratio: number,
+): Promise<void> {
+  if (ratio <= 0) {
+    await log.info(
+      'refund',
+      `partial unconsume пропущен (ratio=${ratio.toFixed(4)} <= 0)`,
+    )
+    return
+  }
+  if (original.matchItems.length === 0) {
+    await log.info('refund', 'partial unconsume: match_items пуст')
+    return
+  }
+  const scaledItems = original.matchItems
+    .filter((mi) => mi.server_item_id != null)
+    .map((mi) => ({
+      inv_item_id: mi.server_item_id!,
+      // Округляем до целого qty (1000 = 1 шт). Если < 1000 → 0, не отправляем.
+      quantity: Math.round(mi.quantity * ratio),
+    }))
+    .filter((it) => it.quantity > 0)
+  if (scaledItems.length === 0) {
+    await log.info(
+      'refund',
+      `partial unconsume: после округления все qty стали 0 (ratio=${ratio.toFixed(4)})`,
+    )
+    return
+  }
+
+  // Логируем подробно для аудита (кладовщик может проверить).
+  await log.info(
+    'refund',
+    `partial unconsume: ratio=${ratio.toFixed(4)}, ${scaledItems.length} items`,
+    { items: scaledItems },
+  )
+
+  // Реюзаем общий код через создание псевдо-original с уже отскейленным
+  // matchItems. Хак — но избегает дубля логики error-handling.
+  const scaledOriginal: OriginalContext = {
+    ...original,
+    matchItems: scaledItems.map((it) => ({
+      esf_item_id: -1, // не используется в этой ветке tryUnconsume
+      quantity: it.quantity,
+      server_item_id: it.inv_item_id,
+    })),
+  }
+  await tryUnconsume(scaledOriginal, refundDbId, refundFiscalSign)
 }
 
 /**
@@ -526,6 +845,14 @@ async function maybePrintRefundReceipt(
   refundCash: number,
   refundCard: number,
   isTest: boolean,
+  /**
+   * Items[] которые УШЛИ в ОФД как refund (для full = все из оригинала,
+   * для partial = только выбранные с пересчитанным qty). На печать кассиру
+   * показываем именно их — то что физически возвращается клиенту.
+   */
+  refundItemsForPrint?: JsonRpcItem[],
+  /** true → шапка «ЧАСТИЧНЫЙ ВОЗВРАТ» вместо «ВОЗВРАТ ТОВАРА». */
+  isPartial: boolean = false,
 ): Promise<void> {
   try {
     const enabled = (await getSetting(SettingKey.PrinterAutoPrint)) === 'true'
@@ -546,6 +873,8 @@ async function maybePrintRefundReceipt(
       refundCash,
       refundCard,
       isTest,
+      refundItemsForPrint,
+      isPartial,
     )
     const jobId = await printFiscalReceipt(printerName, data)
     await log.info('refund', `Refund-чек отправлен на печать (job #${jobId})`, {
@@ -567,6 +896,8 @@ async function buildRefundReceiptData(
   refundCash: number,
   refundCard: number,
   isTest: boolean,
+  refundItemsForPrint?: JsonRpcItem[],
+  isPartial: boolean = false,
 ): Promise<ReceiptData> {
   const [name, address, phone, inn] = await Promise.all([
     getSetting(SettingKey.CompanyName),
@@ -576,7 +907,11 @@ async function buildRefundReceiptData(
   ])
   const cashier = (await getSetting(SettingKey.MoyskladEmployeeName)) ?? ''
 
-  const items: ReceiptItem[] = originalReceipt.Items.map((it: JsonRpcItem) => ({
+  // Если переданы refundItemsForPrint (partial mode) — печатаем их.
+  // Иначе fallback на originalReceipt.Items (full mode / legacy callers).
+  const itemsSource: JsonRpcItem[] = refundItemsForPrint ?? originalReceipt.Items
+
+  const items: ReceiptItem[] = itemsSource.map((it: JsonRpcItem) => ({
     name: it.Name,
     class_code: it.spic,
     qty_str: formatQtyForPrint(it.Amount),
@@ -586,20 +921,20 @@ async function buildRefundReceiptData(
     vat_percent: it.VATPercent ?? 0,
   }))
 
-  const totalTiyin = originalReceipt.Items.reduce(
+  const totalTiyin = itemsSource.reduce(
     (s, it) => s + it.Price - it.Discount,
     0,
   )
-  const totalVatTiyin = originalReceipt.Items.reduce(
-    (s, it) => s + it.VAT,
-    0,
-  )
+  const totalVatTiyin = itemsSource.reduce((s, it) => s + it.VAT, 0)
 
+  // Для partial префиксом «ЧАСТИЧНО» в reference — кассиру видно из шапки
+  // что это не полный возврат, без изменения Rust-кода printer.rs.
+  const refRefPrefix = isPartial ? 'ЧАСТИЧНО · ' : ''
   return {
     is_copy: false,
     is_test: isTest,
     is_refund: true,
-    original_receipt_ref: `${original.fr.receipt_seq} от ${formatPrintDate(original.fr.fiscal_datetime)}`,
+    original_receipt_ref: `${refRefPrefix}${original.fr.receipt_seq} от ${formatPrintDate(original.fr.fiscal_datetime)}`,
     company: {
       name: name || '',
       address: address || '',

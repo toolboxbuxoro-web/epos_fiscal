@@ -26,8 +26,11 @@ import {
   getDb,
   getMsReceipt,
   getRefundByOriginalFiscalId,
+  getRefundState,
+  listRefundsByOriginalFiscalId,
   type FiscalReceiptRow,
   type FiscalRefundRow,
+  type RefundState,
 } from '@/lib/db'
 import {
   getDefaultRefundAmounts,
@@ -71,11 +74,40 @@ export default function Refund() {
   >([])
   const [msName, setMsName] = useState<string | null>(null)
   const [existing, setExisting] = useState<FiscalRefundRow | null>(null)
+  const [refundState, setRefundState] = useState<RefundState>('none')
+  /**
+   * Map<originalItemIndex, totalRefundedQtyMilli> — сколько уже вернули
+   * по каждой позиции за все предыдущие partial refund'ы.
+   * Используется чтобы:
+   *   - Сделать cap qty input: max = originalQty - alreadyRefunded
+   *   - Показать кассиру badge «уже возвращено N»
+   *   - НЕ дать сделать over-refund
+   */
+  const [alreadyRefundedByIndex, setAlreadyRefundedByIndex] = useState<
+    Map<number, number>
+  >(new Map())
   const [defaultCash, setDefaultCash] = useState(0)
   const [defaultCard, setDefaultCard] = useState(0)
   const [busy, setBusy] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
+  /**
+   * Режим возврата:
+   *   - 'full' — возвращаем ВСЕ позиции оригинала (default если refund'ов ещё нет)
+   *   - 'partial' — кассир выбирает qty по каждой позиции
+   *
+   * Если есть предыдущие partial refund'ы → автоматически 'partial' (full
+   * запрещён в processRefund — нельзя смешивать).
+   */
+  const [refundMode, setRefundMode] = useState<'full' | 'partial'>('full')
+  /**
+   * Map<originalItemIndex, qtyMilli> — выбранные qty при partial refund.
+   * 0 / отсутствие в map → этот item НЕ возвращаем.
+   * Cap (max value) для каждого = originalQty - alreadyRefunded[index].
+   */
+  const [partialQtyMap, setPartialQtyMap] = useState<Map<number, number>>(
+    new Map(),
+  )
   /**
    * Синхронный lock против двойного клика «Подтвердить возврат».
    * `setSubmitting(true)` асинхронен — между двумя быстрыми кликами оба
@@ -144,9 +176,35 @@ export default function Refund() {
         }
       }
 
-      // 3. Проверка: уже был возврат?
-      const ex = await getRefundByOriginalFiscalId(fiscalId)
-      setExisting(ex)
+      // 3. Проверка состояния refund'ов и previous partial-snapshots.
+      const state = await getRefundState(fiscalId)
+      setRefundState(state)
+      const allRefunds = await listRefundsByOriginalFiscalId(fiscalId)
+      // FullRefund блокирует UI полностью.
+      const fullExisting = allRefunds.find((r) => r.is_partial === 0) ?? null
+      setExisting(fullExisting)
+      // Подсчёт cumulative qty по предыдущим partial-refund'ам.
+      const cumulativeQty = new Map<number, number>()
+      for (const r of allRefunds) {
+        if (!r.refunded_items_snapshot) continue
+        try {
+          const snap = JSON.parse(r.refunded_items_snapshot) as Array<{
+            originalItemIndex: number
+            qtyMilli: number
+          }>
+          for (const s of snap) {
+            cumulativeQty.set(
+              s.originalItemIndex,
+              (cumulativeQty.get(s.originalItemIndex) ?? 0) + s.qtyMilli,
+            )
+          }
+        } catch {
+          /* битый JSON — пропускаем */
+        }
+      }
+      setAlreadyRefundedByIndex(cumulativeQty)
+      // Если уже были partial refund'ы → форс-режим partial.
+      if (state === 'partial') setRefundMode('partial')
 
       // 4. Дефолты сумм возврата (= как было оплачено).
       const def = await getDefaultRefundAmounts(fiscalId)
@@ -172,14 +230,52 @@ export default function Refund() {
     [refundCardStr],
   )
   const totalRefundTiyin = parsedCash + parsedCard
-  const originalTotalTiyin = useMemo(
-    () => items.reduce((s, it) => s + it.price - it.discount, 0),
-    [items],
-  )
+  /**
+   * Сумма к возврату по выбранным позициям.
+   * Full mode: вся сумма оригинала.
+   * Partial mode: Σ(item.unit_price × selectedQty / item.originalQty).
+   */
+  const itemsRefundTotalTiyin = useMemo(() => {
+    if (refundMode === 'full') {
+      return items.reduce((s, it) => s + it.price - it.discount, 0)
+    }
+    // partial — пересчёт по qty
+    let sum = 0
+    items.forEach((it, idx) => {
+      const qtySelected = partialQtyMap.get(idx) ?? 0
+      if (qtySelected <= 0) return
+      const ratio = qtySelected / it.qty
+      sum += Math.round((it.price - it.discount) * ratio)
+    })
+    return sum
+  }, [items, partialQtyMap, refundMode])
 
-  const sumMismatch = totalRefundTiyin !== originalTotalTiyin
-  const overRefund = totalRefundTiyin > originalTotalTiyin
-  const noRefund = totalRefundTiyin <= 0
+  // Авто-перезаполнение поля cash/card при изменении itemsRefundTotalTiyin
+  // в partial-режиме (чтобы кассиру не приходилось вручную пересчитывать).
+  // Применяется только при инициализации partial — после ручного ввода
+  // юзер контролирует сам.
+  const [partialAmountsManuallyEdited, setPartialAmountsManuallyEdited] =
+    useState(false)
+  useEffect(() => {
+    if (refundMode !== 'partial' || partialAmountsManuallyEdited) return
+    // Пропорциональный split: cash = origCash * (refundTotal / origTotal)
+    const origTotal = defaultCash + defaultCard
+    if (origTotal <= 0 || itemsRefundTotalTiyin <= 0) {
+      setRefundCashStr('')
+      setRefundCardStr('')
+      return
+    }
+    const ratio = itemsRefundTotalTiyin / origTotal
+    const cashTiyin = Math.round(defaultCash * ratio)
+    const cardTiyin = itemsRefundTotalTiyin - cashTiyin
+    setRefundCashStr(cashTiyin > 0 ? Math.round(cashTiyin / 100).toString() : '')
+    setRefundCardStr(cardTiyin > 0 ? Math.round(cardTiyin / 100).toString() : '')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [itemsRefundTotalTiyin, refundMode])
+
+  const sumMismatch = Math.abs(totalRefundTiyin - itemsRefundTotalTiyin) > 100
+  const overRefund = totalRefundTiyin > itemsRefundTotalTiyin
+  const noRefund = totalRefundTiyin <= 0 || itemsRefundTotalTiyin <= 0
 
   async function doRefund() {
     if (!fiscalReceipt) return
@@ -215,12 +311,27 @@ export default function Refund() {
         )
         return
       }
+      // Собираем selectedItems если partial-режим (для full передаём undefined).
+      const selectedItems =
+        refundMode === 'partial'
+          ? Array.from(partialQtyMap.entries())
+              .filter(([, q]) => q > 0)
+              .map(([originalItemIndex, qtyMilli]) => ({
+                originalItemIndex,
+                qtyMilli,
+              }))
+          : undefined
+      if (refundMode === 'partial' && (!selectedItems || selectedItems.length === 0)) {
+        setError('Не выбрана ни одна позиция для возврата. Укажите qty.')
+        return
+      }
       const res = await processRefund({
         originalFiscalId: fiscalReceipt.id,
         refundCashTiyin: parsedCash,
         refundCardTiyin: parsedCard,
         refundQrTiyin: 0,
         reason: reason.trim() || undefined,
+        selectedItems,
       })
       toast.success(`Возврат ${res.fiscal.FiscalSign} проведён`, { duration: 5000 })
       nav('/history')
@@ -376,7 +487,51 @@ export default function Refund() {
         <Card.Header>
           <Card.Title>Что возвращаем (фискальные позиции)</Card.Title>
           <Card.HeaderAction>
-            <Badge variant="info">{items.length} позиций</Badge>
+            <div className="flex items-center gap-2">
+              <Badge variant="info">{items.length} позиций</Badge>
+              {/* Toggle режима — disable если уже был partial (нельзя смешивать) */}
+              <div className="inline-flex rounded-md border border-border bg-canvas p-0.5 text-caption">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setRefundMode('full')
+                    setPartialQtyMap(new Map())
+                    setPartialAmountsManuallyEdited(false)
+                  }}
+                  disabled={refundState === 'partial' || !!existing}
+                  className={
+                    refundMode === 'full'
+                      ? 'rounded px-2.5 py-1 bg-primary text-on-primary font-medium'
+                      : 'rounded px-2.5 py-1 text-ink-muted hover:text-ink disabled:opacity-40'
+                  }
+                  title={
+                    refundState === 'partial'
+                      ? 'Полный возврат недоступен — есть частичные возвраты'
+                      : 'Вернуть весь чек целиком'
+                  }
+                >
+                  Полный
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setRefundMode('partial')
+                    // По дефолту партиал начинает с qty=0 для всех — кассир сам выбирает.
+                    setPartialQtyMap(new Map())
+                    setPartialAmountsManuallyEdited(false)
+                  }}
+                  disabled={!!existing}
+                  className={
+                    refundMode === 'partial'
+                      ? 'rounded px-2.5 py-1 bg-primary text-on-primary font-medium'
+                      : 'rounded px-2.5 py-1 text-ink-muted hover:text-ink disabled:opacity-40'
+                  }
+                  title="Выбрать конкретные товары для возврата"
+                >
+                  Частичный
+                </button>
+              </div>
+            </div>
           </Card.HeaderAction>
         </Card.Header>
         <table className="w-full text-body">
@@ -386,7 +541,7 @@ export default function Refund() {
                 Товар
               </th>
               <th className="px-3 py-2.5 text-right text-caption font-medium text-ink-muted uppercase tracking-wide">
-                Кол-во
+                {refundMode === 'partial' ? 'Возврат (шт)' : 'Кол-во'}
               </th>
               <th className="px-3 py-2.5 text-right text-caption font-medium text-ink-muted uppercase tracking-wide">
                 Сумма
@@ -394,42 +549,91 @@ export default function Refund() {
             </tr>
           </thead>
           <tbody>
-            {items.map((it, i) => (
-              <tr key={i} className="border-b border-border last:border-0">
-                <td className="px-3 py-2.5">
-                  <div className="font-medium text-ink">{it.name}</div>
-                  <div className="font-mono text-caption text-ink-subtle">
-                    {it.classCode} · НДС {it.vatPercent}%
-                  </div>
-                </td>
-                <td className="px-3 py-2.5 text-right tabular-nums text-ink-muted">
-                  {it.qty / 1000}
-                </td>
-                <td className="px-3 py-2.5 text-right tabular-nums text-ink">
-                  {it.discount > 0 ? (
-                    <div className="space-y-0.5">
-                      <div className="text-caption text-ink-subtle line-through">
-                        {tiyinToSumDisplay(it.price)}
-                      </div>
-                      <div className="text-caption text-danger">
-                        −{tiyinToSumDisplay(it.discount)}
-                      </div>
-                      <div className="font-medium">
-                        {tiyinToSumDisplay(it.price - it.discount)}
-                      </div>
+            {items.map((it, i) => {
+              const origQtyMilli = it.qty
+              const alreadyRefunded = alreadyRefundedByIndex.get(i) ?? 0
+              const remainingMilli = Math.max(0, origQtyMilli - alreadyRefunded)
+              const selectedQty = partialQtyMap.get(i) ?? 0
+              const isFullMode = refundMode === 'full'
+              // При partial считаем сумму по qty (пропорционально к unit_price)
+              const itemRefundTiyin = isFullMode
+                ? it.price - it.discount
+                : Math.round(((it.price - it.discount) * selectedQty) / origQtyMilli)
+
+              return (
+                <tr key={i} className="border-b border-border last:border-0">
+                  <td className="px-3 py-2.5">
+                    <div className="font-medium text-ink">{it.name}</div>
+                    <div className="font-mono text-caption text-ink-subtle">
+                      {it.classCode} · НДС {it.vatPercent}%
                     </div>
-                  ) : (
-                    tiyinToSumDisplay(it.price)
-                  )}
-                </td>
-              </tr>
-            ))}
+                    {alreadyRefunded > 0 && (
+                      <div className="mt-0.5 inline-block text-caption text-warning">
+                        Уже возвращено: {(alreadyRefunded / 1000).toString()} шт
+                      </div>
+                    )}
+                  </td>
+                  <td className="px-3 py-2.5 text-right tabular-nums">
+                    {isFullMode ? (
+                      <span className="text-ink-muted">{it.qty / 1000}</span>
+                    ) : (
+                      <div className="flex flex-col items-end gap-1">
+                        <Input
+                          type="number"
+                          min={0}
+                          max={remainingMilli / 1000}
+                          step="any"
+                          value={selectedQty > 0 ? selectedQty / 1000 : ''}
+                          onChange={(e) => {
+                            const v = parseFloat(e.target.value)
+                            const milli = isFinite(v)
+                              ? Math.round(Math.max(0, v) * 1000)
+                              : 0
+                            const capped = Math.min(milli, remainingMilli)
+                            const next = new Map(partialQtyMap)
+                            if (capped <= 0) next.delete(i)
+                            else next.set(i, capped)
+                            setPartialQtyMap(next)
+                            setPartialAmountsManuallyEdited(false)
+                          }}
+                          disabled={!!existing || remainingMilli <= 0}
+                          className="w-24 text-right"
+                          placeholder={remainingMilli <= 0 ? '—' : '0'}
+                        />
+                        <span className="text-caption text-ink-subtle">
+                          из {remainingMilli / 1000}
+                        </span>
+                      </div>
+                    )}
+                  </td>
+                  <td className="px-3 py-2.5 text-right tabular-nums text-ink">
+                    {it.discount > 0 ? (
+                      <div className="space-y-0.5">
+                        <div className="text-caption text-ink-subtle line-through">
+                          {tiyinToSumDisplay(it.price)}
+                        </div>
+                        <div className="text-caption text-danger">
+                          −{tiyinToSumDisplay(it.discount)}
+                        </div>
+                        <div className="font-medium">
+                          {tiyinToSumDisplay(itemRefundTiyin)}
+                        </div>
+                      </div>
+                    ) : (
+                      <span className={isFullMode ? '' : 'font-medium'}>
+                        {tiyinToSumDisplay(itemRefundTiyin)}
+                      </span>
+                    )}
+                  </td>
+                </tr>
+              )
+            })}
             <tr className="bg-canvas">
               <td className="px-3 py-2.5 text-right font-medium" colSpan={2}>
-                Итого:
+                {refundMode === 'partial' ? 'Итого к возврату:' : 'Итого:'}
               </td>
               <td className="px-3 py-2.5 text-right tabular-nums font-semibold text-ink">
-                {tiyinToSumDisplay(originalTotalTiyin)} сум
+                {tiyinToSumDisplay(itemsRefundTotalTiyin)} сум
               </td>
             </tr>
           </tbody>
@@ -456,7 +660,10 @@ export default function Refund() {
                 type="number"
                 min={0}
                 value={refundCashStr}
-                onChange={(e) => setRefundCashStr(e.target.value)}
+                onChange={(e) => {
+                  setRefundCashStr(e.target.value)
+                  setPartialAmountsManuallyEdited(true)
+                }}
                 disabled={!!existing}
               />
               <div className="mt-1 text-xs text-ink-muted">
@@ -471,7 +678,10 @@ export default function Refund() {
                 type="number"
                 min={0}
                 value={refundCardStr}
-                onChange={(e) => setRefundCardStr(e.target.value)}
+                onChange={(e) => {
+                  setRefundCardStr(e.target.value)
+                  setPartialAmountsManuallyEdited(true)
+                }}
                 disabled={!!existing}
               />
               <div className="mt-1 text-xs text-ink-muted">
@@ -495,8 +705,8 @@ export default function Refund() {
             {sumMismatch && (
               <div className="mt-1 text-caption text-warning">
                 {overRefund
-                  ? `⚠️ Сумма возврата ${tiyinToSumDisplay(totalRefundTiyin)} превышает сумму чека ${tiyinToSumDisplay(originalTotalTiyin)}. Уменьшите.`
-                  : `⚠️ Сумма возврата ${tiyinToSumDisplay(totalRefundTiyin)} меньше суммы чека ${tiyinToSumDisplay(originalTotalTiyin)} — недовозврат.`}
+                  ? `⚠️ Сумма возврата ${tiyinToSumDisplay(totalRefundTiyin)} превышает сумму чека ${tiyinToSumDisplay(itemsRefundTotalTiyin)}. Уменьшите.`
+                  : `⚠️ Сумма возврата ${tiyinToSumDisplay(totalRefundTiyin)} меньше суммы чека ${tiyinToSumDisplay(itemsRefundTotalTiyin)} — недовозврат.`}
               </div>
             )}
           </div>

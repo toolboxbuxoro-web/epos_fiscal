@@ -384,4 +384,25 @@ export interface FiscalRefundRow {
   reason: string | null
   cashier_name: string | null
   refunded_at: EpochSec
+  /**
+   * 0 = полный возврат всего чека, 1 = частичный (выбраны конкретные товары/qty).
+   * Старые refund'ы до миграции 013 = 0.
+   */
+  is_partial: number
+  /**
+   * JSON-snapshot выбранных позиций для partial refund.
+   * Формат: `[{ originalItemIndex: number, qtyMilli: number, refundTiyin: number }]`
+   * NULL для full refund (там items_json содержит ВСЕ items оригинала).
+   */
+  refunded_items_snapshot: string | null
 }
+
+/**
+ * Состояние возврата по конкретному чеку — для UI History badge + блокировки
+ * кнопки «Возврат» когда чек уже полностью возвращён.
+ *
+ *   - 'none'    — refund'ов нет, можно делать новый
+ *   - 'partial' — есть partial refund'ы, можно ещё (qty осталось)
+ *   - 'full'    — полностью возвращён, новый refund невозможен
+ */
+export type RefundState = 'none' | 'partial' | 'full'

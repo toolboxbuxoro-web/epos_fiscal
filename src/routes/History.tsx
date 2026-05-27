@@ -5,10 +5,11 @@ import { ChevronLeft, ChevronRight, Undo2 } from 'lucide-react'
 import {
   countFiscalReceipts,
   getAllSettings,
-  getRefundedFiscalIds,
+  getRefundStatesMap,
   listFiscalReceipts,
   SettingKey,
   type FiscalReceiptRow,
+  type RefundState,
 } from '@/lib/db'
 import { formatDateTime, tiyinToSumDisplay } from '@/lib/format'
 import {
@@ -70,7 +71,15 @@ function parsePayment(requestJson: string): {
 export default function History() {
   const nav = useNavigate()
   const [rows, setRows] = useState<FiscalReceiptRow[]>([])
-  const [refundedIds, setRefundedIds] = useState<Set<number>>(new Set())
+  /**
+   * Состояние возврата по каждому fiscal_id:
+   *   - не в Map     → возвратов нет, можно делать
+   *   - 'partial'    → есть частичные, можно ещё (показываем «Частично», кнопка активна)
+   *   - 'full'       → полностью возвращён, кнопка disabled
+   */
+  const [refundStates, setRefundStates] = useState<Map<number, RefundState>>(
+    new Map(),
+  )
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   /** id чека → сообщение результата перепечати (для inline-фидбека). */
@@ -97,9 +106,12 @@ export default function History() {
       ])
       setRows(list)
       setTotal(count)
-      // Bulk-проверка какие чеки уже возвращены — чтобы дисэйблить кнопку.
-      const refunded = await getRefundedFiscalIds(list.map((r) => r.id))
-      setRefundedIds(refunded)
+      // Bulk-проверка состояния возвратов: полный / частичный / нет.
+      // - 'full'    → кнопка disabled, бейдж «Возвращён»
+      // - 'partial' → кнопка активна (можно довозвратить), бейдж «Частично»
+      // - отсутствует → кнопка активна, бейджа нет
+      const states = await getRefundStatesMap(list.map((r) => r.id))
+      setRefundStates(states)
     } catch (e) {
       setError(formatErrorForUser(e))
     } finally {
@@ -208,7 +220,9 @@ export default function History() {
               </tr>
             ) : (
               rows.map((r) => {
-                const isRefunded = refundedIds.has(r.id)
+                const refState = refundStates.get(r.id)
+                const isFullyRefunded = refState === 'full'
+                const isPartiallyRefunded = refState === 'partial'
                 // Парсим request_json чтобы показать сумму и способ оплаты.
                 // request_json — это payload который мы слали в EPOS (там
                 // ReceivedCash + ReceivedCard). Сумма получается их склейкой.
@@ -282,11 +296,27 @@ export default function History() {
                     </div>
                   </Td>
                   <Td>
-                    {isRefunded ? (
+                    {isFullyRefunded ? (
                       <span className="inline-flex items-center gap-1 rounded-md bg-danger-soft px-2 py-0.5 text-xs text-danger">
                         <Undo2 size={11} />
                         Возвращён
                       </span>
+                    ) : isPartiallyRefunded ? (
+                      <div className="flex items-center gap-2">
+                        <span className="inline-flex items-center gap-1 rounded-md bg-warning-soft px-2 py-0.5 text-xs text-warning">
+                          <Undo2 size={11} />
+                          Частично
+                        </span>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => nav(`/refund/${r.id}`)}
+                          icon={<Undo2 size={12} />}
+                          title="Довозвратить остаток"
+                        >
+                          Ещё
+                        </Button>
+                      </div>
                     ) : (
                       <Button
                         variant="ghost"
