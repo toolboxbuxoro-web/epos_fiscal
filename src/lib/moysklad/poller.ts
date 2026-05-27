@@ -160,6 +160,11 @@ export class MoyskladPoller {
   }
 
   private async persist(rd: MsRetailDemand): Promise<void> {
+    // Чек на 0 сум (вся покупка за бонусные баллы / 100% скидка) —
+    // ОФД физически не примет товар на 0 сум. Сразу помечаем такой
+    // чек как not_required чтобы он не висел в списке pending и не
+    // тревожил кассира «нужно фискализировать».
+    const status = rd.sum <= 0 ? 'not_required' as const : undefined
     await upsertMsReceipt({
       ms_id: rd.id,
       ms_name: rd.name ?? null,
@@ -167,6 +172,7 @@ export class MoyskladPoller {
       ms_sum_tiyin: rd.sum,
       raw_json: JSON.stringify(rd),
       fetched_at: now(),
+      status,
     })
   }
 }

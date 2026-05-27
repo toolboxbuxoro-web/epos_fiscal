@@ -71,6 +71,12 @@ pub fn run() {
             sql: include_str!("../migrations/011_logs_telemetry.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 12,
+            description: "zero_sum_not_required",
+            sql: include_str!("../migrations/012_zero_sum_not_required.sql"),
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()
