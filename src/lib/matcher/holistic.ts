@@ -41,7 +41,14 @@
  */
 
 import type { Tiyin } from '@/lib/db/types'
-import { costWithVat, vatIncluded, type MatcherPool, type PoolItem } from './strategies'
+import {
+  costWithVat,
+  priceFloorTiyin,
+  vatIncluded,
+  MIN_MARKUP_PERCENT,
+  type MatcherPool,
+  type PoolItem,
+} from './strategies'
 import type { HolisticLine, HolisticPlan, MatcherOptions } from './types'
 
 const DEFAULT_FILLER_RESERVE_TIYIN: Tiyin = 3_000_000 // 30 000 сум
@@ -149,14 +156,15 @@ export function planHolistic(
     if (remaining <= 0) break
     const sell = w.poolItem.sellingPrice
     if (sell <= fillerThreshold) continue // мелкое — для фазы 2
-    // Cost-floor per-line: если unit_price × vat > sellPrice, продажа в убыток.
-    // Это маловероятно при наценке ≥10%, но защищаемся.
-    const unitCost = costWithVat(
+    // Floor per-line: если себестоимость +5% > sellPrice, продажа ниже
+    // минимальной наценки → не берём. При наценке ≥10% обычно не триггерит,
+    // но защищаемся (например магазин на упрощёнке с markup=0).
+    const unitFloor = priceFloorTiyin(
       w.poolItem.item.unit_price_tiyin,
       w.poolItem.item.vat_percent,
       1000, // 1 шт
     )
-    if (unitCost > sell) continue
+    if (unitFloor > sell) continue
 
     // Целевой бюджет фазы 1: либо весь remaining (если филлеров нет),
     // либо remaining - fillerReserve (оставляем под фазу 2).
@@ -273,19 +281,21 @@ export function planHolistic(
     }
     remaining = toBump
   } else if (remaining < 0) {
-    // Перебрали — discount, но не ниже cost-floor.
+    // Перебрали — discount, но не ниже floor = себестоимость × (1 + 5%).
+    // Раньше floor была голая себестоимость (0% маржи). Теперь скидка не
+    // опускает цену ниже «себестоимость + минимальная наценка 5%».
     let toCut = -remaining
     const sorted = [...lines].sort((a, b) => b.priceTiyin - a.priceTiyin)
     for (const line of sorted) {
       if (toCut <= 0) break
-      const cost = costWithVat(
+      const floor = priceFloorTiyin(
         line.esfItem.unit_price_tiyin,
         line.esfItem.vat_percent,
         line.quantity,
       )
       const maxCut = Math.min(
         maxBumpPerLine, // используем тот же cap
-        line.priceTiyin - line.discountTiyin - cost,
+        line.priceTiyin - line.discountTiyin - floor,
       )
       if (maxCut <= 0) continue
       const take = Math.min(toCut, maxCut)
@@ -314,10 +324,23 @@ export function planHolistic(
     (s, l) => s + l.priceTiyin - l.discountTiyin,
     0,
   )
+  // totalCostTiyin — голая себестоимость (для отчёта в HolisticPlan).
   const totalCostTiyin = lines.reduce(
     (s, l) =>
       s +
       costWithVat(
+        l.esfItem.unit_price_tiyin,
+        l.esfItem.vat_percent,
+        l.quantity,
+      ),
+    0,
+  )
+  // totalFloorTiyin — себестоимость + минимум 5%. Это нижняя граница для
+  // всего плана. Если выручка ниже — продаём ниже минимальной наценки.
+  const totalFloorTiyin = lines.reduce(
+    (s, l) =>
+      s +
+      priceFloorTiyin(
         l.esfItem.unit_price_tiyin,
         l.esfItem.vat_percent,
         l.quantity,
@@ -332,13 +355,13 @@ export function planHolistic(
       detail: `итог plan ${totalTiyin} ≠ target ${target} (delta ${totalTiyin - target})`,
     }
   }
-  if (totalCostTiyin > totalTiyin) {
+  if (totalFloorTiyin > totalTiyin) {
     return {
       ok: false,
       reason: 'BELOW_COST',
       detail:
-        `глобальная себестоимость ${totalCostTiyin} > выручка ${totalTiyin} — ` +
-        `продажа в убыток`,
+        `минимальная цена (себестоимость +${MIN_MARKUP_PERCENT}%) ${totalFloorTiyin} > ` +
+        `выручка ${totalTiyin} — продажа ниже минимальной наценки`,
     }
   }
 

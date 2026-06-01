@@ -1,8 +1,8 @@
 import type { MsRetailDemand } from '@/lib/moysklad/types'
 import { extractPositions } from './extract'
 import {
-  costWithVat,
   loadMatcherPool,
+  priceFloorTiyin,
   tryLinkedMsVariant,
   tryMultiItem,
   tryPassthrough,
@@ -270,6 +270,31 @@ export async function buildMatch(
       `Holistic-режим не справился (${holistic.reason}): ${holistic.detail}. ` +
         `Используйте ручной подбор для неподобранных позиций.`,
     )
+  }
+
+  // Проверка минимальной наценки: ни одна позиция не должна продаваться ниже
+  // себестоимости + 5%. Возникает в основном при linked-ms / price-bucket
+  // где цена = pos.totalTiyin (что заплатил клиент). Если клиент заплатил
+  // меньше чем себестоимость+5% выбранного прихода — предупреждаем кассира
+  // (не блокируем: цену чека МС менять нельзя, клиент уже заплатил).
+  for (const m of matches) {
+    for (const c of m.candidates) {
+      const effectivePrice = c.priceTiyin - c.discountTiyin
+      const floor = priceFloorTiyin(
+        c.esfItem.unit_price_tiyin,
+        c.esfItem.vat_percent,
+        c.quantity,
+      )
+      if (effectivePrice > 0 && effectivePrice < floor) {
+        const lossTiyin = floor - effectivePrice
+        warnings.push(
+          `⚠️ «${c.esfItem.name}» продаётся за ${tiyinToSumDisplay(effectivePrice)} ` +
+            `— ниже минимальной цены ${tiyinToSumDisplay(floor)} ` +
+            `(себестоимость +5%). Не хватает ${tiyinToSumDisplay(lossTiyin)}. ` +
+            `Замените товар через ручную сборку если возможно.`,
+        )
+      }
+    }
   }
 
   // canAutoFiscalize: все позиции linked-ms или passthrough, нет warnings, diff = 0.
@@ -551,14 +576,17 @@ function distributeDiscount(
   const maxPerItem = opts.maxDiscountPerItemTiyin ?? 200_000 // 2000 сум
 
   // Считаем максимально возможную скидку для каждого кандидата.
+  // Floor = себестоимость × (1 + 5%) — скидка не может опустить цену ниже
+  // «себестоимость + минимальная наценка». Раньше floor был голой
+  // себестоимостью (0% маржи) → товар продавался в ноль прибыли.
   type Slot = { c: typeof candidates[number]; max: number }
   const slots: Slot[] = candidates.map((c) => {
-    const cost = costWithVat(
+    const floor = priceFloorTiyin(
       c.esfItem.unit_price_tiyin,
       c.esfItem.vat_percent,
       c.quantity,
     )
-    const maxBySelfCost = Math.max(0, c.priceTiyin - cost)
+    const maxBySelfCost = Math.max(0, c.priceTiyin - floor)
     return { c, max: Math.min(maxBySelfCost, maxPerItem) }
   })
 

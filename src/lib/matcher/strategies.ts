@@ -656,11 +656,11 @@ function makeCandidate(
 
 /**
  * Себестоимость с НДС для всей позиции (за `quantity` единиц).
- * Это пол скидки: `discount` не может опустить (price - discount) ниже этой
- * суммы — иначе продажа в убыток. НДС применяется ПРАВИЛЬНО (последовательно,
- * не суммой 22%): unit_price × (1 + vat/100).
+ * НДС применяется ПРАВИЛЬНО (последовательно, не суммой 22%):
+ * unit_price × (1 + vat/100).
  *
- * Используется в distributeDiscount.
+ * Это «голая» себестоимость без наценки. Для нижней границы цены при подборе
+ * используется `priceFloorTiyin` (= себестоимость × (1 + MIN_MARKUP/100)).
  */
 export function costWithVat(
   unitPriceTiyin: Tiyin,
@@ -670,4 +670,37 @@ export function costWithVat(
   if (unitPriceTiyin <= 0) return 0
   const unitWithVat = (unitPriceTiyin * (100 + Math.max(0, vatPercent))) / 100
   return Math.round((unitWithVat * quantityMilli) / 1000)
+}
+
+/**
+ * Минимальная наценка (%) которую магазин гарантированно держит при подборе.
+ *
+ * Бизнес-правило: товар НЕ должен продаваться ниже себестоимости. Хотя бы
+ * +5% маржи. distributeDiscount/holistic phase-3 не срезают цену ниже этого
+ * флора; manual picker и стратегии предупреждают если приход нельзя продать
+ * с такой наценкой (клиент заплатил слишком мало).
+ *
+ * Хардкод (а не настройка) — осознанное решение пользователя: 5% это
+ * минимальная допустимая маржа для всех 4 магазинов, единое правило.
+ */
+export const MIN_MARKUP_PERCENT = 5
+
+/**
+ * Нижняя граница продажной цены позиции = себестоимость с НДС × (1 + MIN_MARKUP/100).
+ *
+ * Ниже этой суммы продавать нельзя — это и есть «себестоимость + минимум 5%».
+ * Используется как floor в:
+ *   - distributeDiscount (срезка скидкой)
+ *   - holistic phase-3 (discount при перенаборе)
+ *   - manual picker (предупреждение «ниже +5%»)
+ *   - стратегии подбора (предупреждение если pos.totalTiyin < этого флора)
+ */
+export function priceFloorTiyin(
+  unitPriceTiyin: Tiyin,
+  vatPercent: number,
+  quantityMilli: number,
+): Tiyin {
+  const cost = costWithVat(unitPriceTiyin, vatPercent, quantityMilli)
+  if (cost <= 0) return 0
+  return Math.round((cost * (100 + MIN_MARKUP_PERCENT)) / 100)
 }
