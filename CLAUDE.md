@@ -293,9 +293,20 @@ Matcher выбирает товары так, чтобы суммарно сов
   остаток (< 1 сум) для дробного target не распределяется — в UZ-рознице
   суммы всегда целые, поэтому остаток = 0 и сумма сходится ТОЧНО
 
-Тесты: `rounding-real-data.test.ts` (реальные приходы Xonabod из БД,
-210 selling-цен × markup/step), `distribute-rounding.test.ts` (симуляция
-distribute, инвариант «нет тийинов + сумма сходится»).
+**Валидация на проде:** 16179 реальных чеков (таблица `receipts` FinCore)
+— **99.91% суммы кратны 1000 сум** (целые). 14 чеков (0.087%) с тийинами
+— артефакты округления МС (бонусы/скидки/FX), все в пределах **1-2 тийинов**
+от целого сума (.01/.98/.99). Для них сабсумный остаток не распределяется,
+в пределах EPOS-tolerance (10000 тийинов = 100 сум). Допущение «UZ-розница
+= целые сумы» подтверждено.
+
+Тесты:
+- `rounding-real-data.test.ts` — реальные приходы Xonabod из БД, 210
+  selling-цен × markup/step, ноль тийинов
+- `distribute-rounding.test.ts` — симуляция distribute, инвариант «нет
+  тийинов + сумма сходится точно»
+- `real-receipts-rounding.test.ts` — реальные суммы 27 чеков (целые +
+  дробные), валидация остатка < 1 сум
 
 ### НДС override (общий режим магазина)
 
@@ -1093,15 +1104,41 @@ docs/
 - **VAT-формула**: по умолчанию `vat = total * percent / (100 + percent)` (НДС включён в цену). Если у магазина НДС начисляется сверху — нужно поменять `vatIncluded` → `vatAddedOn` в `matcher/strategies.ts`.
 - **Ключи подписи**: `~/.tauri/epos-fiscal.key` живёт только на одной машине разработчика. Если потеряем — нужно перевыпустить и заново публиковать клиентам (auto-update сломается). Бэкап ключа — обязательно.
 
-## Текущее состояние (на 2026-05-21)
+## Текущее состояние (на 2026-06-01)
 
 ### Версии
 
 - **Последний released tag:** `v0.10.18` (12.05.2026) — на этом сидят все 4 магазина в проде
-- **Dev-сборка (текущая):** `0.10.29` (в package.json), ветка `dev-test/holistic-phase1`. НЕ тегнута. Авто-апдейт на магазины НЕ идёт. Для теста — dev-build `.exe` через push в `dev-test/**` или `gh workflow run dev-build.yml`
-- **Накопленные фичи между 0.10.18 → 0.10.30 ждут production-тег** (11 крупных feature/fix коммитов)
+- **Dev-сборка (текущая):** `0.11.0` (в package.json + tauri.conf.json + telemetry.ts APP_VERSION — все 3 синхронны), ветка `dev-test/holistic-phase1`. НЕ тегнута. Авто-апдейт на магазины НЕ идёт. Для теста — dev-build `.exe` через push в `dev-test/**` или `gh workflow run dev-build.yml`
+- **Накопленные фичи 0.10.18 → 0.11.0 ждут production-тег** (~20 крупных feature/fix коммитов)
+- **Тесты:** vitest установлен, `npm test`. 185+ кейсов (holistic, partial-refund, preflight, stale-handler, price-floor, rounding на реальных данных БД)
 
-### ✅ Что готово и в коде (0.10.29)
+### ✅ Что готово и в коде (0.11.0)
+
+**Добавлено в 0.11.0 (поверх 0.10.30):**
+
+| Фича | Что |
+|---|---|
+| **Частичный refund** | Migration 013: снят UNIQUE на `original_fiscal_id`, колонки `is_partial` + `refunded_items_snapshot`. Возврат конкретных товаров с qty (не весь чек). Pro-rata Price/VAT, cumulative qty check (не больше original), пропорциональный unconsume. UI toggle «Полный/Частичный» + qty-инпуты, badge «Частично»/«Возвращён» в Истории. Защита: full+partial микс запрещён. См. `refund.ts::buildPartialRefundItems` |
+| **Минимальная наценка 5%** | `MIN_MARKUP_PERCENT=5` (хардкод), `priceFloorTiyin = ceilToSum(cost×1.05)`. Floor в distributeDiscount/holistic phase-3/greedy. Post-match warning если цена < floor (linked-ms/price-bucket где клиент заплатил мало). Не блокирует — цену МС менять нельзя |
+| **Округление без тийинов** | `ceilToSum`/`floorToSum`, цены на ленте всегда целые сумы. floor округлён вверх, distributeDiscount/Bump в целых сумах. Валидировано на 16179 реальных чеках (99.91% целые) |
+| **Preflight reserve** | `GET /items` перед `reserve()` — ловит stale-cache ДО ошибки inv_items_check. InventoryConflictError без reserve-запроса |
+| **SSE в manual modal** | event-bus.ts: live-обновления остатков в открытой модалке + clamp qty |
+| **История: Сумма + Оплата** | Колонки с детализацией mixed (нал X + карта Y), парсинг request_json |
+| **Пагинация** | История + Dashboard «Все чеки» (50/стр) |
+| **Telemetry** | error-логи на mytoolbox (shop_logs), PII-скрабинг, opt-out |
+| **App icon + лого** | Toolbox_Fiscal.png в иконке приложения и сайдбаре |
+
+**Базовое (было в 0.10.18):**
+- MVP функционально полный, auto-update Win+Mac
+- Multi-shop архитектура, фильтр по точке продаж
+- MXIK через `spic` (подтверждено реальной фискализацией, кешбэк ✅)
+- JSON-RPC only (legacy /uzpos удалён)
+- Z-отчёт ККМ, smart open-shift, retry refresh
+- Печать QR на Xprinter (CP866, ESC/POS native QR)
+- Pricing markup×VAT с округлением, distributeDiscount/Bump
+
+**Добавлено 0.10.19 → 0.10.29:**
 
 **Базовое (было в 0.10.18):**
 - MVP функционально полный, auto-update Win+Mac
