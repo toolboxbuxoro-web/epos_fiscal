@@ -1,6 +1,8 @@
 import type { MsRetailDemand } from '@/lib/moysklad/types'
 import { extractPositions } from './extract'
 import {
+  ceilToSum,
+  floorToSum,
   loadMatcherPool,
   priceFloorTiyin,
   tryLinkedMsVariant,
@@ -590,28 +592,36 @@ function distributeDiscount(
     return { c, max: Math.min(maxBySelfCost, maxPerItem) }
   })
 
-  // Раунд 1: равномерно делим. ceil чтобы покрыть весь diff если все позиции
-  // имеют достаточно запаса; если у какой-то меньше — берём по максимуму.
+  // Работаем в ЦЕЛЫХ сумах чтобы финальная цена (price - discount) не имела
+  // тийинов на ленте. `remaining` дробим на whole-sum чанки. Сабсумный остаток
+  // (< 1 сум) оставляем нераспределённым — в UZ-рознице суммы всегда целые,
+  // поэтому для них остаток = 0 (точное совпадение). Для дробного target
+  // расхождение < 1 сум, в пределах EPOS-tolerance.
+  let toRemove = floorToSum(remaining)
   const N = slots.length
-  const perItem = Math.ceil(remaining / N)
+
+  // Раунд 1: равномерно делим. ceilToSum чтобы перекрыть diff целыми сумами.
+  const perItem = ceilToSum(toRemove / N)
   for (const s of slots) {
-    if (remaining <= 0) break
-    const take = Math.min(perItem, s.max, remaining)
+    if (toRemove <= 0) break
+    const take = Math.min(perItem, s.max, toRemove)
     s.c.discountTiyin = take
-    remaining -= take
+    toRemove -= take
   }
 
-  // Раунд 2: добор с тех у кого осталось пространство.
-  if (remaining > 0) {
+  // Раунд 2: добор с тех у кого осталось пространство (всё кратно 1 суму).
+  if (toRemove > 0) {
     for (const s of slots) {
-      if (remaining <= 0) break
+      if (toRemove <= 0) break
       const left = s.max - s.c.discountTiyin
       if (left <= 0) continue
-      const take = Math.min(left, remaining)
+      const take = Math.min(left, toRemove)
       s.c.discountTiyin += take
-      remaining -= take
+      toRemove -= take
     }
   }
+  // Остаток для warning ниже: сабсумный + то что не влезло в floor-cap.
+  remaining = toRemove + (remaining - floorToSum(remaining))
 
   // Пересчитать VAT каждого кандидата от (price - discount).
   for (const c of candidates) {
@@ -679,33 +689,39 @@ function distributeBump(
     opts.maxBumpPerItemTiyin ??
     Math.max(opts.maxDiscountPerItemTiyin ?? 0, 1_000_000) // 10000 сум
 
+  // maxPerItem округляем вниз до целого сума чтобы все надбавки были whole-sum.
+  const maxPerItemSum = floorToSum(maxPerItem)
+
   type Slot = { c: typeof candidates[number]; bumped: number }
   const slots: Slot[] = candidates.map((c) => ({ c, bumped: 0 }))
 
-  // Раунд 1: равномерно делим. ceil чтобы покрыть весь diff если все позиции
-  // имеют достаточно запаса до cap.
+  // Работаем в ЦЕЛЫХ сумах (без тийинов на ленте). Дробим whole-sum часть
+  // remaining; сабсумный остаток (< 1 сум) оставляем — для целых UZ-сумм = 0.
+  let toAdd = floorToSum(remaining)
   const N = slots.length
-  const perItem = Math.ceil(remaining / N)
+
+  // Раунд 1: равномерно делим, ceilToSum — целыми сумами.
+  const perItem = ceilToSum(toAdd / N)
   for (const s of slots) {
-    if (remaining <= 0) break
-    const take = Math.min(perItem, maxPerItem, remaining)
+    if (toAdd <= 0) break
+    const take = Math.min(perItem, maxPerItemSum, toAdd)
     s.bumped = take
-    remaining -= take
+    toAdd -= take
   }
 
   // Раунд 2: добор с тех у кого ещё есть пространство до cap.
-  if (remaining > 0) {
+  if (toAdd > 0) {
     for (const s of slots) {
-      if (remaining <= 0) break
-      const left = maxPerItem - s.bumped
+      if (toAdd <= 0) break
+      const left = maxPerItemSum - s.bumped
       if (left <= 0) continue
-      const take = Math.min(left, remaining)
+      const take = Math.min(left, toAdd)
       s.bumped += take
-      remaining -= take
+      toAdd -= take
     }
   }
 
-  // Применить надбавку и пересчитать VAT от (price - discount).
+  // Применить надбавку (она уже кратна 1 суму) и пересчитать VAT.
   for (const s of slots) {
     if (s.bumped <= 0) continue
     s.c.priceTiyin += s.bumped
@@ -714,6 +730,8 @@ function distributeBump(
       s.c.esfItem.vat_percent,
     )
   }
+  // Остаток для warning: не влезшее в cap + сабсумный.
+  remaining = toAdd + (remaining - floorToSum(remaining))
 
   if (remaining > 0) {
     return [

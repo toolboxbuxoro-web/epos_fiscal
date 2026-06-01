@@ -274,6 +274,29 @@ Matcher выбирает товары так, чтобы суммарно сов
 поэтому floor влияет только когда `distributeDiscount` срезает цену
 или когда цена = `pos.totalTiyin` (клиент заплатил мало).
 
+### Округление цен — БЕЗ тийинов на ленте
+
+Цена товара на фискальной ленте **никогда не имеет тийинов** (дробных
+сум) — всё кратно 1 суму (100 тийинов). Хелперы в `strategies.ts`:
+- `TIYIN_PER_SUM = 100`
+- `ceilToSum(t)` — вверх до целого сума
+- `floorToSum(t)` — вниз до целого сума
+
+Где применяется:
+- `calculateSellingPrice` — round_up до `roundUpToSum` (default 1000 сум),
+  уже кратна шагу → без тийинов
+- `priceFloorTiyin` — `ceilToSum(cost × 1.05)`, floor кратен 1 суму.
+  Раньше был `Math.round` → floor имел тийины (705.**60** сум), и когда
+  discount срезал до floor — цена на ленте получала тийины
+- `distributeDiscount` / `distributeBump` — распределяют diff в **целых
+  сумах** (`floorToSum(remaining)` дробится на whole-sum чанки). Сабсумный
+  остаток (< 1 сум) для дробного target не распределяется — в UZ-рознице
+  суммы всегда целые, поэтому остаток = 0 и сумма сходится ТОЧНО
+
+Тесты: `rounding-real-data.test.ts` (реальные приходы Xonabod из БД,
+210 selling-цен × markup/step), `distribute-rounding.test.ts` (симуляция
+distribute, инвариант «нет тийинов + сумма сходится»).
+
 ### НДС override (общий режим магазина)
 
 `SettingKey.DefaultVatPercent` (default `'12'`) — override `inv_item.vat_percent`

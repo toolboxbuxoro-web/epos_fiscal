@@ -686,10 +686,30 @@ export function costWithVat(
 export const MIN_MARKUP_PERCENT = 5
 
 /**
- * Нижняя граница продажной цены позиции = себестоимость с НДС × (1 + MIN_MARKUP/100).
+ * 1 сум = 100 тийинов. Цены на ленте всегда в целых сумах (без тийинов/
+ * «копеек»). Любой расчёт цены (floor, скидка, надбавка) округляется до
+ * кратного этой величины чтобы на фискальном чеке не было `.XX` сум.
+ */
+export const TIYIN_PER_SUM = 100
+
+/** Округлить тийины ВВЕРХ до целого сума (кратно 100 тийинов). */
+export function ceilToSum(tiyin: Tiyin): Tiyin {
+  return Math.ceil(tiyin / TIYIN_PER_SUM) * TIYIN_PER_SUM
+}
+
+/** Округлить тийины ВНИЗ до целого сума (кратно 100 тийинов). */
+export function floorToSum(tiyin: Tiyin): Tiyin {
+  return Math.floor(tiyin / TIYIN_PER_SUM) * TIYIN_PER_SUM
+}
+
+/**
+ * Нижняя граница продажной цены позиции = себестоимость с НДС × (1 + MIN_MARKUP/100),
+ * округлённая ВВЕРХ до целого сума (без тийинов).
  *
- * Ниже этой суммы продавать нельзя — это и есть «себестоимость + минимум 5%».
- * Используется как floor в:
+ * Округление вверх: floor не должен опускаться ниже «себестоимость + 5%»,
+ * поэтому ceil (а не round) — гарантирует ≥ cost×1.05 и кратность 1 суму.
+ *
+ * Ниже этой суммы продавать нельзя. Используется как floor в:
  *   - distributeDiscount (срезка скидкой)
  *   - holistic phase-3 (discount при перенаборе)
  *   - manual picker (предупреждение «ниже +5%»)
@@ -702,5 +722,5 @@ export function priceFloorTiyin(
 ): Tiyin {
   const cost = costWithVat(unitPriceTiyin, vatPercent, quantityMilli)
   if (cost <= 0) return 0
-  return Math.round((cost * (100 + MIN_MARKUP_PERCENT)) / 100)
+  return ceilToSum((cost * (100 + MIN_MARKUP_PERCENT)) / 100)
 }

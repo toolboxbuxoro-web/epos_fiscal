@@ -17,6 +17,8 @@ import {
   priceFloorTiyin,
   MIN_MARKUP_PERCENT,
   calculateSellingPrice,
+  ceilToSum,
+  TIYIN_PER_SUM,
 } from '@/lib/matcher/strategies'
 
 describe('MIN_MARKUP_PERCENT', () => {
@@ -60,7 +62,7 @@ describe('priceFloorTiyin (себестоимость + 5%)', () => {
     expect(priceFloorTiyin(100_000, 12, 3000)).toBe(352_800)
   })
 
-  it('floor ВСЕГДА > cost (для положительных)', () => {
+  it('floor ВСЕГДА > cost + округлён ВВЕРХ до целого сума (без тийинов)', () => {
     const samples = [
       { unit: 50_000, vat: 12 },
       { unit: 1_303_000, vat: 12 },
@@ -71,8 +73,10 @@ describe('priceFloorTiyin (себестоимость + 5%)', () => {
       const cost = costWithVat(s.unit, s.vat, 1000)
       const floor = priceFloorTiyin(s.unit, s.vat, 1000)
       expect(floor).toBeGreaterThan(cost)
-      // floor должен быть примерно cost × 1.05
-      expect(floor).toBe(Math.round((cost * 105) / 100))
+      // floor = ceilToSum(cost × 1.05) — округление вверх до целого сума
+      expect(floor).toBe(ceilToSum((cost * 105) / 100))
+      // КЛЮЧЕВОЕ: floor всегда кратен 100 тийинов (без тийинов на ленте)
+      expect(floor % TIYIN_PER_SUM).toBe(0)
     }
   })
 
