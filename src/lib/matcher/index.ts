@@ -275,29 +275,8 @@ export async function buildMatch(
   }
 
   // Проверка минимальной наценки: ни одна позиция не должна продаваться ниже
-  // себестоимости + 5%. Возникает в основном при linked-ms / price-bucket
-  // где цена = pos.totalTiyin (что заплатил клиент). Если клиент заплатил
-  // меньше чем себестоимость+5% выбранного прихода — предупреждаем кассира
-  // (не блокируем: цену чека МС менять нельзя, клиент уже заплатил).
-  for (const m of matches) {
-    for (const c of m.candidates) {
-      const effectivePrice = c.priceTiyin - c.discountTiyin
-      const floor = priceFloorTiyin(
-        c.esfItem.unit_price_tiyin,
-        c.esfItem.vat_percent,
-        c.quantity,
-      )
-      if (effectivePrice > 0 && effectivePrice < floor) {
-        const lossTiyin = floor - effectivePrice
-        warnings.push(
-          `⚠️ «${c.esfItem.name}» продаётся за ${tiyinToSumDisplay(effectivePrice)} ` +
-            `— ниже минимальной цены ${tiyinToSumDisplay(floor)} ` +
-            `(себестоимость +5%). Не хватает ${tiyinToSumDisplay(lossTiyin)}. ` +
-            `Замените товар через ручную сборку если возможно.`,
-        )
-      }
-    }
-  }
+  // себестоимости + 5%. См. collectBelowFloorWarnings.
+  warnings.push(...collectBelowFloorWarnings(matches))
 
   // canAutoFiscalize: все позиции linked-ms или passthrough, нет warnings, diff = 0.
   // linked-ms — явная связка от бухгалтера, ещё надёжнее чем passthrough.
@@ -420,12 +399,54 @@ export function recalculateAfterSwap(
     0,
   )
 
+  // Пересобираем warnings: убираем старые below-floor (от прошлого набора) и
+  // добавляем актуальные для нового набора. Без этого после swap на дорогой
+  // приход warning «ниже минимальной цены» не появился бы.
+  const nonFloorWarnings = result.warnings.filter(
+    (w) => !w.includes('ниже минимальной цены'),
+  )
+  const floorWarnings = collectBelowFloorWarnings(newPositions)
+
   return {
     ...result,
     positions: newPositions,
     matchedTotalTiyin: matchedTotal,
     totalDiffTiyin: matchedTotal - target_sum,
+    warnings: [...nonFloorWarnings, ...floorWarnings],
   }
+}
+
+/**
+ * Собрать warnings про позиции продаваемые ниже минимальной цены
+ * (себестоимость + 5%). Возникает при linked-ms / price-bucket где цена =
+ * pos.totalTiyin (клиент заплатил мало), а также после swap на более дорогой
+ * приход. Не блокирует — цену МС менять нельзя.
+ *
+ * Используется в `buildMatch` (классический проход) И `recalculateAfterSwap`
+ * (после ручного swap товара) — чтобы warning не пропал после замены.
+ */
+export function collectBelowFloorWarnings(matches: PositionMatch[]): string[] {
+  const out: string[] = []
+  for (const m of matches) {
+    for (const c of m.candidates) {
+      const effectivePrice = c.priceTiyin - c.discountTiyin
+      const floor = priceFloorTiyin(
+        c.esfItem.unit_price_tiyin,
+        c.esfItem.vat_percent,
+        c.quantity,
+      )
+      if (effectivePrice > 0 && effectivePrice < floor) {
+        const lossTiyin = floor - effectivePrice
+        out.push(
+          `⚠️ «${c.esfItem.name}» продаётся за ${tiyinToSumDisplay(effectivePrice)} ` +
+            `— ниже минимальной цены ${tiyinToSumDisplay(floor)} ` +
+            `(себестоимость +5%). Не хватает ${tiyinToSumDisplay(lossTiyin)}. ` +
+            `Замените товар через ручную сборку если возможно.`,
+        )
+      }
+    }
+  }
+  return out
 }
 
 const STRATEGY_RANK: Record<MatchStrategy, number> = {

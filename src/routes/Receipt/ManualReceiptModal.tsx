@@ -3,6 +3,7 @@ import { AlertCircle, Loader2, Minus, Plus, RotateCcw, Wand2, X } from 'lucide-r
 import { planHolistic } from '@/lib/matcher'
 import {
   costWithVat,
+  priceFloorTiyin,
   vatIncluded,
   type MatcherPool,
   type PoolItem,
@@ -399,6 +400,11 @@ function ManualReceiptModalBody(props: BodyProps) {
     const lines: HolisticLine[] = []
     let totalTiyin = 0
     let totalCostTiyin = 0
+    // Позиции ниже минимальной цены (себестоимость +5%) — для warning.
+    // Цена в manual = pi.sellingPrice (наценка ≥10% по дефолту, выше floor),
+    // поэтому срабатывает только при markup<5% (упрощёнка). Не блокируем —
+    // консистентно с правилом: цену не меняем, кассир решает сам.
+    const belowFloor: string[] = []
     selected.forEach((qty, id) => {
       const pi = poolById.get(id)
       if (!pi || qty <= 0) return
@@ -418,16 +424,38 @@ function ManualReceiptModalBody(props: BodyProps) {
         pi.item.vat_percent,
         quantityMilli,
       )
+      const floor = priceFloorTiyin(
+        pi.item.unit_price_tiyin,
+        pi.item.vat_percent,
+        quantityMilli,
+      )
+      if (priceTiyin > 0 && priceTiyin < floor) {
+        belowFloor.push(pi.item.name)
+      }
     })
     if (lines.length === 0) {
       toast.error('Добавьте хотя бы один товар', { duration: 4000 })
       return
     }
+    if (belowFloor.length > 0) {
+      toast.error(
+        `${belowFloor.length} ${belowFloor.length === 1 ? 'товар' : 'товара'} ` +
+          `ниже минимальной цены (себестоимость +5%): ${belowFloor[0]}` +
+          (belowFloor.length > 1 ? ` и др.` : '') +
+          `. Проверьте наценку магазина в Настройках.`,
+        { duration: 6000 },
+      )
+    }
     onDone({
       lines,
       totalTiyin,
       totalCostTiyin,
-      notes: ['Чек собран вручную кассиром'],
+      notes: [
+        'Чек собран вручную кассиром',
+        ...(belowFloor.length > 0
+          ? [`⚠️ ${belowFloor.length} позиций ниже минимальной наценки 5%`]
+          : []),
+      ],
     })
   }
 
