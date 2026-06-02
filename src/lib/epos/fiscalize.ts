@@ -239,36 +239,43 @@ export async function fiscalize(
   )
   // ────────────────────────────────────────────────────────────────────
 
+  // 3+4. Бэкенд читаем сразу — нужен и для pre-flight и для фискализации.
+  const fiscalBackend = (await getSetting(SettingKey.FiscalBackend)) ?? 'epos'
+
   await log.info('fiscalize', `Отправляю чек ${build.receipt.name} в EPOS`, {
     eposUrl,
+    fiscalBackend,
     items: effectiveLines.length,
     mode: build.mode,
     total: matchedTotal,
     remoteReserved: reserveResult.reservations?.length ?? 0,
   })
 
-  // 3. Pre-flight: версия Communicator в логи (best-effort, не ломает sale).
+  // 3. Pre-flight: версия Communicator в логи (только для epos бэкенда).
+  // При fiscaldrive пропускаем — FiscalDriveService не имеет метода status()
+  // и попытка стучаться на :3448 даёт ненужный warning в логах.
   let communicatorVersion: string | null = null
-  try {
-    const probe = new JsonRpcEposClient({ url: eposUrl })
-    const status = await probe.status()
-    communicatorVersion = JSON.stringify(status).slice(0, 200)
-    await log.info('fiscalize', `Communicator status: ${communicatorVersion}`, {
-      eposUrl,
-    })
-  } catch (verErr) {
-    const msg = verErr instanceof Error ? verErr.message : String(verErr)
-    await log.warn(
-      'fiscalize',
-      `Не удалось получить статус Communicator (продолжаем sale): ${msg}`,
-      { eposUrl },
-    )
+  if (fiscalBackend !== 'fiscaldrive') {
+    try {
+      const probe = new JsonRpcEposClient({ url: eposUrl })
+      const status = await probe.status()
+      communicatorVersion = JSON.stringify(status).slice(0, 200)
+      await log.info('fiscalize', `Communicator status: ${communicatorVersion}`, {
+        eposUrl,
+      })
+    } catch (verErr) {
+      const msg = verErr instanceof Error ? verErr.message : String(verErr)
+      await log.warn(
+        'fiscalize',
+        `Не удалось получить статус Communicator (продолжаем sale): ${msg}`,
+        { eposUrl },
+      )
+    }
   }
 
   // 4. Фискализация — выбираем бэкенд по настройке FiscalBackend:
   //   'epos'        → JSON-RPC на :3448/rpc/api (Api.SendSaleReceipt)
   //   'fiscaldrive' → REST на :3449 (GetTXID → RegisterTXID)
-  const fiscalBackend = (await getSetting(SettingKey.FiscalBackend)) ?? 'epos'
 
   let fiscal: FiscalReceiptInfo
   let requestJson: string
