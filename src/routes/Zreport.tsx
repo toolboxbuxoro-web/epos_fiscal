@@ -10,6 +10,7 @@ import { Button, Card, EmptyState, PageHeader } from '@/components/ui'
 import {
   JsonRpcEposClient,
   FiscalDriveClient,
+  mapFdsZReportToJsonRpc,
   type JsonRpcZReportInfo,
 } from '@/lib/epos'
 import { getSetting, SettingKey } from '@/lib/db'
@@ -58,47 +59,18 @@ export default function Zreport() {
   /**
    * Получить данные текущей смены через FiscalDriveService.
    *
-   * Используем FiscalMemory/Info — аккумуляторы (CashAccomulator / CardAccomulator)
-   * сбрасываются при закрытии Z-отчёта и отражают текущую открытую смену.
-   * ZReport/Info даёт только закрытые смены по индексу в памяти ФМ — для
-   * текущей открытой смены подходит только FiscalMemory.
+   * FDS хранит Z-отчёты в памяти НОВЕЙШИМ ПЕРВЫМ — index 0 = текущая смена.
+   * Подтверждено реальными данными магазина: ZReportsCount=77, index=76 вернул
+   * март (самый старый), значит index=0 = текущий (июнь).
+   *
+   * FiscalMemory/Info аккумуляторы — НЕ подходят: они накапливаются за всё
+   * время жизни ФМ (не сбрасываются при закрытии смены).
    */
   async function getZReportInfoFds(): Promise<JsonRpcZReportInfo> {
     const { client, factoryId } = await getFdsClient()
-    const [mem, fiscalInfo] = await Promise.all([
-      client.getFiscalMemoryInfo(factoryId),
-      client.getInfo(factoryId),
-    ])
-
-    // Логируем сырой ответ — чтобы понять реальную структуру FDS-ответа
-    await log.info('epos', 'FDS FiscalMemory/Info сырой ответ', {
-      mem: mem as unknown as Record<string, unknown>,
-      fiscalInfo: fiscalInfo as unknown as Record<string, unknown>,
-    })
-
-    const cashAcc = mem.CashAccomulator ?? { Sale: 0, Refund: 0 }
-    const cardAcc = mem.CardAccomulator ?? { Sale: 0, Refund: 0 }
-
-    return {
-      TerminalID: fiscalInfo.TerminalID,
-      Number: 0,
-      Count: 0,
-      // OpenTime: FiscalMemory/Info не возвращает время открытия смены напрямую.
-      // FirstUnacknowledgedReceiptTime — время первого чека смены (лучшее приближение).
-      OpenTime: mem.FirstUnacknowledgedReceiptTime ?? mem.LastOperationTime ?? '',
-      CloseTime: '', // пустая = смена открыта
-      FirstReceiptSeq: '',
-      LastReceiptSeq: String(mem.ReceiptSeq ?? ''),
-      TotalSaleCount: mem.ReceiptsCount ?? 0,
-      TotalSaleCash: cashAcc.Sale,
-      TotalSaleCard: cardAcc.Sale,
-      TotalSaleVAT: 0,
-      TotalRefundCount: 0,
-      TotalRefundCash: cashAcc.Refund,
-      TotalRefundCard: cardAcc.Refund,
-      TotalRefundVAT: 0,
-      AppletVersion: fiscalInfo.AppletVersion,
-    }
+    const raw = await client.getZReportInfo(factoryId, 0)
+    if (!raw) throw new Error('FiscalDriveService: нет данных о смене. Откройте смену.')
+    return mapFdsZReportToJsonRpc(raw)
   }
 
   async function refresh() {
