@@ -48,7 +48,7 @@ const BATCH_SIZE = 50
  * `src-tauri/tauri.conf.json::version`. Все 3 места обновляются при
  * каждом релизе вручную (package.json не импортируется в браузерный bundle).
  */
-const APP_VERSION = '0.11.8'
+const APP_VERSION = '0.11.9'
 
 let started = false
 let timer: ReturnType<typeof setInterval> | null = null
