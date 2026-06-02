@@ -61,6 +61,14 @@ import {
   type JsonRpcRefundInfo,
   type JsonRpcFiscalAnswer,
 } from './jsonrpc-client'
+import {
+  FiscalDriveClient,
+  OKEI_PIECE_DEFAULT,
+  mapFdsFiscalAnswer,
+  type FiscalDriveItem,
+  type FiscalDriveReceipt,
+  type FiscalDriveRefundInfo,
+} from './fiscal-drive-client'
 import type { FiscalReceiptInfo } from './types'
 
 /**
@@ -263,83 +271,78 @@ export async function processRefund(opts: ProcessRefundOptions): Promise<Process
     return { fiscal: fakeFiscal, refundDbId: 0 }
   }
 
-  // 5. Билдим refund payload (Items копируем из request_json оригинала).
-  //
-  // ⚠️ КРИТИЧНО для привязки к оригиналу в ОФД (иначе «бириктирилмаган»):
-  //
-  //   1. Имя поля — `refundInfo` (camelCase). Вся дока E-POS (mobile-api +
-  //      universal-communicator) показывает именно camelCase. PascalCase
-  //      `RefundInfo` Communicator ИГНОРИРУЕТ → refund уходит без привязки.
-  //      Шлём ОБА варианта (как с `spic` — belt & suspenders, лишний ключ
-  //      Communicator молча проигнорирует).
-  //
-  //   2. `dateTime` — строго 14 цифр YYYYMMDDHHMMSS без разделителей
-  //      (universal-communicator.md стр.111). `fiscal_datetime` оригинала
-  //      может быть «2026-05-16 09:54:18» (Go-style) или ISO — нормализуем.
-  const refundInfo: JsonRpcRefundInfo = {
-    terminalId: original.fr.terminal_id,
-    receiptSeq: original.fr.receipt_seq,
-    dateTime: toRefundDateTime(original.fr.fiscal_datetime),
-    fiscalSign: original.fr.fiscal_sign,
-  }
+  // 5. Отправляем возврат в ФМ — EPOS JSON-RPC или FiscalDriveService.
+  const fiscalBackend = (await getSetting(SettingKey.FiscalBackend)) ?? 'epos'
+  let fiscal: FiscalReceiptInfo
+  let requestJson: string
 
-  // JsonRpcReceipt типизирован с `RefundInfo`, но шлём ещё и `refundInfo`
-  // (camelCase) — основной рабочий вариант по доке. Каст через unknown
-  // т.к. в интерфейсе нет lowercase-ключа (он намеренный alias на проводе).
-  const refundReceipt = {
-    Time: formatGoTime(new Date()),
-    // Items — либо все из оригинала (full refund), либо выбранные с
-    // пересчитанным Amount/Price/VAT (partial refund). Построены в шаге 6.
-    Items: refundItems,
-    ReceivedCash: refundCash,
-    ReceivedCard: refundCard,
-    RefundInfo: refundInfo, // PascalCase (на всякий)
-    refundInfo, // camelCase — основной по доке E-POS
-  } as unknown as JsonRpcReceipt
+  if (fiscalBackend === 'fiscaldrive') {
+    const r = await sendRefundFiscalDrive(original, refundItems, refundCash, refundCard)
+    fiscal = r.fiscal
+    requestJson = r.requestJson
+  } else {
+    // ⚠️ КРИТИЧНО для привязки к оригиналу в ОФД (иначе «бириктирилмаган»):
+    //   1. `refundInfo` camelCase — основной по доке E-POS. PascalCase игнорируется.
+    //   2. `dateTime` — строго 14 цифр YYYYMMDDHHMMSS без разделителей.
+    const refundInfo: JsonRpcRefundInfo = {
+      terminalId: original.fr.terminal_id,
+      receiptSeq: original.fr.receipt_seq,
+      dateTime: toRefundDateTime(original.fr.fiscal_datetime),
+      fiscalSign: original.fr.fiscal_sign,
+    }
+    const refundReceipt = {
+      Time: formatGoTime(new Date()),
+      Items: refundItems,
+      ReceivedCash: refundCash,
+      ReceivedCard: refundCard,
+      RefundInfo: refundInfo,
+      refundInfo,
+    } as unknown as JsonRpcReceipt
 
-  const eposUrl =
-    (await getSetting(SettingKey.EposCommunicatorUrl)) ??
-    'http://localhost:3448/rpc/api'
-  const client = new JsonRpcEposClient({ url: eposUrl })
-  const requestJson = JSON.stringify({
-    jsonrpc: '2.0',
-    method: 'Api.SendRefundReceipt',
-    params: { Receipt: refundReceipt },
-  })
-
-  await log.info('refund', 'Отправляю Api.SendRefundReceipt', {
-    url: eposUrl,
-    originalFiscalId: opts.originalFiscalId,
-    refundInfo,
-    refundCash,
-    refundCard,
-    itemsCount: refundReceipt.Items.length,
-  })
-
-  let answer: JsonRpcFiscalAnswer
-  try {
-    answer = await client.sendRefundReceipt(refundReceipt)
-  } catch (e) {
-    const eposError = e as { code?: number; data?: unknown; message?: string }
-    await log.error('refund', `❌ Refund НЕ пробился: ${eposError.message ?? e}`, {
-      url: eposUrl,
-      jsonRpcCode: eposError.code,
-      jsonRpcData: eposError.data,
-      request: refundReceipt,
+    const eposUrl =
+      (await getSetting(SettingKey.EposCommunicatorUrl)) ??
+      'http://localhost:3448/rpc/api'
+    const client = new JsonRpcEposClient({ url: eposUrl })
+    requestJson = JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'Api.SendRefundReceipt',
+      params: { Receipt: refundReceipt },
     })
-    throw e
-  }
 
-  const fiscal: FiscalReceiptInfo = {
-    TerminalID: answer.TerminalID,
-    ReceiptSeq: answer.ReceiptSeq,
-    DateTime:
-      typeof answer.DateTime === 'string'
-        ? answer.DateTime
-        : new Date(answer.DateTime).toISOString(),
-    FiscalSign: answer.FiscalSign,
-    AppletVersion: answer.AppletVersion,
-    QRCodeURL: answer.QRCodeURL,
+    await log.info('refund', 'Отправляю Api.SendRefundReceipt', {
+      url: eposUrl,
+      originalFiscalId: opts.originalFiscalId,
+      refundInfo,
+      refundCash,
+      refundCard,
+      itemsCount: refundReceipt.Items.length,
+    })
+
+    let answer: JsonRpcFiscalAnswer
+    try {
+      answer = await client.sendRefundReceipt(refundReceipt)
+    } catch (e) {
+      const eposError = e as { code?: number; data?: unknown; message?: string }
+      await log.error('refund', `❌ Refund НЕ пробился: ${eposError.message ?? e}`, {
+        url: eposUrl,
+        jsonRpcCode: eposError.code,
+        jsonRpcData: eposError.data,
+        request: refundReceipt,
+      })
+      throw e
+    }
+
+    fiscal = {
+      TerminalID: answer.TerminalID,
+      ReceiptSeq: answer.ReceiptSeq,
+      DateTime:
+        typeof answer.DateTime === 'string'
+          ? answer.DateTime
+          : new Date(answer.DateTime).toISOString(),
+      FiscalSign: answer.FiscalSign,
+      AppletVersion: answer.AppletVersion,
+      QRCodeURL: answer.QRCodeURL,
+    }
   }
 
   await log.info('refund', `Refund фискализирован: ${fiscal.FiscalSign}`, {
@@ -463,6 +466,98 @@ export async function processRefund(opts: ProcessRefundOptions): Promise<Process
   )
 
   return { fiscal, refundDbId }
+}
+
+// ── FiscalDriveService — возврат ──────────────────────────────────────────────
+
+/**
+ * Отправить возврат через FiscalDriveService (двухшаговый GetTXID→RegisterTXID,
+ * Operation=1). Конвертирует JsonRpcItem[] → FiscalDriveItem[] на лету.
+ */
+async function sendRefundFiscalDrive(
+  original: OriginalContext,
+  refundItems: JsonRpcItem[],
+  refundCash: number,
+  refundCard: number,
+): Promise<{ fiscal: FiscalReceiptInfo; requestJson: string }> {
+  const baseUrl =
+    (await getSetting(SettingKey.FiscalDriveBaseUrl)) ?? 'http://localhost:3449'
+  const factoryId = await getSetting(SettingKey.FiscalDriveFactoryId)
+  if (!factoryId) {
+    throw new Error(
+      'FiscalDriveService: FactoryID не задан. ' +
+        'Откройте Настройки → «FactoryID фискального модуля».',
+    )
+  }
+
+  const items: FiscalDriveItem[] = refundItems.map((it) => ({
+    Name: it.Name,
+    Barcode: it.Barcode ?? '0',
+    SPIC: it.spic,
+    Units: OKEI_PIECE_DEFAULT,
+    PackageCode: it.packageCode || '',
+    OwnerType: (it.OwnerType ?? 0) as 0 | 1 | 2,
+    Amount: it.Amount,
+    Price: it.Price,
+    Discount: it.Discount ?? 0,
+    Other: 0,
+    VATPercent: it.VATPercent ?? 0,
+    VAT: it.VAT ?? 0,
+  }))
+
+  const refundInfo: FiscalDriveRefundInfo = {
+    TerminalID: original.fr.terminal_id,
+    // ReceiptSeq: docs FDS ожидают uint64 (число). Парсим из строки БД.
+    ReceiptSeq: parseInt(original.fr.receipt_seq, 10) || original.fr.receipt_seq,
+    DateTime: toRefundDateTime(original.fr.fiscal_datetime),
+    FiscalSign: original.fr.fiscal_sign,
+  }
+
+  const receipt: FiscalDriveReceipt = {
+    Time: formatGoTime(new Date()),
+    ReceivedCash: refundCash,
+    ReceivedCard: refundCard,
+    Type: 0,
+    Operation: 1, // возврат
+    Items: items,
+    RefundInfo: refundInfo,
+  }
+
+  const requestJson = JSON.stringify({ factoryId, receipt })
+
+  await log.info('refund', 'Отправляю FDS GetTXID (возврат)', {
+    baseUrl,
+    factoryId,
+    refundInfo,
+    refundCash,
+    refundCard,
+    itemsCount: items.length,
+  })
+
+  const client = new FiscalDriveClient({ baseUrl })
+  let txid: number
+  try {
+    txid = await client.getReceiptTXID(factoryId, receipt)
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    await log.error('refund', `FDS GetTXID (возврат) ошибка: ${msg}`, {
+      factoryId, receipt,
+    })
+    throw e
+  }
+
+  await log.info('refund', `FDS GetTXID (возврат) OK, TXID=${txid}`)
+
+  let answer
+  try {
+    answer = await client.registerReceiptTXID(factoryId, txid)
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    await log.error('refund', `FDS RegisterTXID (возврат, TXID=${txid}) ошибка: ${msg}`)
+    throw e
+  }
+
+  return { fiscal: mapFdsFiscalAnswer(answer), requestJson }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -666,15 +761,47 @@ async function loadOriginal(fiscalId: number): Promise<OriginalContext> {
 
 function parseRequest(requestJson: string): JsonRpcReceipt {
   try {
-    const parsed = JSON.parse(requestJson) as {
-      jsonrpc: string
-      method: string
-      params: { Receipt: JsonRpcReceipt }
+    const parsed = JSON.parse(requestJson) as Record<string, unknown>
+
+    // EPOS JSON-RPC format: { jsonrpc, method, params: { Receipt: {...} } }
+    const eposReceipt = (parsed.params as { Receipt?: JsonRpcReceipt } | undefined)?.Receipt
+    if (eposReceipt) return eposReceipt
+
+    // FDS format: { factoryId, receipt: { Items, ReceivedCash, ... } }
+    // Конвертируем FiscalDriveItem[] → JsonRpcItem[] чтобы единый код дальше
+    // работал без изменений (buildFullRefundItems, buildPartialRefundItems).
+    const fdsReceipt = parsed.receipt as {
+      Time: string
+      ReceivedCash: number
+      ReceivedCard: number
+      Items: Array<{
+        Name: string; SPIC: string; Amount: number; Price: number
+        Discount: number; VAT: number; VATPercent: number
+        Barcode: string; PackageCode: string; OwnerType: number
+      }>
+    } | undefined
+    if (fdsReceipt?.Items) {
+      return {
+        Time: fdsReceipt.Time,
+        ReceivedCash: fdsReceipt.ReceivedCash,
+        ReceivedCard: fdsReceipt.ReceivedCard,
+        Items: fdsReceipt.Items.map((it) => ({
+          Name: it.Name,
+          spic: it.SPIC,
+          Amount: it.Amount,
+          Price: it.Price,
+          Discount: it.Discount,
+          VAT: it.VAT,
+          VATPercent: it.VATPercent,
+          Barcode: it.Barcode,
+          packageCode: it.PackageCode,
+          OwnerType: it.OwnerType as 0 | 1 | 2,
+          Other: 0,
+        })),
+      }
     }
-    if (!parsed.params?.Receipt) {
-      throw new Error('В request_json нет params.Receipt')
-    }
-    return parsed.params.Receipt
+
+    throw new Error('В request_json нет params.Receipt (EPOS) и нет receipt.Items (FDS)')
   } catch (e) {
     throw new Error(
       `Не удалось распарсить request_json оригинала: ${e instanceof Error ? e.message : String(e)}`,
@@ -1024,14 +1151,8 @@ export async function getDefaultRefundAmounts(
   )
   if (!rows[0]) return { cash: 0, card: 0, qr: 0 }
   try {
-    const parsed = JSON.parse(rows[0].request_json) as {
-      params: { Receipt: JsonRpcReceipt }
-    }
-    return {
-      cash: parsed.params.Receipt.ReceivedCash,
-      card: parsed.params.Receipt.ReceivedCard,
-      qr: 0,
-    }
+    const receipt = parseRequest(rows[0].request_json)
+    return { cash: receipt.ReceivedCash, card: receipt.ReceivedCard, qr: 0 }
   } catch {
     return { cash: 0, card: 0, qr: 0 }
   }

@@ -812,73 +812,71 @@ export default function Settings() {
         </Field>
       </Section>
 
-      <Section title="EPOS Communicator">
-        <Field label="URL">
-          <Input
-            value={form.eposCommunicatorUrl}
-            onChange={(e) => setField('eposCommunicatorUrl', e.target.value)}
-            placeholder="http://localhost:3448/rpc/api"
-          />
-          <div className="mt-1 text-xs text-ink-muted">
-            JSON-RPC API: <code className="bg-surface-hover px-1 rounded">http://localhost:3448/rpc/api</code>
-            <br />
-            <span className="text-ink-muted/80">Подтверждён рабочим в 0.10.12 — корректно передаёт ИКПУ в ОФД, кешбэк начисляется.</span>
-          </div>
-          {/3449/.test(form.eposCommunicatorUrl) && (
-            <div className="mt-1 text-xs text-amber-600 font-medium">
-              ⚠️ Это адрес FiscalDriveService (порт 3449), а не EPOS Communicator. Используйте{' '}
-              <code className="bg-surface-hover px-1 rounded">http://localhost:3448/rpc/api</code>.
-            </div>
-          )}
-        </Field>
-        <Field label="Ширина чековой ленты">
-          <Select
-            value={form.printerSize}
-            onChange={(e) => setField('printerSize', e.target.value)}
-          >
-            <option value="58">58 мм</option>
-            <option value="80">80 мм</option>
-          </Select>
-        </Field>
-        <div className="col-span-1 md:col-span-2 flex items-center gap-3">
-          <Button variant="secondary" size="sm" onClick={testEpos}>
-            Проверить подключение
-          </Button>
-          <span className="text-xs text-ink-muted">{eposTest}</span>
-        </div>
-      </Section>
-
-      <Section title="FiscalDriveService">
-        <Field label="URL">
-          <Input
-            value={form.fiscalDriveBaseUrl}
-            onChange={(e) => setField('fiscalDriveBaseUrl', e.target.value)}
-            placeholder="http://localhost:3449"
-          />
-          <div className="mt-1 text-xs text-ink-muted">
-            REST API FiscalDriveService. По умолчанию <code className="bg-surface-hover px-1 rounded">http://localhost:3449</code>.
-          </div>
-        </Field>
-        <Field label="FactoryID (серийник ФМ)">
-          <div className="flex gap-2">
+      {form.fiscalBackend === 'epos' && (
+        <Section title="EPOS Communicator">
+          <Field label="URL">
             <Input
-              value={form.fiscalDriveFactoryId}
-              onChange={(e) => setField('fiscalDriveFactoryId', e.target.value)}
-              placeholder="LG420230639660"
-              className="flex-1"
+              value={form.eposCommunicatorUrl}
+              onChange={(e) => setField('eposCommunicatorUrl', e.target.value)}
+              placeholder="http://localhost:3448/rpc/api"
             />
-            <Button variant="secondary" size="sm" onClick={detectFdsFactoryId}>
-              Авто
+            <div className="mt-1 text-xs text-ink-muted">
+              JSON-RPC API: <code className="bg-surface-hover px-1 rounded">http://localhost:3448/rpc/api</code>
+              <br />
+              <span className="text-ink-muted/80">Подтверждён рабочим в 0.10.12 — корректно передаёт ИКПУ в ОФД, кешбэк начисляется.</span>
+            </div>
+          </Field>
+          <Field label="Ширина чековой ленты">
+            <Select
+              value={form.printerSize}
+              onChange={(e) => setField('printerSize', e.target.value)}
+            >
+              <option value="58">58 мм</option>
+              <option value="80">80 мм</option>
+            </Select>
+          </Field>
+          <div className="col-span-1 md:col-span-2 flex items-center gap-3">
+            <Button variant="secondary" size="sm" onClick={testEpos}>
+              Проверить подключение
             </Button>
+            <span className="text-xs text-ink-muted">{eposTest}</span>
           </div>
-          <div className="mt-1 text-xs text-ink-muted">
-            Серийный номер USB-фискального модуля. Нажми «Авто» чтобы получить из /FiscalDrive/List.
-          </div>
-        </Field>
-        {fdsDetectMsg && (
-          <div className="col-span-1 md:col-span-2 text-xs text-ink-muted">{fdsDetectMsg}</div>
-        )}
-      </Section>
+        </Section>
+      )}
+
+      {form.fiscalBackend === 'fiscaldrive' && (
+        <Section title="FiscalDriveService">
+          <Field label="URL">
+            <Input
+              value={form.fiscalDriveBaseUrl}
+              onChange={(e) => setField('fiscalDriveBaseUrl', e.target.value)}
+              placeholder="http://localhost:3449"
+            />
+            <div className="mt-1 text-xs text-ink-muted">
+              REST API FiscalDriveService. По умолчанию <code className="bg-surface-hover px-1 rounded">http://localhost:3449</code>.
+            </div>
+          </Field>
+          <Field label="FactoryID (серийник ФМ)">
+            <div className="flex gap-2">
+              <Input
+                value={form.fiscalDriveFactoryId}
+                onChange={(e) => setField('fiscalDriveFactoryId', e.target.value)}
+                placeholder="серийник с корпуса USB-ключа"
+                className="flex-1"
+              />
+              <Button variant="secondary" size="sm" onClick={detectFdsFactoryId}>
+                Авто
+              </Button>
+            </div>
+            <div className="mt-1 text-xs text-ink-muted">
+              Серийный номер USB-фискального модуля. Нажми «Авто» чтобы получить из /FiscalDrive/List.
+            </div>
+          </Field>
+          {fdsDetectMsg && (
+            <div className="col-span-1 md:col-span-2 text-xs text-ink-muted">{fdsDetectMsg}</div>
+          )}
+        </Section>
+      )}
 
       <Section title="Реквизиты компании">
         <Field label="Название (как в чеке)">
