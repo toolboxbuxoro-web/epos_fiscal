@@ -115,8 +115,10 @@ describe('listDrives', () => {
     expect(drives).toHaveLength(1)
     expect(drives[0]!.FactoryID).toBe(FACTORY_ID)
     expect(drives[0]!.AppletVersion).toBe('0400')
-    // GET /FiscalDrive/List
-    expect(fetch.mock.calls[0]![0]).toContain('/FiscalDrive/List')
+    const [url, opts] = fetch.mock.calls[0] as [string, RequestInit]
+    expect(url).toContain('/FiscalDrive/List')
+    // FDS использует POST для всех эндпоинтов
+    expect(opts.method).toBe('POST')
   })
 
   it('пустой список — нет ФМ', async () => {
@@ -169,11 +171,12 @@ describe('getZReportInfo', () => {
     expect(info!.CloseTime).toBe('')
   })
 
-  it('index передаётся как query param', async () => {
+  it('index передаётся как query param, метод POST', async () => {
     const { client, fetch } = makeClient([{ status: 200, body: Z_REPORT_RAW }])
     await client.getZReportInfo(FACTORY_ID, 3)
-    const [url] = fetch.mock.calls[0] as [string, RequestInit]
+    const [url, opts] = fetch.mock.calls[0] as [string, RequestInit]
     expect(url).toContain('Index=3')
+    expect(opts.method).toBe('POST')
   })
 
   it('HTTP 404 → null (смена не найдена)', async () => {

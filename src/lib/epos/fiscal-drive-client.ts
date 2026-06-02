@@ -204,12 +204,12 @@ export class FiscalDriveClient {
 
   /** Список подключённых ФМ-карт. FactoryID первой = актуальный серийник. */
   listDrives(): Promise<FiscalDriveDriveInfo[]> {
-    return this.request('GET', '/FiscalDrive/List')
+    return this.request('POST', '/FiscalDrive/List')
   }
 
   /** Состояние ФМ: Locked, TerminalID, версия апплета. */
   getInfo(factoryId: string): Promise<FiscalDriveInfo> {
-    return this.request('GET', `/FiscalDrive/Info/${enc(factoryId)}`)
+    return this.request('POST', `/FiscalDrive/Info/${enc(factoryId)}`)
   }
 
   /** Открыть смену. */
@@ -235,7 +235,7 @@ export class FiscalDriveClient {
   async getZReportInfo(factoryId: string, index = 0): Promise<FiscalDriveZReportRaw | null> {
     try {
       return await this.request<FiscalDriveZReportRaw>(
-        'GET',
+        'POST',
         `/FiscalDrive/ZReport/Info/${enc(factoryId)}?Index=${index}`,
       )
     } catch (e) {

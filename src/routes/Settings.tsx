@@ -824,6 +824,12 @@ export default function Settings() {
             <br />
             <span className="text-ink-muted/80">Подтверждён рабочим в 0.10.12 — корректно передаёт ИКПУ в ОФД, кешбэк начисляется.</span>
           </div>
+          {/3449/.test(form.eposCommunicatorUrl) && (
+            <div className="mt-1 text-xs text-amber-600 font-medium">
+              ⚠️ Это адрес FiscalDriveService (порт 3449), а не EPOS Communicator. Используйте{' '}
+              <code className="bg-surface-hover px-1 rounded">http://localhost:3448/rpc/api</code>.
+            </div>
+          )}
         </Field>
         <Field label="Ширина чековой ленты">
           <Select
