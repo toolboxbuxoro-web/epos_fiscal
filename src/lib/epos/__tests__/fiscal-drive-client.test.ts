@@ -492,33 +492,27 @@ describe('Pre-flight Communicator пропускается при fiscaldrive', 
 
   it('null/undefined → fallback epos → pre-flight запускается', () => {
     // getSetting возвращает null если ключ не задан → default 'epos'
-    const backend = (null ?? 'epos') as string
+    const rawSetting: string | null = null
+    const backend = rawSetting ?? 'epos'
     expect(shouldRunPreflight(backend)).toBe(true)
   })
 
   it('при fiscaldrive JsonRpcEposClient на :3448 не вызывается', async () => {
-    // Симулируем: если бы pre-flight запустился при fiscaldrive,
-    // он попытался бы дёрнуть status() на JsonRpcEposClient.
-    // Проверяем что при правильном условии fetch не вызывается.
     const mockStatus = vi.fn()
-
-    const fiscalBackend = 'fiscaldrive'
+    // Используем string чтобы избежать TS literal-type comparison warning
+    const fiscalBackend: string = 'fiscaldrive'
     if (fiscalBackend !== 'fiscaldrive') {
-      // Этот блок НЕ должен выполниться
       mockStatus()
     }
-
     expect(mockStatus).not.toHaveBeenCalled()
   })
 
   it('при epos JsonRpcEposClient status вызывается', () => {
     const mockStatus = vi.fn()
-
-    const fiscalBackend = 'epos'
+    const fiscalBackend: string = 'epos'
     if (fiscalBackend !== 'fiscaldrive') {
       mockStatus()
     }
-
     expect(mockStatus).toHaveBeenCalledOnce()
   })
 })
