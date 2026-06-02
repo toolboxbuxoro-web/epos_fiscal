@@ -40,6 +40,7 @@ export default function Zreport() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [backend, setBackend] = useState<'epos' | 'fiscaldrive'>('epos')
 
   async function getEposClient() {
     const url =
@@ -76,7 +77,8 @@ export default function Zreport() {
   async function refresh() {
     setLoading(true)
     setError(null)
-    const backend = (await getSetting(SettingKey.FiscalBackend)) ?? 'epos'
+    const backend = ((await getSetting(SettingKey.FiscalBackend)) ?? 'epos') as 'epos' | 'fiscaldrive'
+    setBackend(backend)
 
     if (backend === 'fiscaldrive') {
       try {
@@ -325,7 +327,7 @@ export default function Zreport() {
     <div className="space-y-4">
       <PageHeader
         title="Смена ККМ"
-        subtitle="Текущий X/Z-отчёт от EPOS Communicator"
+        subtitle={backend === 'fiscaldrive' ? 'Текущий X/Z-отчёт от FiscalDriveService' : 'Текущий X/Z-отчёт от EPOS Communicator'}
         action={
           <Button
             variant="ghost"
