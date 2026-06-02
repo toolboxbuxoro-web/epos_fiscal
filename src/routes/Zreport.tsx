@@ -70,6 +70,12 @@ export default function Zreport() {
       client.getInfo(factoryId),
     ])
 
+    // Логируем сырой ответ — чтобы понять реальную структуру FDS-ответа
+    await log.info('epos', 'FDS FiscalMemory/Info сырой ответ', {
+      mem: mem as unknown as Record<string, unknown>,
+      fiscalInfo: fiscalInfo as unknown as Record<string, unknown>,
+    })
+
     const cashAcc = mem.CashAccomulator ?? { Sale: 0, Refund: 0 }
     const cardAcc = mem.CardAccomulator ?? { Sale: 0, Refund: 0 }
 
