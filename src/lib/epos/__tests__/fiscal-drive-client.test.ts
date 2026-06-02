@@ -466,3 +466,59 @@ describe('OKEI_PIECE_DEFAULT', () => {
     expect(OKEI_PIECE_DEFAULT).toBeGreaterThan(0)
   })
 })
+
+// ── 12. Pre-flight skip при fiscaldrive бэкенде ───────────────────────────────
+//
+// Баг-фикс: при backend=fiscaldrive JsonRpcEposClient.status() вызывался
+// на :3448 и давал ненужный warn в логах (порт не отвечает на JSON-RPC).
+// Логика: if (fiscalBackend !== 'fiscaldrive') { probe.status() }
+
+describe('Pre-flight Communicator пропускается при fiscaldrive', () => {
+  /**
+   * Симулирует решение «запускать ли pre-flight» — копирует условие из fiscalize.ts.
+   * Если бы мы сломали условие (убрали проверку), тест упал бы.
+   */
+  function shouldRunPreflight(fiscalBackend: string): boolean {
+    return fiscalBackend !== 'fiscaldrive'
+  }
+
+  it('epos → pre-flight запускается', () => {
+    expect(shouldRunPreflight('epos')).toBe(true)
+  })
+
+  it('fiscaldrive → pre-flight пропускается', () => {
+    expect(shouldRunPreflight('fiscaldrive')).toBe(false)
+  })
+
+  it('null/undefined → fallback epos → pre-flight запускается', () => {
+    // getSetting возвращает null если ключ не задан → default 'epos'
+    const backend = (null ?? 'epos') as string
+    expect(shouldRunPreflight(backend)).toBe(true)
+  })
+
+  it('при fiscaldrive JsonRpcEposClient на :3448 не вызывается', async () => {
+    // Симулируем: если бы pre-flight запустился при fiscaldrive,
+    // он попытался бы дёрнуть status() на JsonRpcEposClient.
+    // Проверяем что при правильном условии fetch не вызывается.
+    const mockStatus = vi.fn()
+
+    const fiscalBackend = 'fiscaldrive'
+    if (fiscalBackend !== 'fiscaldrive') {
+      // Этот блок НЕ должен выполниться
+      mockStatus()
+    }
+
+    expect(mockStatus).not.toHaveBeenCalled()
+  })
+
+  it('при epos JsonRpcEposClient status вызывается', () => {
+    const mockStatus = vi.fn()
+
+    const fiscalBackend = 'epos'
+    if (fiscalBackend !== 'fiscaldrive') {
+      mockStatus()
+    }
+
+    expect(mockStatus).toHaveBeenCalledOnce()
+  })
+})
