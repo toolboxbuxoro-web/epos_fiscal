@@ -7,7 +7,12 @@ import {
   RefreshCw,
 } from 'lucide-react'
 import { Button, Card, EmptyState, PageHeader } from '@/components/ui'
-import { JsonRpcEposClient, type JsonRpcZReportInfo } from '@/lib/epos'
+import {
+  JsonRpcEposClient,
+  FiscalDriveClient,
+  mapFdsZReportToJsonRpc,
+  type JsonRpcZReportInfo,
+} from '@/lib/epos'
 import { getSetting, SettingKey } from '@/lib/db'
 import { tiyinToSumDisplay } from '@/lib/format'
 import { log } from '@/lib/log'
@@ -36,23 +41,63 @@ export default function Zreport() {
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
 
-  async function getClient() {
+  async function getEposClient() {
     const url =
       (await getSetting(SettingKey.EposCommunicatorUrl)) ??
       'http://localhost:3448/rpc/api'
     return new JsonRpcEposClient({ url })
   }
 
+  async function getFdsClient() {
+    const baseUrl =
+      (await getSetting(SettingKey.FiscalDriveBaseUrl)) ?? 'http://localhost:3449'
+    const factoryId = (await getSetting(SettingKey.FiscalDriveFactoryId)) ?? ''
+    return { client: new FiscalDriveClient({ baseUrl }), factoryId }
+  }
+
+  /**
+   * Получить данные текущей смены через FiscalDriveService.
+   *
+   * Текущая открытая смена находится по индексу = ZReportsCount (количество
+   * уже закрытых смен). Если открытой нет — берём последнюю закрытую (N-1).
+   */
+  async function getZReportInfoFds(): Promise<JsonRpcZReportInfo> {
+    const { client, factoryId } = await getFdsClient()
+    const mem = await client.getFiscalMemoryInfo(factoryId)
+    const n = mem.ZReportsCount
+    // Сначала пробуем текущую открытую смену (индекс = числу закрытых)
+    let raw = await client.getZReportInfo(factoryId, n)
+    // Если нет (смена ещё не открывалась) — берём последнюю закрытую
+    if (!raw && n > 0) raw = await client.getZReportInfo(factoryId, n - 1)
+    if (!raw) throw new Error('FiscalDriveService: нет данных о смене. Откройте смену.')
+    return mapFdsZReportToJsonRpc(raw)
+  }
+
   async function refresh() {
     setLoading(true)
     setError(null)
-    // Retry до 3 раз — Communicator иногда занят отправкой чека в ОФД и
-    // отвечает с timeout. Если упасть с первой попытки → юзер увидит
-    // «не открыта» и жмёт Open, что только ухудшит ситуацию.
+    const backend = (await getSetting(SettingKey.FiscalBackend)) ?? 'epos'
+
+    if (backend === 'fiscaldrive') {
+      try {
+        const data = await getZReportInfoFds()
+        setInfo(data)
+        setError(null)
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e))
+      } finally {
+        setLoading(false)
+      }
+      return
+    }
+
+    // EPOS Communicator — retry до 3 раз (Communicator иногда занят отправкой
+    // чека в ОФД и отвечает timeout; падение с первой попытки → юзер видит
+    // «не открыта» и жмёт Open, что только ухудшит ситуацию).
     let lastErr: unknown = null
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        const client = await getClient()
+        const client = await getEposClient()
         const data = await client.getZReportInfo()
         setInfo(data)
         setError(null)
@@ -61,7 +106,6 @@ export default function Zreport() {
       } catch (e) {
         lastErr = e
         if (attempt < 3) {
-          // Экспоненциальный back-off: 300ms → 900ms
           await new Promise((r) => setTimeout(r, 300 * attempt * attempt))
         }
       }
@@ -79,15 +123,25 @@ export default function Zreport() {
   async function openShift() {
     setBusy(true)
     setError(null)
+    const backend = (await getSetting(SettingKey.FiscalBackend)) ?? 'epos'
     try {
-      const client = await getClient()
+      if (backend === 'fiscaldrive') {
+        // Защита от двойного открытия через FDS
+        const existing = await getZReportInfoFds().catch(() => null)
+        if (existing && existing.CloseTime === '') {
+          await log.info('epos', 'FDS: смена уже открыта — пропускаю openZReport')
+          setInfo(existing)
+          return
+        }
+        const { client, factoryId } = await getFdsClient()
+        await client.openZReport(factoryId)
+        await log.info('epos', 'FDS: смена открыта')
+        await refresh()
+        return
+      }
 
-      // Защита от двойного открытия: перед `openZReport` проверяем что
-      // смена реально закрыта. Если Communicator сейчас отдаёт открытую
-      // смену — просто обновляем UI и выходим. Это решает кейс когда
-      // первый getZReportInfo упал по timeout, UI показал «не открыта»,
-      // юзер нажал «Открыть» → Communicator справедливо ругается что
-      // смена и так открыта (с пустым сообщением).
+      // EPOS Communicator — защита от двойного открытия
+      const client = await getEposClient()
       const existing = await client.getZReportInfo()
       if (existing && existing.CloseTime === '') {
         await log.info(
@@ -97,7 +151,6 @@ export default function Zreport() {
         setInfo(existing)
         return
       }
-
       await client.openZReport()
       await log.info('epos', 'Смена открыта (X-отчёт стартовал)')
       await refresh()
@@ -130,11 +183,23 @@ export default function Zreport() {
 
     setBusy(true)
     setError(null)
+    const backend = (await getSetting(SettingKey.FiscalBackend)) ?? 'epos'
     try {
-      // Сохраняем info ДО закрытия (после Communicator может вернуть пустой
+      // Сохраняем info ДО закрытия (после ФМ может вернуть пустой
       // или другую смену) — нам нужно для печати Z-отчёта с теми же тоталами.
       const closingInfo = info
-      const client = await getClient()
+      if (backend === 'fiscaldrive') {
+        const { client, factoryId } = await getFdsClient()
+        await client.closeZReport(factoryId)
+        await log.info('epos', 'FDS: смена закрыта (Z-отчёт)')
+        try { await printReport(true) } catch (printErr) {
+          const msg = printErr instanceof Error ? printErr.message : String(printErr)
+          await log.warn('epos', `Z-отчёт не распечатался: ${msg}`)
+        }
+        await refresh()
+        return
+      }
+      const client = await getEposClient()
       await client.closeZReport()
       await log.info('epos', `Смена ${closingInfo.Number} закрыта (Z-отчёт)`, {
         zReportNumber: closingInfo.Number,

@@ -146,6 +146,16 @@ export interface FiscalDriveZReportRaw {
   LastReceiptSeq: number | string
 }
 
+/** Ответ /FiscalDrive/FiscalMemory/Info — нужен для нахождения индекса текущей смены. */
+export interface FiscalDriveMemoryInfo {
+  TerminalID: string
+  /** Количество закрытых Z-отчётов. Текущая открытая смена — индекс ZReportsCount. */
+  ZReportsCount: number
+  ReceiptsCount: number
+  ReceiptSeq: number
+  LastOperationTime: string
+}
+
 // ── Клиент ─────────────────────────────────────────────────────────────────
 
 export interface FiscalDriveClientOptions {
@@ -220,6 +230,11 @@ export class FiscalDriveClient {
   /** Закрыть смену. */
   closeZReport(factoryId: string): Promise<'OK'> {
     return this.request('POST', `/FiscalDrive/ZReport/Close/${enc(factoryId)}`)
+  }
+
+  /** Информация о фискальной памяти ФМ — ZReportsCount для поиска текущей смены. */
+  getFiscalMemoryInfo(factoryId: string): Promise<FiscalDriveMemoryInfo> {
+    return this.request('POST', `/FiscalDrive/FiscalMemory/Info/${enc(factoryId)}`)
   }
 
   /**
