@@ -10,7 +10,6 @@ import { Button, Card, EmptyState, PageHeader } from '@/components/ui'
 import {
   JsonRpcEposClient,
   FiscalDriveClient,
-  mapFdsZReportToJsonRpc,
   type JsonRpcZReportInfo,
 } from '@/lib/epos'
 import { getSetting, SettingKey } from '@/lib/db'
@@ -59,19 +58,41 @@ export default function Zreport() {
   /**
    * Получить данные текущей смены через FiscalDriveService.
    *
-   * Текущая открытая смена находится по индексу = ZReportsCount (количество
-   * уже закрытых смен). Если открытой нет — берём последнюю закрытую (N-1).
+   * Используем FiscalMemory/Info — аккумуляторы (CashAccomulator / CardAccomulator)
+   * сбрасываются при закрытии Z-отчёта и отражают текущую открытую смену.
+   * ZReport/Info даёт только закрытые смены по индексу в памяти ФМ — для
+   * текущей открытой смены подходит только FiscalMemory.
    */
   async function getZReportInfoFds(): Promise<JsonRpcZReportInfo> {
     const { client, factoryId } = await getFdsClient()
-    const mem = await client.getFiscalMemoryInfo(factoryId)
-    const n = mem.ZReportsCount
-    // Сначала пробуем текущую открытую смену (индекс = числу закрытых)
-    let raw = await client.getZReportInfo(factoryId, n)
-    // Если нет (смена ещё не открывалась) — берём последнюю закрытую
-    if (!raw && n > 0) raw = await client.getZReportInfo(factoryId, n - 1)
-    if (!raw) throw new Error('FiscalDriveService: нет данных о смене. Откройте смену.')
-    return mapFdsZReportToJsonRpc(raw)
+    const [mem, fiscalInfo] = await Promise.all([
+      client.getFiscalMemoryInfo(factoryId),
+      client.getInfo(factoryId),
+    ])
+
+    const cashAcc = mem.CashAccomulator ?? { Sale: 0, Refund: 0 }
+    const cardAcc = mem.CardAccomulator ?? { Sale: 0, Refund: 0 }
+
+    return {
+      TerminalID: fiscalInfo.TerminalID,
+      Number: 0,
+      Count: 0,
+      // OpenTime: FiscalMemory/Info не возвращает время открытия смены напрямую.
+      // FirstUnacknowledgedReceiptTime — время первого чека смены (лучшее приближение).
+      OpenTime: mem.FirstUnacknowledgedReceiptTime ?? mem.LastOperationTime ?? '',
+      CloseTime: '', // пустая = смена открыта
+      FirstReceiptSeq: '',
+      LastReceiptSeq: String(mem.ReceiptSeq ?? ''),
+      TotalSaleCount: mem.ReceiptsCount ?? 0,
+      TotalSaleCash: cashAcc.Sale,
+      TotalSaleCard: cardAcc.Sale,
+      TotalSaleVAT: 0,
+      TotalRefundCount: 0,
+      TotalRefundCash: cashAcc.Refund,
+      TotalRefundCard: cardAcc.Refund,
+      TotalRefundVAT: 0,
+      AppletVersion: fiscalInfo.AppletVersion,
+    }
   }
 
   async function refresh() {

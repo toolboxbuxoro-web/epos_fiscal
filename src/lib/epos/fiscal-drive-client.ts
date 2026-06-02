@@ -146,14 +146,24 @@ export interface FiscalDriveZReportRaw {
   LastReceiptSeq: number | string
 }
 
-/** Ответ /FiscalDrive/FiscalMemory/Info — нужен для нахождения индекса текущей смены. */
+/**
+ * Ответ /FiscalDrive/FiscalMemory/Info.
+ *
+ * ⚠️ ZReportsCount — количество Z-отчётов СЕЙЧАС В ПАМЯТИ ФМ (ещё не отправленных
+ * на ОФД), а НЕ исторический счётчик всех смен. После отправки = 0.
+ *
+ * CashAccomulator / CardAccomulator — накопленные суммы ТЕКУЩЕЙ открытой смены
+ * (сбрасываются при закрытии Z-отчёта = это и есть X-отчётные данные).
+ */
 export interface FiscalDriveMemoryInfo {
   TerminalID: string
-  /** Количество закрытых Z-отчётов. Текущая открытая смена — индекс ZReportsCount. */
   ZReportsCount: number
   ReceiptsCount: number
   ReceiptSeq: number
   LastOperationTime: string
+  FirstUnacknowledgedReceiptTime?: string
+  CashAccomulator?: { Sale: number; Refund: number }
+  CardAccomulator?: { Sale: number; Refund: number }
 }
 
 // ── Клиент ─────────────────────────────────────────────────────────────────
