@@ -8,7 +8,7 @@ import {
   type MsEmployee,
   type MsRetailStore,
 } from '@/lib/moysklad'
-import { JsonRpcEposClient } from '@/lib/epos'
+import { JsonRpcEposClient, FiscalDriveClient } from '@/lib/epos'
 import { applyUpdate, checkForUpdate } from '@/lib/updater'
 import { log } from '@/lib/log'
 import {
@@ -68,6 +68,10 @@ interface FormState {
   maxDiscountPerItemSum: string
   // Тестовый режим — фискализация без реальной отправки в Communicator
   testMode: 'true' | 'false'
+  // Фискальный бэкенд
+  fiscalBackend: 'epos' | 'fiscaldrive'
+  fiscalDriveBaseUrl: string
+  fiscalDriveFactoryId: string
   // Inventory Server (общий пул приходов через mytoolbox) — обязательно с 0.10+
   invServerUrl: string
   invShopSlug: string
@@ -103,6 +107,9 @@ const empty: FormState = {
   discountForExactSum: 'true',
   maxDiscountPerItemSum: '2000',
   testMode: 'false',
+  fiscalBackend: 'epos',
+  fiscalDriveBaseUrl: 'http://localhost:3449',
+  fiscalDriveFactoryId: '',
   invServerUrl: '',
   invShopSlug: '',
   invShopApiKey: '',
@@ -123,6 +130,8 @@ export default function Settings() {
   const [printers, setPrinters] = useState<PrinterInfo[]>([])
   const [printerLoading, setPrinterLoading] = useState(false)
   const [printerTestMsg, setPrinterTestMsg] = useState<string>('')
+  // FiscalDriveService
+  const [fdsDetectMsg, setFdsDetectMsg] = useState<string>('')
   // Inventory подключение
   const [invTestMsg, setInvTestMsg] = useState<string>('')
   const [invConnecting, setInvConnecting] = useState(false)
@@ -214,6 +223,9 @@ export default function Settings() {
       maxDiscountPerItemSum:
         all[SettingKey.MaxDiscountPerItemSum] ?? '2000',
       testMode: (all[SettingKey.TestMode] ?? 'false') as 'true' | 'false',
+      fiscalBackend: (all[SettingKey.FiscalBackend] === 'fiscaldrive' ? 'fiscaldrive' : 'epos') as 'epos' | 'fiscaldrive',
+      fiscalDriveBaseUrl: all[SettingKey.FiscalDriveBaseUrl] ?? 'http://localhost:3449',
+      fiscalDriveFactoryId: all[SettingKey.FiscalDriveFactoryId] ?? '',
       autoFiscalize: (all[SettingKey.AutoFiscalize] ?? 'false') as 'true' | 'false',
       replacementEnabled: (all[SettingKey.ReplacementEnabled] ?? 'true') as 'true' | 'false',
       invServerUrl: all[SettingKey.InventoryServerUrl] ?? '',
@@ -352,6 +364,9 @@ export default function Settings() {
         [SettingKey.DiscountForExactSum]: form.discountForExactSum,
         [SettingKey.MaxDiscountPerItemSum]: form.maxDiscountPerItemSum,
         [SettingKey.TestMode]: form.testMode,
+        [SettingKey.FiscalBackend]: form.fiscalBackend,
+        [SettingKey.FiscalDriveBaseUrl]: form.fiscalDriveBaseUrl.replace(/\/$/, ''),
+        [SettingKey.FiscalDriveFactoryId]: form.fiscalDriveFactoryId.trim(),
         [SettingKey.AutoFiscalize]: form.autoFiscalize,
         [SettingKey.ReplacementEnabled]: form.replacementEnabled,
         [SettingKey.InventoryRemoteEnabled]: "true",
@@ -484,6 +499,26 @@ export default function Settings() {
         url: form.eposCommunicatorUrl,
         error: msg,
       })
+    }
+  }
+
+  async function detectFdsFactoryId() {
+    setFdsDetectMsg('Получаю список ФМ…')
+    try {
+      const baseUrl = form.fiscalDriveBaseUrl.replace(/\/$/, '') || 'http://localhost:3449'
+      const client = new FiscalDriveClient({ baseUrl })
+      const drives = await client.listDrives()
+      if (drives.length === 0) {
+        setFdsDetectMsg('Список ФМ пустой — проверьте что FiscalDriveService запущен и ФМ подключён.')
+        return
+      }
+      const first = drives[0]!
+      const factoryId = first.FactoryID
+      setField('fiscalDriveFactoryId', factoryId)
+      setFdsDetectMsg(`✓ FactoryID: ${factoryId} (AppletVersion: ${first.AppletVersion})`)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setFdsDetectMsg(`Ошибка: ${msg}`)
     }
   }
 
@@ -762,6 +797,21 @@ export default function Settings() {
         )}
       </Section>
 
+      <Section title="Фискальный бэкенд">
+        <Field label="Бэкенд">
+          <Select
+            value={form.fiscalBackend}
+            onChange={(e) => setField('fiscalBackend', e.target.value as 'epos' | 'fiscaldrive')}
+          >
+            <option value="epos">E-POS Communicator (JSON-RPC :3448)</option>
+            <option value="fiscaldrive">FiscalDriveService (REST :3449)</option>
+          </Select>
+          <div className="mt-1 text-xs text-ink-muted">
+            Магазин 1 (Хонабод) — epos. Магазин 2 (Хазрати Имом) — fiscaldrive.
+          </div>
+        </Field>
+      </Section>
+
       <Section title="EPOS Communicator">
         <Field label="URL">
           <Input
@@ -790,6 +840,38 @@ export default function Settings() {
           </Button>
           <span className="text-xs text-ink-muted">{eposTest}</span>
         </div>
+      </Section>
+
+      <Section title="FiscalDriveService">
+        <Field label="URL">
+          <Input
+            value={form.fiscalDriveBaseUrl}
+            onChange={(e) => setField('fiscalDriveBaseUrl', e.target.value)}
+            placeholder="http://localhost:3449"
+          />
+          <div className="mt-1 text-xs text-ink-muted">
+            REST API FiscalDriveService. По умолчанию <code className="bg-surface-hover px-1 rounded">http://localhost:3449</code>.
+          </div>
+        </Field>
+        <Field label="FactoryID (серийник ФМ)">
+          <div className="flex gap-2">
+            <Input
+              value={form.fiscalDriveFactoryId}
+              onChange={(e) => setField('fiscalDriveFactoryId', e.target.value)}
+              placeholder="LG420230639660"
+              className="flex-1"
+            />
+            <Button variant="secondary" size="sm" onClick={detectFdsFactoryId}>
+              Авто
+            </Button>
+          </div>
+          <div className="mt-1 text-xs text-ink-muted">
+            Серийный номер USB-фискального модуля. Нажми «Авто» чтобы получить из /FiscalDrive/List.
+          </div>
+        </Field>
+        {fdsDetectMsg && (
+          <div className="col-span-1 md:col-span-2 text-xs text-ink-muted">{fdsDetectMsg}</div>
+        )}
       </Section>
 
       <Section title="Реквизиты компании">

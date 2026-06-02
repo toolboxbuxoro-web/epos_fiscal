@@ -194,6 +194,27 @@ export const SettingKey = {
    * «Отправлять логи об ошибках на сервер»).
    */
   TelemetryEnabled: 'telemetry.enabled',
+  /**
+   * Бэкенд фискализации.
+   *   - `'epos'`        (default) — E-POS Communicator JSON-RPC на :3448/rpc/api
+   *   - `'fiscaldrive'` — FiscalDriveService REST на :3449 (двухшаговый GetTXID→RegisterTXID)
+   *
+   * Магазин 1 (Хонабод) = 'epos'. Магазин 2 (Хазрати Имом) = 'fiscaldrive'.
+   */
+  FiscalBackend: 'fiscal.backend',
+  /**
+   * FactoryID фискального модуля (серийник ФМ-карты) для FiscalDriveService.
+   * Получается из GET /FiscalDrive/List → первый элемент → FactoryID.
+   * Пример: 'LG420230639660' или '002024083000152503000000000000000000'.
+   * Кэшируется в Settings чтобы не делать /List при каждой фискализации.
+   */
+  FiscalDriveFactoryId: 'fiscal.drive_factory_id',
+  /**
+   * Базовый URL FiscalDriveService.
+   * По умолчанию 'http://localhost:3449'.
+   * Аналог EposCommunicatorUrl для нового бэкенда.
+   */
+  FiscalDriveBaseUrl: 'fiscal.drive_base_url',
 } as const
 
 export type SettingKey = (typeof SettingKey)[keyof typeof SettingKey]

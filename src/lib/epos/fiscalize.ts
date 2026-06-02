@@ -44,6 +44,14 @@ import {
   type ReceiptData,
 } from '@/lib/printer'
 import { JsonRpcEposClient, formatGoTime, type JsonRpcReceipt } from './jsonrpc-client'
+import {
+  FiscalDriveClient,
+  FISCAL_DRIVE_DEFAULT_URL,
+  OKEI_PIECE_DEFAULT,
+  mapFdsFiscalAnswer,
+  type FiscalDriveItem,
+  type FiscalDriveReceipt,
+} from './fiscal-drive-client'
 import type { FiscalReceiptInfo } from './types'
 
 export interface FiscalizeOptions {
@@ -257,18 +265,41 @@ export async function fiscalize(
     )
   }
 
-  // 4. Фискализация — только JSON-RPC `/rpc/api`. Legacy /uzpos удалён в
-  // 0.10.13 (актуальные Communicator 3.20+ legacy урезали, всё работает
-  // через JSON-RPC). Auto-fallback тоже удалён за ненадобностью.
+  // 4. Фискализация — выбираем бэкенд по настройке FiscalBackend:
+  //   'epos'        → JSON-RPC на :3448/rpc/api (Api.SendSaleReceipt)
+  //   'fiscaldrive' → REST на :3449 (GetTXID → RegisterTXID)
+  const fiscalBackend = (await getSetting(SettingKey.FiscalBackend)) ?? 'epos'
+
   let fiscal: FiscalReceiptInfo
   let requestJson: string
   try {
-    const result = await fiscalizeJsonRpc(
-      eposUrl,
-      effectiveLines,
-      receivedCash,
-      receivedCard,
-    )
+    let result: { fiscal: FiscalReceiptInfo; requestJson: string }
+    if (fiscalBackend === 'fiscaldrive') {
+      const fdsBaseUrl =
+        (await getSetting(SettingKey.FiscalDriveBaseUrl)) ?? FISCAL_DRIVE_DEFAULT_URL
+      const factoryId = await getSetting(SettingKey.FiscalDriveFactoryId)
+      if (!factoryId) {
+        throw new Error(
+          'FiscalDriveService: FactoryID не задан. ' +
+          'Откройте Настройки → «FactoryID фискального модуля» и введите серийник ФМ.',
+        )
+      }
+      result = await fiscalizeFiscalDrive(
+        fdsBaseUrl,
+        factoryId,
+        effectiveLines,
+        receivedCash,
+        receivedCard,
+        opts.cardKind,
+      )
+    } else {
+      result = await fiscalizeJsonRpc(
+        eposUrl,
+        effectiveLines,
+        receivedCash,
+        receivedCard,
+      )
+    }
     fiscal = result.fiscal
     requestJson = result.requestJson
   } catch (eposErr) {
@@ -842,6 +873,113 @@ async function buildReceiptData(
   }
 }
 
+
+// ── Реализация для FiscalDriveService REST :3449 ────────────────────────────
+
+/**
+ * Двухшаговая фискализация через FiscalDriveService:
+ *   1. GetTXID — записать JSON-чек в БД FDS, получить TXID
+ *   2. RegisterTXID — подписать ФМ, получить FiscalSign+QR
+ *
+ * Retry-safe: при сбоя сети на шаге 2 — повторный RegisterTXID вернёт
+ * тот же ответ без дубликата (ФМ идемпотентен по TXID).
+ *
+ * Отличия payload от JSON-RPC:
+ *   - SPIC (uppercase) вместо spic (lowercase)
+ *   - Units (ОКЭИ-код) — обязательное поле, дефолт OKEI_PIECE_DEFAULT
+ *   - ExtraInfo.CardType вместо отдельного поля в Communicator
+ *   - Operation=0 (продажа) и Type=0 (обычный чек) явно
+ */
+async function fiscalizeFiscalDrive(
+  baseUrl: string,
+  factoryId: string,
+  effectiveLines: FiscalLine[],
+  receivedCash: number,
+  receivedCard: number,
+  cardKind?: 'fiz' | 'corp',
+): Promise<{ fiscal: FiscalReceiptInfo; requestJson: string }> {
+  const items: FiscalDriveItem[] = effectiveLines.map((c) => ({
+    Name: c.esfItem.name,
+    Barcode: c.esfItem.barcode ?? '0',
+    SPIC: c.esfItem.class_code,
+    Units: OKEI_PIECE_DEFAULT,
+    PackageCode: c.esfItem.package_code || '',
+    OwnerType: (c.esfItem.owner_type ?? 0) as 0 | 1 | 2,
+    Amount: c.quantity,
+    Price: c.priceTiyin,
+    Discount: c.discountTiyin,
+    Other: 0,
+    VATPercent: c.esfItem.vat_percent,
+    VAT: c.vatTiyin,
+  }))
+
+  // cardKind → ExtraInfo.CardType (1=корп, 2=личная)
+  // 'corp'=1, 'fiz'=2 — обратный маппинг от нашего enum
+  const cardTypeMap: Record<'fiz' | 'corp', 1 | 2> = { corp: 1, fiz: 2 }
+  const extraInfo =
+    receivedCard > 0 && cardKind
+      ? { CardType: cardTypeMap[cardKind] }
+      : undefined
+
+  const receipt: FiscalDriveReceipt = {
+    Time: formatGoTime(new Date()),
+    ReceivedCash: receivedCash,
+    ReceivedCard: receivedCard,
+    Type: 0,
+    Operation: 0,
+    Items: items,
+    ExtraInfo: extraInfo,
+  }
+
+  const requestJson = JSON.stringify({ factoryId, receipt })
+
+  await log.info('fiscalize', 'Отправляю FiscalDrive GetTXID', {
+    baseUrl,
+    factoryId,
+    itemsCount: items.length,
+    request: receipt,
+  })
+
+  const client = new FiscalDriveClient({ baseUrl })
+  let txid: number
+  try {
+    txid = await client.getReceiptTXID(factoryId, receipt)
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    await log.error('fiscalize', `FiscalDrive GetTXID ошибка: ${msg}`, {
+      baseUrl,
+      factoryId,
+      request: receipt,
+    })
+    throw e
+  }
+
+  await log.info('fiscalize', `FiscalDrive GetTXID успешно, TXID=${txid}`, { factoryId })
+
+  let answer
+  try {
+    answer = await client.registerReceiptTXID(factoryId, txid)
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    await log.error('fiscalize', `FiscalDrive RegisterTXID ошибка (TXID=${txid}): ${msg}`, {
+      baseUrl,
+      factoryId,
+      txid,
+    })
+    // Специфичный детект «смена не открыта» для FDS — ошибка содержит
+    // слово ZREPORT или shift или аналог. Пробрасываем ShiftNotOpenError.
+    if (/zreport.*not.*open|open.*zreport|shift.*not|смена/i.test(msg)) {
+      throw new ShiftNotOpenError()
+    }
+    throw e
+  }
+
+  await log.info('fiscalize', `FiscalDrive RegisterTXID успешно: ${answer.FiscalSign}`, {
+    response: answer,
+  })
+
+  return { fiscal: mapFdsFiscalAnswer(answer), requestJson }
+}
 
 // ── Реализация для нового JSON-RPC :3448/rpc/api ──────────────────────
 
