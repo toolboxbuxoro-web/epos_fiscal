@@ -1104,14 +1104,13 @@ docs/
 - **VAT-формула**: по умолчанию `vat = total * percent / (100 + percent)` (НДС включён в цену). Если у магазина НДС начисляется сверху — нужно поменять `vatIncluded` → `vatAddedOn` в `matcher/strategies.ts`.
 - **Ключи подписи**: `~/.tauri/epos-fiscal.key` живёт только на одной машине разработчика. Если потеряем — нужно перевыпустить и заново публиковать клиентам (auto-update сломается). Бэкап ключа — обязательно.
 
-## Текущее состояние (на 2026-06-01)
+## Текущее состояние (на 2026-06-02)
 
 ### Версии
 
-- **Последний released tag:** `v0.10.18` (12.05.2026) — на этом сидят все 4 магазина в проде
-- **Dev-сборка (текущая):** `0.11.0` (в package.json + tauri.conf.json + telemetry.ts APP_VERSION — все 3 синхронны), ветка `dev-test/holistic-phase1`. НЕ тегнута. Авто-апдейт на магазины НЕ идёт. Для теста — dev-build `.exe` через push в `dev-test/**` или `gh workflow run dev-build.yml`
-- **Накопленные фичи 0.10.18 → 0.11.0 ждут production-тег** (~20 крупных feature/fix коммитов)
-- **Тесты:** vitest установлен, `npm test`. 185+ кейсов (holistic, partial-refund, preflight, stale-handler, price-floor, rounding на реальных данных БД)
+- **Последний released tag:** `v0.11.0` (02.06.2026) — тег создан, GitHub Actions строит Win+Mac, авто-апдейт идёт на все магазины
+- **Текущая версия:** `0.11.0` (в package.json + tauri.conf.json + telemetry.ts APP_VERSION — все 3 синхронны)
+- **Тесты:** vitest установлен, `npm test`. 270+ кейсов (holistic, partial-refund, preflight, stale-handler, price-floor, rounding на реальных данных БД, **fiscal-drive-client**)
 
 ### ✅ Что готово и в коде (0.11.0)
 
@@ -1119,6 +1118,7 @@ docs/
 
 | Фича | Что |
 |---|---|
+| **FiscalDriveService REST :3449** | `FiscalDriveClient` — второй бэкенд фискализации для ФМ версии 0400. Двухшаговый GetTXID→RegisterTXID (retry-safe). `SettingKey.FiscalBackend` ('epos'\|'fiscaldrive'), `FiscalDriveFactoryId`, `FiscalDriveBaseUrl`. UI в Настройках: выбор бэкенда + кнопка «Авто» для определения FactoryID из /FiscalDrive/List. Маппинги `mapFdsZReportToJsonRpc` + `mapFdsFiscalAnswer`. 37 тестов. Файлы: `src/lib/epos/fiscal-drive-client.ts`, `src/lib/epos/__tests__/fiscal-drive-client.test.ts`. ⚠️ Фазы 5+6 (смена/возврат через FDS) — не реализованы: смену открывать через E-POS Cashdesk, возврат — тоже |
 | **Частичный refund** | Migration 013: снят UNIQUE на `original_fiscal_id`, колонки `is_partial` + `refunded_items_snapshot`. Возврат конкретных товаров с qty (не весь чек). Pro-rata Price/VAT, cumulative qty check (не больше original), пропорциональный unconsume. UI toggle «Полный/Частичный» + qty-инпуты, badge «Частично»/«Возвращён» в Истории. Защита: full+partial микс запрещён. См. `refund.ts::buildPartialRefundItems` |
 | **Минимальная наценка 5%** | `MIN_MARKUP_PERCENT=5` (хардкод), `priceFloorTiyin = ceilToSum(cost×1.05)`. Floor в distributeDiscount/holistic phase-3/greedy. Post-match warning если цена < floor (linked-ms/price-bucket где клиент заплатил мало). Не блокирует — цену МС менять нельзя |
 | **Округление без тийинов** | `ceilToSum`/`floorToSum`, цены на ленте всегда целые сумы. floor округлён вверх, distributeDiscount/Bump в целых сумах. Валидировано на 16179 реальных чеках (99.91% целые) |
@@ -1162,20 +1162,15 @@ docs/
 | 0.10.29 | **AlreadyFiscalizedError** (блок повторной фискализации из Чеков, UI + defense-in-depth); **ShiftNotOpenError** (понятный баннер на ZREPORT_IS_NOT_OPEN); manual picker **cost floor** (строки-убытки серые + бейдж); **тюнинг matcher** (maxMultiItem 5→10, tolerance 100k→500k, отдельный maxBumpPerItemTiyin=10000 сум); UX-баннер «подобрано N/M» |
 | 0.10.30 *(в работе)* | **Holistic matcher** — целостный подбор на сумму чека (фаза 1 greedy + фаза 2 DP exact-sum + bump delta), fallback при разреженном пуле; `SettingKey.MatcherMode` с дефолтом `'auto'`. **«Karta turi»** — модалка перед фискализацией при оплате картой (Jismoniy shaxs / Korporativ), печать на ленте, сохранение в `fiscal_receipts.card_kind` (migration 009) для refund/reprint. **Click/Payme exclude** — поле в Receipt.tsx позволяет исключить сумму электронной оплаты из ОФД; matcher пересобирает план на остаток через `targetSumOverrideTiyin`; `excluded_payment_tiyin` сохраняется в БД (migration 010) для аудита; при exclude=rd.sum кнопка меняется на «Отметить как не фискальный» (`ms_receipts.status='not_required'`) |
 
-### 🔴 Что критично проверить на проде перед тегом
-
-1. **Refund.привязка** — после 0.10.28 fix: refund в soliq.uz должен попадать в **«Бириктирилган»** (не «Бириктирилмаган»). Этот fix ещё **не подтверждён** реальной фискализацией.
-2. **Двойная фискализация** — попробовать вернуться в уже-фискализированный чек: кнопка должна быть disabled + баннер.
-3. **Возвраты end-to-end** — refund → unconsume → остаток в пул → SSE → другие магазины видят. Backend /unconsume на mytoolbox задеплоен (Railway), endpoint доступен.
-
 ### ⏳ Не сделано (Phase 2 / future)
 
-- **Частичный refund** (qty picker для каждой позиции). Сейчас только full refund — UNIQUE constraint на `original_fiscal_id`. Снять constraint + добавить `qty_refunded` в match_items.
+- **FiscalDriveService фаза 5** — смена (open/close) через наш UI для `fiscaldrive` бэкенда. Пока: открывать смену через E-POS Cashdesk. Файл: `src/routes/Zreport.tsx` (~30 строк).
+- **FiscalDriveService фаза 6** — возврат через наш UI для `fiscaldrive` бэкенда (`Operation=1`). Файл: `src/lib/epos/refund.ts` (~30 строк).
+- **OKEI Units код** — подтвердить точный код единицы измерения у E-POS. Сейчас `OKEI_PIECE_DEFAULT=796` (стандартный ОКЭИ-код штуки), но FDS может использовать другой формат. Файл: `src/lib/epos/fiscal-drive-client.ts::OKEI_PIECE_DEFAULT`.
 - **Авто-создание `retailreturn` в МС** при refund — сейчас МС-сторона не интегрирована (магазины оформляют возвраты в МС руками).
 - **Polling `retailreturn` из МС** (вариант «А» — отдельный поллер на refund-сущность МС).
 - **Refund EPS** (PAYME/CLICK/UZUM rollback) — refundEPS метод. Сейчас refund только cash/card.
 - **Sidebar пункт «Возвраты»** (список всех `fiscal_refunds` глобально для админа).
-- **Тег `v0.10.30`** для production раскатки на все магазины. Сейчас 4 магазина сидят на 0.10.18 — отстают на 12 версий.
 - **Отчёт «Click/Payme за период»** — суммировать `fiscal_receipts.excluded_payment_tiyin` по датам. Сейчас поле сохраняется, отчёт — Phase 2.
 - **Помечать `not_required` чеки в МС** — отдельным статусом или примечанием, чтобы бухгалтер видел что мы сознательно не фискализировали.
 
