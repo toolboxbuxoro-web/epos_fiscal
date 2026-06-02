@@ -263,7 +263,7 @@ export class FiscalDriveClient {
    * первой регистрации без дубликата — это ключевое отличие от JSON-RPC.
    */
   registerReceiptTXID(factoryId: string, txid: number): Promise<FiscalDriveFiscalAnswer> {
-    return this.request('POST', `/FiscalDrive/Receipt/RegisterTXID/${enc(factoryId)}`, txid)
+    return this.request('POST', `/FiscalDrive/Receipt/RegisterTXID/${enc(factoryId)}?TXID=${txid}`)
   }
 }
 

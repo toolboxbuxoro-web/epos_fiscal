@@ -251,14 +251,15 @@ describe('getReceiptTXID', () => {
 // ── 5. registerReceiptTXID ────────────────────────────────────────────────────
 
 describe('registerReceiptTXID', () => {
-  it('POST с TXID в теле, возвращает FiscalSign + QRCodeURL', async () => {
+  it('POST с TXID как query-параметр, возвращает FiscalSign + QRCodeURL', async () => {
     const { client, fetch } = makeClient([{ status: 200, body: FISCAL_ANSWER }])
     const answer = await client.registerReceiptTXID(FACTORY_ID, 17)
     expect(answer.FiscalSign).toBe('320262508539')
     expect(answer.QRCodeURL).toContain('ofd.soliq.uz')
     const [url, opts] = fetch.mock.calls[0] as [string, RequestInit]
-    expect(url).toContain(`/FiscalDrive/Receipt/RegisterTXID/${FACTORY_ID}`)
-    expect(JSON.parse(opts.body as string)).toBe(17) // тело = просто число
+    // TXID передаётся как ?TXID=N в URL, тело пустое
+    expect(url).toContain(`/FiscalDrive/Receipt/RegisterTXID/${FACTORY_ID}?TXID=17`)
+    expect(opts.body).toBeUndefined()
   })
 
   it('ReceiptSeq в ответе может быть числом или строкой', async () => {
