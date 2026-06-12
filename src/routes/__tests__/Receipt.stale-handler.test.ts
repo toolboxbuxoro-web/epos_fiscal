@@ -12,6 +12,8 @@
  *   5. Manual-план (manuallyBuilt:true) НЕ перетирается load'ом
  *   6. Debounce: 2 stale в течение 5 сек → 1 toast
  *   7. После 5 сек — следующий stale показывает toast
+ *   8. Rebuild после stale/conflict получает уже НОВЫЕ exclude ids
+ *      (регрессия React async state/старого closure в Receipt.tsx)
  */
 
 import { describe, it, expect, beforeEach } from 'vitest'
@@ -29,6 +31,7 @@ class StaleHandlerStateMachine {
   lastStaleToastTs = 0
   toastsShown: string[] = []
   loadCalled = 0
+  loadExcludeIdsHistory: number[][] = []
   syncCalled = 0
   matchManuallyBuilt = false
   matchReplaced = false
@@ -91,6 +94,7 @@ class StaleHandlerStateMachine {
 
     // Авто-план — load()
     this.loadCalled += 1
+    this.loadExcludeIdsHistory.push([...this.excludedServerIds])
     this.matchReplaced = true
     let toast: string | null = null
     if (shouldShowToast) {
@@ -98,6 +102,22 @@ class StaleHandlerStateMachine {
       this.toastsShown.push(toast)
     }
     return { toast, syncCalled, loadCalled: true, persistentSet: false, matchPreserved: false }
+  }
+
+  /** Симулирует callback handler InventoryConflictError из Receipt.tsx. */
+  handleConflict(failedInvItemIds: number[]): {
+    loadCalled: boolean
+    loadExcludeIds: number[]
+  } {
+    this.excludedServerIds = Array.from(
+      new Set([...this.excludedServerIds, ...failedInvItemIds]),
+    )
+    this.loadCalled += 1
+    this.loadExcludeIdsHistory.push([...this.excludedServerIds])
+    return {
+      loadCalled: true,
+      loadExcludeIds: [...this.excludedServerIds],
+    }
   }
 
   /** Симулирует нажатие «Открыть Собрать вручную» из persistent-карточки. */
@@ -137,6 +157,11 @@ describe('Receipt.tsx — обработчик InventoryStaleError', () => {
       sm.excludedServerIds = [10, 20]
       await sm.handleStale([20, 30, 40])
       expect(sm.excludedServerIds).toEqual([10, 20, 30, 40])
+    })
+
+    it('load после stale вызывается уже с новыми exclude ids', async () => {
+      await sm.handleStale([42, 43])
+      expect(sm.loadExcludeIdsHistory).toEqual([[42, 43]])
     })
 
     it('без suspect-ids — exclude не меняется', async () => {
@@ -284,6 +309,16 @@ describe('Receipt.tsx — обработчик InventoryStaleError', () => {
       // 3-я stale подряд → persistent остаётся, manuallyBuilt сохраняется
       expect(t3.persistentSet).toBe(true)
       expect(t3.matchPreserved).toBe(true)
+    })
+  })
+
+  describe('Сценарий 7: InventoryConflictError тоже rebuild-ит со свежими exclude', () => {
+    it('после 409 load получает failed inv_item_id сразу, без ожидания React state', () => {
+      sm.excludedServerIds = [10]
+      const r = sm.handleConflict([20, 30])
+      expect(r.loadCalled).toBe(true)
+      expect(r.loadExcludeIds).toEqual([10, 20, 30])
+      expect(sm.loadExcludeIdsHistory).toEqual([[10, 20, 30]])
     })
   })
 })

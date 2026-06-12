@@ -19,6 +19,7 @@ import {
 } from '@/lib/inventory'
 import { ensureTelemetryStarted } from '@/lib/telemetry'
 import { Toaster } from '@/components/ui'
+import { AppVersionBadge } from '@/components/AppVersionBadge'
 
 export default function App() {
   useEffect(() => {
@@ -74,6 +75,7 @@ export default function App() {
         </Route>
       </Routes>
       <Toaster />
+      <AppVersionBadge />
     </>
   )
 }

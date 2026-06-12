@@ -36,20 +36,12 @@
 import { fetch } from '@tauri-apps/plugin-http'
 import { getSetting, SettingKey } from '@/lib/db'
 import { listUnsentLogsForServer, markLogsSentToServer } from '@/lib/log'
+import { APP_VERSION } from '@/lib/app-version'
 
 /** Интервал между попытками flush'а — 30 сек. */
 const FLUSH_INTERVAL_MS = 30_000
 /** Сколько строк за один POST. */
 const BATCH_SIZE = 50
-/**
- * Текущая версия приложения для трассировки на сервере.
- *
- * ⚠️ Должна совпадать с `package.json::version` и
- * `src-tauri/tauri.conf.json::version`. Все 3 места обновляются при
- * каждом релизе вручную (package.json не импортируется в браузерный bundle).
- */
-const APP_VERSION = '0.11.9'
-
 let started = false
 let timer: ReturnType<typeof setInterval> | null = null
 /** Кол-во подряд-failed flush'ей для exp backoff. */
@@ -234,4 +226,3 @@ export function stopTelemetry(): void {
 export async function flushNow(): Promise<void> {
   await flushLogsToServer()
 }
-

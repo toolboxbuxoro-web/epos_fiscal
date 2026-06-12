@@ -117,7 +117,7 @@ export default function Receipt() {
    * успел забрать). При rematch matcher их игнорирует — иначе сразу
    * предложил бы те же товары и снова получил 409.
    */
-  const [excludedServerIds, setExcludedServerIds] = useState<number[]>([])
+  const excludedServerIdsRef = useRef<number[]>([])
   /**
    * Открыта ли модалка «Karta turi». Появляется при клике «Фискализировать»
    * когда оплата картой/QR/mixed (cardSum > 0). Кассир выбирает «Jismoniy
@@ -245,7 +245,11 @@ export default function Receipt() {
   }, [rd])
 
   useEffect(() => {
-    void load()
+    excludedServerIdsRef.current = []
+    staleErrorCountRef.current = 0
+    lastStaleToastTsRef.current = 0
+    setStaleErrorPersistent(false)
+    void load({ excludeServerItemIds: [] })
   }, [id])
 
   /**
@@ -274,7 +278,14 @@ export default function Receipt() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [excludeTiyin])
 
-  async function load() {
+  function rememberExcludedServerIds(ids: number[]): number[] {
+    if (ids.length === 0) return excludedServerIdsRef.current
+    const next = [...new Set([...excludedServerIdsRef.current, ...ids])]
+    excludedServerIdsRef.current = next
+    return next
+  }
+
+  async function load(overrides?: { excludeServerItemIds?: number[] }) {
     setBusy(true)
     setError(null)
     try {
@@ -412,6 +423,8 @@ export default function Receipt() {
       // matcher работает с уменьшенной таргет-суммой. Передаём через override,
       // не мутируя parsed.sum (его читает ещё Refund.tsx, history и т.д.).
       const effectiveTarget = Math.max(0, parsed.sum - excludeTiyin)
+      const activeExcludedServerIds =
+        overrides?.excludeServerItemIds ?? excludedServerIdsRef.current
 
       const opts: MatcherOptions = {
         toleranceTiyin: tolerance,
@@ -422,7 +435,10 @@ export default function Receipt() {
         linkCharacteristicName,
         defaultVatPercent,
         matcherMode,
-        excludeServerItemIds: excludedServerIds.length > 0 ? excludedServerIds : undefined,
+        excludeServerItemIds:
+          activeExcludedServerIds.length > 0
+            ? activeExcludedServerIds
+            : undefined,
         // Если excludeTiyin > 0 — matcher собирает план на rd.sum − exclude.
         // Если excludeTiyin = 0 — override не передаём (matcher работает по rd.sum
         // как всегда). Это сохраняет старое поведение для чеков без Click/Payme.
@@ -524,11 +540,9 @@ export default function Receipt() {
       // с другим товаром. Добавляем отказанные server_item_id в exclude
       // и автоматом перерендериваем match (matcher их пропустит).
       if (e instanceof InventoryConflictError) {
-        const newExcludes = [
-          ...excludedServerIds,
-          ...e.failed.map((f) => f.inv_item_id),
-        ]
-        setExcludedServerIds(newExcludes)
+        const newExcludes = rememberExcludedServerIds(
+          e.failed.map((f) => f.inv_item_id),
+        )
         toast.error(
           `Товар закончился — другой магазин опередил. Подбираю замену...`,
           { duration: 4000 },
@@ -537,7 +551,7 @@ export default function Receipt() {
         // useEffect от excludedServerIds не сработает, поэтому зовём load() явно.
         // Чуть-чуть ждём чтобы SSE может прилететь.
         setTimeout(() => {
-          void load()
+          void load({ excludeServerItemIds: newExcludes })
         }, 300)
         return
       }
@@ -581,12 +595,7 @@ export default function Receipt() {
         if (shouldShowToast) lastStaleToastTsRef.current = now
 
         // Suspect ids → excludedServerIds (для будущих авто-подборов).
-        const newExcludes = e.suspectInvItemIds.length
-          ? [...new Set([...excludedServerIds, ...e.suspectInvItemIds])]
-          : excludedServerIds
-        if (newExcludes !== excludedServerIds) {
-          setExcludedServerIds(newExcludes)
-        }
+        const newExcludes = rememberExcludedServerIds(e.suspectInvItemIds)
 
         // forceFull sync — обязательно ДО всех веток ниже.
         try {
@@ -630,7 +639,7 @@ export default function Receipt() {
         if (shouldShowToast) {
           toast.error('Остатки изменились, подбираю замены…', { duration: 4000 })
         }
-        setTimeout(() => void load(), 300)
+        setTimeout(() => void load({ excludeServerItemIds: newExcludes }), 300)
         return
       }
       // Смена не открыта — НЕ failed (чек валиден, просто нет смены).
@@ -1297,9 +1306,21 @@ export default function Receipt() {
               // Если sync упал — всё равно грузим pool из того что есть.
               // Лучше показать кассиру stale данные чем вообще ничего.
             }
-            return loadMatcherPool(matcherOpts)
+            return loadMatcherPool({
+              ...matcherOpts,
+              excludeServerItemIds:
+                excludedServerIdsRef.current.length > 0
+                  ? excludedServerIdsRef.current
+                  : matcherOpts.excludeServerItemIds,
+            })
           }}
-          opts={matcherOpts}
+          opts={{
+            ...matcherOpts,
+            excludeServerItemIds:
+              excludedServerIdsRef.current.length > 0
+                ? excludedServerIdsRef.current
+                : matcherOpts.excludeServerItemIds,
+          }}
           initialLines={(match.mode === 'holistic' && match.holistic
             ? match.holistic.lines
             : match.positions.flatMap((pm) => pm.candidates)
