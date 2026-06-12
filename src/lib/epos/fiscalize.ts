@@ -29,6 +29,7 @@ function getEffectiveLines(build: BuildMatchResult): FiscalLine[] {
   return build.positions.flatMap((pm) => pm.candidates)
 }
 import {
+  applyItemsUpdate,
   deletePendingByReservations,
   getInventoryClient,
   loadInventoryConfig,
@@ -556,6 +557,35 @@ async function tryRemoteReserve(
         })
       }
     }
+
+    // Best-effort: записываем свежую доступность в локальный кэш ВСЕГДА
+    // после успешного fetch, независимо от того будет conflict или нет.
+    // Это устраняет рассинхрон «получили preflight-данные но не записали их»
+    // и обеспечивает что следующий matcher/rematch увидит актуальные остатки.
+    // applyItemsUpdate ожидает { id, available } — вычисляем available из
+    // qty_received − qty_consumed − qty_reserved.
+    //
+    // ВАЖНО: обновляем только товары текущего резерва (freshById), а НЕ весь
+    // fresh.items (до 5000 строк). applyItemsUpdate делает по одному
+    // await db.execute на строку — тысячи SQLite-запросов на каждую
+    // фискализацию слишком дорого. freshById содержит ≤ нескольких десятков
+    // строк (только items из текущего плана + их insufficiency-кандидаты).
+    try {
+      const cacheUpdates = Array.from(freshById.entries()).map(([id, f]) => ({
+        id,
+        available: f.qty_received - f.qty_consumed - f.qty_reserved,
+      }))
+      await applyItemsUpdate(cacheUpdates)
+    } catch (cacheErr) {
+      await log
+        .warn(
+          'fiscalize',
+          `preflight: applyItemsUpdate упал — кэш не обновлён: ${cacheErr instanceof Error ? cacheErr.message : String(cacheErr)}`,
+        )
+        .catch(() => {})
+      // Не прерываем — цель preflight это проверка, не запись.
+    }
+
     const insufficient: Array<{ inv_item_id: number; available: number; requested: number }> = []
     for (const it of items) {
       const f = freshById.get(it.inv_item_id)
@@ -653,6 +683,25 @@ async function confirmRemote(reservations: ReservationInfo[], fiscal_sign: strin
     const resp = await client.confirm({ reservation_ids: ids, fiscal_sign })
     if (resp.ok) {
       await deletePendingByReservations(ids).catch(() => {})
+      // Best-effort: сервер вернул обновлённые остатки после confirm —
+      // применяем их в локальный кэш чтобы магазин сразу видел свои продажи.
+      if (resp.items && resp.items.length > 0) {
+        try {
+          await applyItemsUpdate(
+            resp.items.map((it) => ({
+              id: it.id,
+              available: it.available,
+            })),
+          )
+        } catch (cacheErr) {
+          await log
+            .warn(
+              'fiscalize',
+              `confirm: applyItemsUpdate упал: ${cacheErr instanceof Error ? cacheErr.message : String(cacheErr)}`,
+            )
+            .catch(() => {})
+        }
+      }
     } else {
       // Это плохой сценарий: фискальный чек в ОФД, но сервер inventory отказал.
       // Оставляем pending — админ разберёт. retry-механизм попробует ещё раз.

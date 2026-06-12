@@ -246,4 +246,104 @@ describe('Preflight: ДО reserve проверка серверных остат
       expect(err.message).toContain('Недостаточно')
     })
   })
+
+  /**
+   * Тесты Fix 2: preflight вызывает applyItemsUpdate только с подмножеством
+   * товаров текущего резерва (freshById), а не с полным fresh.items (до 5000).
+   *
+   * Проверяем логику маппинга Map<id, RemoteInvItem> → { id, available }
+   * изолированно, без вызова реальных Tauri-команд (SQLite недоступен в vitest).
+   */
+  describe('Fix 2: preflight → applyItemsUpdate маппинг подмножества', () => {
+    /**
+     * Симулирует построение freshById из simulatePreflight:
+     * берём только items чьи id есть в reserveItems.
+     */
+    function buildFreshById(
+      reserveItems: Array<{ inv_item_id: number; quantity: number }>,
+      serverItems: RemoteInvItem[],
+    ): Map<number, RemoteInvItem> {
+      const itemIdsSet = new Set(reserveItems.map((it) => it.inv_item_id))
+      const freshById = new Map<number, RemoteInvItem>()
+      for (const f of serverItems) {
+        if (itemIdsSet.has(f.id)) freshById.set(f.id, f)
+      }
+      return freshById
+    }
+
+    it('маппинг Map-entries → { id, available } корректен', () => {
+      const reserveItems = [
+        { inv_item_id: 1, quantity: 1000 },
+        { inv_item_id: 2, quantity: 1000 },
+        { inv_item_id: 3, quantity: 1000 },
+      ]
+      const serverItems: RemoteInvItem[] = [
+        mkRemoteItem({ id: 1, received: 10, consumed: 3, reserved: 2 }),
+        mkRemoteItem({ id: 2, received: 5, consumed: 5 }),
+        mkRemoteItem({ id: 3, received: 7 }),
+      ]
+      const freshById = buildFreshById(reserveItems, serverItems)
+      const cacheUpdates = Array.from(freshById.entries()).map(([id, f]) => ({
+        id,
+        available: f.qty_received - f.qty_consumed - f.qty_reserved,
+      }))
+      expect(cacheUpdates).toHaveLength(3)
+      expect(cacheUpdates).toContainEqual({ id: 1, available: 5000 }) // (10−3−2)×1000
+      expect(cacheUpdates).toContainEqual({ id: 2, available: 0 })    // sold-out
+      expect(cacheUpdates).toContainEqual({ id: 3, available: 7000 }) // без reserved
+    })
+
+    it('товары вне текущего резерва НЕ попадают в cacheUpdates (оптимизация)', () => {
+      // Сервер вернул 5000 items, но резервируем только 2. Только они должны
+      // быть в freshById и, следовательно, в cacheUpdates.
+      const reserveItems = [
+        { inv_item_id: 10, quantity: 1000 },
+        { inv_item_id: 11, quantity: 1000 },
+      ]
+      const serverItems: RemoteInvItem[] = [
+        mkRemoteItem({ id: 10, received: 3 }),
+        mkRemoteItem({ id: 11, received: 2, consumed: 1 }),
+        // id 99, 100, 101 — не в reserve, не должны попасть в freshById
+        mkRemoteItem({ id: 99, received: 50 }),
+        mkRemoteItem({ id: 100, received: 10 }),
+        mkRemoteItem({ id: 101, received: 7 }),
+      ]
+      const freshById = buildFreshById(reserveItems, serverItems)
+      const cacheUpdates = Array.from(freshById.entries()).map(([id, f]) => ({
+        id,
+        available: f.qty_received - f.qty_consumed - f.qty_reserved,
+      }))
+      // Только 2 из 5 серверных items
+      expect(cacheUpdates).toHaveLength(2)
+      expect(cacheUpdates).toContainEqual({ id: 10, available: 3000 })
+      expect(cacheUpdates).toContainEqual({ id: 11, available: 1000 })
+      // Не-резервируемые не попали
+      const ids = cacheUpdates.map((u) => u.id)
+      expect(ids).not.toContain(99)
+      expect(ids).not.toContain(100)
+      expect(ids).not.toContain(101)
+    })
+
+    it('preflight конфликт: sold-out item попадает в cacheUpdates с available=0', () => {
+      // applyItemsUpdate вызывается ДО throw — включая sold-out товары.
+      const reserveItems = [
+        { inv_item_id: 38, quantity: 1000 },
+        { inv_item_id: 39, quantity: 1000 },
+      ]
+      const serverItems: RemoteInvItem[] = [
+        mkRemoteItem({ id: 38, received: 13, consumed: 13 }), // sold-out
+        mkRemoteItem({ id: 39, received: 5 }),                // доступен
+      ]
+      const freshById = buildFreshById(reserveItems, serverItems)
+      const cacheUpdates = Array.from(freshById.entries()).map(([id, f]) => ({
+        id,
+        available: f.qty_received - f.qty_consumed - f.qty_reserved,
+      }))
+      // Оба попадают в кэш; sold-out с available=0
+      expect(cacheUpdates).toContainEqual({ id: 38, available: 0 })
+      expect(cacheUpdates).toContainEqual({ id: 39, available: 5000 })
+      // Не содержит чужих ids из общего fresh-пула
+      expect(cacheUpdates).toHaveLength(2)
+    })
+  })
 })

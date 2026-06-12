@@ -547,12 +547,17 @@ export default function Receipt() {
           `Товар закончился — другой магазин опередил. Подбираю замену...`,
           { duration: 4000 },
         )
-        // Re-build match с новым excludes — тут же без перезагрузки страницы.
-        // useEffect от excludedServerIds не сработает, поэтому зовём load() явно.
-        // Чуть-чуть ждём чтобы SSE может прилететь.
-        setTimeout(() => {
-          void load({ excludeServerItemIds: newExcludes })
-        }, 300)
+        // Re-build match с новым excludes — сначала синхронизируем SQLite-кэш
+        // с сервером, чтобы rematch видел свежие остатки, а не stale данные
+        // которые только что вызвали конфликт. Прямой await (не IIFE) чтобы
+        // finally сработал только после завершения sync, а не во время него
+        // (иначе кнопка ре-энейблится пока sync ещё идёт → риск двойного клика).
+        try {
+          await syncFromServer({ forceFull: true })
+        } catch {
+          // best-effort: продолжаем с тем что есть
+        }
+        void load({ excludeServerItemIds: newExcludes })
         return
       }
       // Уже фискализирован (обошли UI-блок) — НЕ failed, просто

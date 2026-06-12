@@ -220,7 +220,16 @@ export default function Zreport() {
       await refresh()
     } catch (e) {
       const errMsg = formatEposError(e, 'closeZReport')
-      setError(`Не удалось закрыть смену: ${errMsg}`)
+      // code=65532 «parsing time ""» — Communicator не нашёл открытую смену
+      // (уже закрыта или не открывалась). Показываем понятный текст.
+      const x = e as { code?: number; data?: unknown }
+      const noOpenShift =
+        x.code === 65532 && String(x.data ?? '').includes('parsing time')
+      setError(
+        noOpenShift
+          ? 'Смена не открыта или уже закрыта. Нажмите «Обновить» — данные подтянутся.'
+          : `Не удалось закрыть смену: ${errMsg}`,
+      )
       await log.error('epos', `closeZReport failed: ${errMsg}`, {
         raw: e instanceof Error ? e.message : String(e),
         json: JSON.stringify(e),

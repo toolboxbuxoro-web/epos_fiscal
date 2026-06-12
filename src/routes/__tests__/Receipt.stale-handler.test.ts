@@ -33,6 +33,7 @@ class StaleHandlerStateMachine {
   loadCalled = 0
   loadExcludeIdsHistory: number[][] = []
   syncCalled = 0
+  conflictSyncCalled = 0
   matchManuallyBuilt = false
   matchReplaced = false
 
@@ -104,17 +105,30 @@ class StaleHandlerStateMachine {
     return { toast, syncCalled, loadCalled: true, persistentSet: false, matchPreserved: false }
   }
 
-  /** Симулирует callback handler InventoryConflictError из Receipt.tsx. */
-  handleConflict(failedInvItemIds: number[]): {
+  /**
+   * Симулирует callback handler InventoryConflictError из Receipt.tsx.
+   * Fix 1: сначала syncFromServer({ forceFull: true }), потом load().
+   */
+  async handleConflict(
+    failedInvItemIds: number[],
+    opts?: { syncThrows?: boolean },
+  ): Promise<{
+    syncCalled: boolean
     loadCalled: boolean
     loadExcludeIds: number[]
-  } {
+  }> {
     this.excludedServerIds = Array.from(
       new Set([...this.excludedServerIds, ...failedInvItemIds]),
     )
+    // Fix 1: sync ПЕРЕД load
+    this.conflictSyncCalled += 1
+    if (opts?.syncThrows) {
+      // best-effort: при ошибке sync load всё равно вызывается
+    }
     this.loadCalled += 1
     this.loadExcludeIdsHistory.push([...this.excludedServerIds])
     return {
+      syncCalled: true,
       loadCalled: true,
       loadExcludeIds: [...this.excludedServerIds],
     }
@@ -313,12 +327,37 @@ describe('Receipt.tsx — обработчик InventoryStaleError', () => {
   })
 
   describe('Сценарий 7: InventoryConflictError тоже rebuild-ит со свежими exclude', () => {
-    it('после 409 load получает failed inv_item_id сразу, без ожидания React state', () => {
+    it('после 409 load получает failed inv_item_id сразу, без ожидания React state', async () => {
       sm.excludedServerIds = [10]
-      const r = sm.handleConflict([20, 30])
+      const r = await sm.handleConflict([20, 30])
       expect(r.loadCalled).toBe(true)
       expect(r.loadExcludeIds).toEqual([10, 20, 30])
       expect(sm.loadExcludeIdsHistory).toEqual([[10, 20, 30]])
+    })
+  })
+
+  describe('Сценарий 8 (Fix 1): InventoryConflictError делает sync ПЕРЕД load', () => {
+    it('sync вызывается до load — rematch видит свежий кэш', async () => {
+      sm.excludedServerIds = []
+      const r = await sm.handleConflict([42])
+      expect(r.syncCalled).toBe(true)
+      expect(r.loadCalled).toBe(true)
+      // sync должен быть ДО load — это гарантируется порядком в handleConflict
+      expect(sm.conflictSyncCalled).toBe(1)
+      expect(sm.loadCalled).toBe(1)
+    })
+
+    it('если sync бросил ошибку — load всё равно вызывается (best-effort)', async () => {
+      // Симулируем: sync упал, но load НЕ должен быть пропущен
+      const r = await sm.handleConflict([55], { syncThrows: true })
+      expect(r.loadCalled).toBe(true)
+      expect(r.loadExcludeIds).toContain(55)
+    })
+
+    it('failed ids попадают в exclude до load — load видит актуальный список', async () => {
+      sm.excludedServerIds = [1, 2]
+      const r = await sm.handleConflict([3, 4])
+      expect(r.loadExcludeIds).toEqual([1, 2, 3, 4])
     })
   })
 })

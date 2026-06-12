@@ -31,6 +31,12 @@ export interface PollerOptions {
 
 export class MoyskladPoller {
   private timer: number | null = null
+  /**
+   * Подряд-ошибки опроса. В телеметрию (log.error) уходит только ПЕРВАЯ
+   * ошибка серии — сетевой обрыв на 3 минуты иначе давал 6-12 одинаковых
+   * error-записей на сервер. Остальные — log.warn (остаются локально).
+   */
+  private consecutiveErrors = 0
   private status: PollerStatus = {
     running: false,
     lastTickAt: null,
@@ -143,6 +149,7 @@ export class MoyskladPoller {
       this.status.lastSuccessAt = now()
       this.status.lastFetchedCount = items.length
       this.status.lastError = null
+      this.consecutiveErrors = 0
     } catch (err) {
       this.status.lastError =
         err instanceof MoyskladError
@@ -150,9 +157,12 @@ export class MoyskladPoller {
           : err instanceof Error
             ? err.message
             : String(err)
-      await log.error('poller', 'Ошибка опроса МойСклад', {
+      this.consecutiveErrors += 1
+      const logFn = this.consecutiveErrors === 1 ? log.error : log.warn
+      await logFn('poller', 'Ошибка опроса МойСклад', {
         error: this.status.lastError,
         status: err instanceof MoyskladError ? err.status : undefined,
+        consecutive: this.consecutiveErrors,
       })
     } finally {
       this.notify()

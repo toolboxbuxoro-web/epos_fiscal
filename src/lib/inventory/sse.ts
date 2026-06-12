@@ -35,6 +35,13 @@ interface SubscribeOptions {
 const RETRY_BASE_MS = 2000
 const RETRY_MAX_MS = 60000
 
+// Минимальный интервал между forceFull-sync при реконнектах — 60 сек.
+// Если соединение флапает (handshake проходит, стрим сразу рвётся), backoff
+// сбрасывается при каждом успешном handshake, и без этого guard'а forceFull
+// запускался бы каждые ~2 сек бесконечно, создавая лавину GET /items запросов.
+const RECONNECT_SYNC_MIN_INTERVAL_MS = 60_000
+let lastReconnectSyncTs = 0
+
 /**
  * Запустить SSE подписку. Возвращает функцию-стоп для отвязки.
  * Внутренний reconnect-loop работает пока stop() не вызван.
@@ -47,6 +54,10 @@ export function subscribeToInventoryEvents(opts: SubscribeOptions): () => void {
 
   let retryMs = RETRY_BASE_MS
   let stopped = false
+  // Флаг: первый коннект или реконнект после разрыва.
+  // На первом коннекте bootstrap forceFull уже был сделан в App.tsx,
+  // поэтому лишний sync не нужен. При реконнекте — дозагружаем пропущенное.
+  let hadDisconnect = false
 
   const loop = async () => {
     while (!stopped && !controller.signal.aborted) {
@@ -74,6 +85,31 @@ export function subscribeToInventoryEvents(opts: SubscribeOptions): () => void {
         }
         opts.onStatusChange?.('connected')
         retryMs = RETRY_BASE_MS // reset backoff после успешного подключения
+
+        // При реконнекте после разрыва — дозагружаем то что могло прийти
+        // пока SSE-канал был оборван. Используем dynamic import чтобы
+        // избежать циклической зависимости sync.ts ↔ sse.ts.
+        // Guard: не запускаем forceFull чаще раза в RECONNECT_SYNC_MIN_INTERVAL_MS.
+        // При флапающем соединении backoff сбрасывается после каждого успешного
+        // handshake, без guard'а это приводило бы к forceFull каждые ~2 сек.
+        if (hadDisconnect) {
+          const now = Date.now()
+          if (now - lastReconnectSyncTs >= RECONNECT_SYNC_MIN_INTERVAL_MS) {
+            lastReconnectSyncTs = now
+            void import('./sync')
+              .then(({ syncFromServer }) =>
+                syncFromServer({ forceFull: true }),
+              )
+              .catch((e: unknown) => {
+                log
+                  .warn(
+                    'inventory.sse',
+                    `reconnect forceFull-sync упал: ${e instanceof Error ? e.message : String(e)}`,
+                  )
+                  .catch(() => {})
+              })
+          }
+        }
 
         // Читаем поток построчно через ReadableStream API.
         const reader = res.body.getReader()
@@ -130,6 +166,10 @@ export function subscribeToInventoryEvents(opts: SubscribeOptions): () => void {
       }
       opts.onStatusChange?.('disconnected')
       if (stopped || controller.signal.aborted) break
+
+      // Помечаем что был разрыв — следующий успешный коннект запустит
+      // forceFull sync для дозагрузки пропущенных событий.
+      hadDisconnect = true
 
       // Wait + exponential backoff (с jitter).
       const wait = retryMs + Math.floor(Math.random() * 500)

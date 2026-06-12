@@ -317,9 +317,13 @@ export class JsonRpcEposClient {
     return this.call('Api.OpenZReport', { Time: this.formatTime(time) })
   }
 
-  /** Закрыть смену. */
-  closeZReport(): Promise<{ AppletVersion: string }> {
-    return this.call('Api.CloseZReport')
+  /**
+   * Закрыть смену. Time передаём как и в openZReport: без него Communicator
+   * некоторых версий парсит пустую строку и падает с code=65532
+   * «parsing time "" as "2006-01-02 15:04:05"».
+   */
+  closeZReport(time: Date = new Date()): Promise<{ AppletVersion: string }> {
+    return this.call('Api.CloseZReport', { Time: this.formatTime(time) })
   }
 
   // ⚠️ Печать X/Z-отчёта через Communicator JSON-RPC НЕДОСТУПНА.
