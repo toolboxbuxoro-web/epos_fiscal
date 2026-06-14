@@ -359,19 +359,22 @@ function ManualReceiptModalBody(props: BodyProps) {
     if (remaining <= 0) return
     // Пул с учётом уже выбранного: уменьшаем available на занятые штуки,
     // чтобы holistic не «взял» то что кассир уже добавил.
+    const subPoolItems = pool.items.map((pi) => {
+      const usedPcs = selected.get(pi.item.id) ?? 0
+      if (usedPcs <= 0) return pi
+      return {
+        ...pi,
+        item: {
+          ...pi.item,
+          available: Math.max(0, pi.item.available - usedPcs * 1000),
+        },
+      }
+    })
     const subPool: MatcherPool = {
       minSellingPrice: pool.minSellingPrice,
-      items: pool.items.map((pi) => {
-        const usedPcs = selected.get(pi.item.id) ?? 0
-        if (usedPcs <= 0) return pi
-        return {
-          ...pi,
-          item: {
-            ...pi.item,
-            available: Math.max(0, pi.item.available - usedPcs * 1000),
-          },
-        }
-      }),
+      items: subPoolItems,
+      // remainingById строим из скорректированных available субпула.
+      remainingById: new Map(subPoolItems.map((p) => [p.item.id, p.item.available])),
     }
     const r = planHolistic(remaining, subPool, opts)
     if (!r.ok) {

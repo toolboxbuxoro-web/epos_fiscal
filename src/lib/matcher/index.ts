@@ -27,8 +27,26 @@ import { tiyinToSumDisplay } from '@/lib/format'
 
 export * from './types'
 export { extractPositions } from './extract'
-export { loadMatcherPool, type MatcherPool } from './strategies'
+export { loadMatcherPool, poolRemaining, type MatcherPool } from './strategies'
 export { planHolistic } from './holistic'
+
+/**
+ * Вычесть использованное qty из мутабельной рабочей копии пула.
+ *
+ * Вызывается после финализации каждой позиции чека. Для каждого кандидата
+ * в матче вычитаем его quantity из `pool.remainingById[esfItem.id]`.
+ * Следующие позиции получат актуальный остаток через `poolRemaining()`.
+ *
+ * Если ключа нет в Map (редкий кейс для тестов без remainingById) — silent skip.
+ */
+function decrementPool(pool: MatcherPool, candidates: import('./types').MatchCandidate[]): void {
+  for (const c of candidates) {
+    const id = c.esfItem.id
+    const current = pool.remainingById.get(id)
+    if (current === undefined) continue
+    pool.remainingById.set(id, Math.max(0, current - c.quantity))
+  }
+}
 
 /**
  * Главная функция: собрать план фискализации для чека МойСклад.
@@ -159,6 +177,11 @@ export async function buildMatch(
     if (m) {
       matches.push(m)
       warnings.push(...m.warnings)
+      // Декремент пула: вычитаем использованные qty из remainingById чтобы
+      // следующие позиции видели актуальный остаток. Без этого один приход
+      // мог «матчиться» в несколько позиций суммарно сверх available —
+      // reserve на сервере падал с InventoryConflictError.
+      decrementPool(pool, m.candidates)
     } else {
       const reason = await explainNoMatch(pos, pool, opts)
       warnings.push(
@@ -185,6 +208,39 @@ export async function buildMatch(
         canSplitMore: false,
         splittable: false,
       })
+    }
+  }
+
+  // ── Post-validation (defense-in-depth) ──────────────────────────────
+  // Проверяем инвариант: суммарное использованное qty по server_item_id
+  // не должно превышать оригинальный available. Если это условие нарушено —
+  // это баг в стратегиях (не должно происходить после декремента выше).
+  // Не бросаем — preflight в fiscalize.ts всё равно проверит на сервере.
+  // Логируем только warn для диагностики.
+  {
+    // Агрегируем использованное qty по item.id
+    const usedById = new Map<number, number>()
+    for (const match of matches) {
+      for (const c of match.candidates) {
+        const id = c.esfItem.id
+        usedById.set(id, (usedById.get(id) ?? 0) + c.quantity)
+      }
+    }
+    // Проверяем против оригинального available
+    for (const poolItem of pool.items) {
+      const id = poolItem.item.id
+      const used = usedById.get(id)
+      if (used === undefined) continue
+      if (used > poolItem.item.available) {
+        void log.warn(
+          'matcher',
+          `[stock-overalloc] item.id=${id} "${poolItem.item.name}": ` +
+            `used=${used} > available=${poolItem.item.available} — ` +
+            `переаллокация остатков, reserve упадёт на сервере. ` +
+            `Это баг в стратегиях matcher'а, сообщите разработчику.`,
+          { item_id: id, used, available: poolItem.item.available },
+        )
+      }
     }
   }
 

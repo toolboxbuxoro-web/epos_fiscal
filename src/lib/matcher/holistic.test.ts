@@ -74,9 +74,14 @@ function mkPool(items: EsfItemWithAvailable[]): MatcherPool {
     (m, p) => (p.sellingPrice > 0 && p.sellingPrice < m ? p.sellingPrice : m),
     Number.POSITIVE_INFINITY,
   )
+  // Инициализируем remainingById как в loadMatcherPool.
+  const remainingById = new Map<number, number>(
+    poolItems.map((p) => [p.item.id, p.item.available]),
+  )
   return {
     items: poolItems,
     minSellingPrice: Number.isFinite(minSellingPrice) ? minSellingPrice : 0,
+    remainingById,
   }
 }
 
@@ -159,7 +164,7 @@ export function _selfTest_unreachableTarget(): void {
 }
 
 export function _selfTest_emptyPool(): void {
-  const r = planHolistic(100_000, { items: [], minSellingPrice: 0 })
+  const r = planHolistic(100_000, { items: [], minSellingPrice: 0, remainingById: new Map() })
   assert(!r.ok && r.reason === 'POOL_EMPTY', `expected POOL_EMPTY, got ${!r.ok && r.reason}`)
 }
 

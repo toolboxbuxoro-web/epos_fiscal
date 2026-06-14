@@ -586,13 +586,28 @@ async function tryRemoteReserve(
       // Не прерываем — цель preflight это проверка, не запись.
     }
 
-    const insufficient: Array<{ inv_item_id: number; available: number; requested: number }> = []
+    // АГРЕГИРУЕМ запрошенное кол-во по inv_item_id ПЕРЕД проверкой. Один и тот
+    // же приход может стоять в нескольких строках плана (holistic/classic
+    // переиспользуют SKU на разные позиции), а server.reserve складывает их
+    // атомарно по inv_item_id. Если проверять построчно — переаллокация
+    // (4+4 > 7 при available=7) проходит мимо preflight: `7≥4`✓ дважды → reserve
+    // падает на Postgres-инварианте → InventoryStaleError → цикл «зацикливается».
+    // Суммируем и сравниваем кумулятив с остатком — это ловит переаллокацию как
+    // чистый InventoryConflictError (UI сделает exclude + sync + rematch).
+    const requestedById = new Map<number, number>()
     for (const it of items) {
-      const f = freshById.get(it.inv_item_id)
+      requestedById.set(
+        it.inv_item_id,
+        (requestedById.get(it.inv_item_id) ?? 0) + it.quantity,
+      )
+    }
+    const insufficient: Array<{ inv_item_id: number; available: number; requested: number }> = []
+    for (const [invItemId, requested] of requestedById) {
+      const f = freshById.get(invItemId)
       if (!f) continue // не нашли в свежем — пропускаем, пусть reserve сам решает
       const available = f.qty_received - f.qty_consumed - f.qty_reserved
-      if (available < it.quantity) {
-        insufficient.push({ inv_item_id: it.inv_item_id, available, requested: it.quantity })
+      if (available < requested) {
+        insufficient.push({ inv_item_id: invItemId, available, requested })
       }
     }
     if (insufficient.length > 0) {

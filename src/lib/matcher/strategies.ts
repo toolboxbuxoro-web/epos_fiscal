@@ -62,11 +62,36 @@ export interface MatcherPool {
   items: PoolItem[]
   /** Минимальная цена в пуле — для подсказок «нечем набрать по multi-item». */
   minSellingPrice: Tiyin
+  /**
+   * Мутабельная рабочая копия остатков (ключ = esfItem.id, значение = тийины).
+   *
+   * Инициализируется в `loadMatcherPool` из `item.available`.
+   * После финализации каждой позиции buildMatch вычитает использованное qty
+   * через `decrementPool()` — следующие стратегии видят актуальный остаток.
+   * Это предотвращает переаллокацию одного прихода на несколько позиций
+   * сверх реального доступного количества.
+   *
+   * Единицы: миллидоли (1000 = 1 шт) — такие же как `item.available`.
+   */
+  remainingById: Map<number, number>
 }
 
 export interface PoolItem {
   item: EsfItemWithAvailable
   sellingPrice: Tiyin
+}
+
+/**
+ * Вернуть текущий остаток товара из мутабельной рабочей копии пула.
+ *
+ * Если `remainingById` содержит запись — возвращает её (может быть < item.available
+ * если предыдущие позиции уже «съели» часть). Fallback на `item.available` если
+ * ключа нет (для обратной совместимости и тестов без remainingById).
+ *
+ * Единицы: миллидоли (1000 = 1 шт).
+ */
+export function poolRemaining(pool: MatcherPool, itemId: number): number {
+  return pool.remainingById.get(itemId) ?? pool.items.find((p) => p.item.id === itemId)?.item.available ?? 0
 }
 
 /**
@@ -151,9 +176,17 @@ export async function loadMatcherPool(opts: MatcherOptions = {}): Promise<Matche
     }
     return { item, sellingPrice }
   })
+  // Инициализируем мутабельную рабочую копию остатков.
+  // Ключ = esfItem.id, значение = item.available в миллидолях.
+  // buildMatch будет вычитать из этой Map после каждой финализированной позиции
+  // чтобы следующие позиции видели актуальный остаток, а не исходный.
+  const remainingById = new Map<number, number>(
+    items.map((p) => [p.item.id, p.item.available]),
+  )
   return {
     items,
     minSellingPrice: Number.isFinite(minSellingPrice) ? minSellingPrice : 0,
+    remainingById,
   }
 }
 
@@ -313,9 +346,11 @@ export function tryLinkedMsVariant(
     return null
   }
 
-  // Фильтруем по остатку: должно хватить на нашу quantity
+  // Фильтруем по остатку: должно хватить на нашу quantity.
+  // Используем poolRemaining() — актуальный остаток после ранее матчнутых позиций,
+  // а не статичный item.available (который не меняется после load).
   const withStock = candidates.filter(
-    (p) => p.item.qty_received - p.item.qty_consumed >= pos.quantity,
+    (p) => poolRemaining(pool, p.item.id) >= pos.quantity,
   )
   if (withStock.length === 0) {
     // Normal-case: товар связан, но остаток < нужного (например ушло на
@@ -341,7 +376,7 @@ export function tryLinkedMsVariant(
     `[linked-ms] ✓ "${pos.linkedBuhName}" → "${chosen.item.name}" (ИКПУ ${chosen.item.class_code})`,
     {
       ms_qty: pos.quantity,
-      available: chosen.item.qty_received - chosen.item.qty_consumed,
+      available: poolRemaining(pool, chosen.item.id),
       alternatives: sorted.length,
     },
   )
@@ -401,7 +436,7 @@ export function tryPassthrough(
   const candidates = pool.items.filter(
     (p) =>
       p.item.class_code === pos.classCode &&
-      p.item.qty_received - p.item.qty_consumed >= pos.quantity &&
+      poolRemaining(pool, p.item.id) >= pos.quantity &&
       (!strictVat || p.item.vat_percent === pos.vatPercent),
   )
 
@@ -476,9 +511,12 @@ export function tryPriceBucket(
 
   // Собираем ВСЕХ кандидатов в пределах swapTolerance, отсортированных
   // по близости к target — первый = best.
+  // Фильтруем по poolRemaining (1 шт = 1000 milli) — не предлагаем товары
+  // которые уже «съедены» предыдущими позициями в этом чеке.
   const inRange: { item: EsfItemWithAvailable; sellingPrice: Tiyin; diff: number }[] = []
   for (const p of pool.items) {
     if (strictVat && p.item.vat_percent !== pos.vatPercent) continue
+    if (poolRemaining(pool, p.item.id) < 1000) continue // 1 шт минимум
     const diff = Math.abs(p.sellingPrice - pos.totalTiyin)
     if (diff > swapTolerance) continue
     inRange.push({ item: p.item, sellingPrice: p.sellingPrice, diff })
@@ -561,7 +599,7 @@ export function tryMultiItem(
     if (sellingPrice > remaining + tolerance) continue
 
     const fitsByPrice = Math.floor(remaining / sellingPrice)
-    const fitsByStock = Math.floor(item.available / 1000)
+    const fitsByStock = Math.floor(poolRemaining(pool, item.id) / 1000)
     const qty = Math.min(fitsByPrice, fitsByStock)
     if (qty <= 0) continue
 
@@ -622,7 +660,7 @@ export function canSplitToLevel(
   let cnt = 0
   for (const p of pool.items) {
     if (strictVat && p.item.vat_percent !== pos.vatPercent) continue
-    if (Math.floor(p.item.available / 1000) < 1) continue
+    if (Math.floor(poolRemaining(pool, p.item.id) / 1000) < 1) continue
     if (Math.abs(p.sellingPrice - targetAvg) > radius) continue
     cnt++
     if (cnt >= N) return true

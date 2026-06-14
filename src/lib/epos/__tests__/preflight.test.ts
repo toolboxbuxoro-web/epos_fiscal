@@ -42,13 +42,22 @@ async function simulatePreflight(opts: {
     if (itemIds.includes(f.id)) freshById.set(f.id, f)
   }
 
-  const insufficient: Array<{ inv_item_id: number; available: number; requested: number }> = []
+  // АГРЕГИРУЕМ запрошенное кол-во по inv_item_id перед сравнением — точная
+  // копия логики fiscalize.ts::requestedById. Один и тот же приход может
+  // стоять в нескольких строках плана (holistic/classic переиспользуют SKU
+  // на разные позиции), поэтому проверяем кумулятив против available.
+  const requestedById = new Map<number, number>()
   for (const it of opts.reserveItems) {
-    const f = freshById.get(it.inv_item_id)
+    requestedById.set(it.inv_item_id, (requestedById.get(it.inv_item_id) ?? 0) + it.quantity)
+  }
+
+  const insufficient: Array<{ inv_item_id: number; available: number; requested: number }> = []
+  for (const [invItemId, requested] of requestedById) {
+    const f = freshById.get(invItemId)
     if (!f) continue
     const available = f.qty_received - f.qty_consumed - f.qty_reserved
-    if (available < it.quantity) {
-      insufficient.push({ inv_item_id: it.inv_item_id, available, requested: it.quantity })
+    if (available < requested) {
+      insufficient.push({ inv_item_id: invItemId, available, requested })
     }
   }
 
@@ -158,6 +167,37 @@ describe('Preflight: ДО reserve проверка серверных остат
         serverItems: [mkRemoteItem({ id: 1, received: 5, consumed: 2, reserved: 3 })], // available=0
       })
       expect(r.action).toBe('conflict')
+    })
+
+    it('регресс: два плана с ОДНИМ inv_item_id (4000+4000) при available=7000 → conflict (переаллокация)', async () => {
+      // БАГ без агрегации: `7000 >= 4000` ✓ дважды → reserve → Postgres-инвариант
+      // ФИКС с requestedById: суммируем 4000+4000=8000, сравниваем 8000 > 7000 → conflict
+      const r = await simulatePreflight({
+        reserveItems: [
+          { inv_item_id: 1, quantity: 4000 },
+          { inv_item_id: 1, quantity: 4000 },
+        ],
+        serverItems: [mkRemoteItem({ id: 1, received: 7 })], // available = 7000
+      })
+      expect(r.action).toBe('conflict')
+      if (r.action === 'conflict') {
+        // Агрегированная запись — одна, не две
+        expect(r.failed).toHaveLength(1)
+        expect(r.failed[0]!.inv_item_id).toBe(1)
+        expect(r.failed[0]!.requested).toBe(8000) // 4000 + 4000 агрегировано
+        expect(r.failed[0]!.available).toBe(7000)
+      }
+    })
+
+    it('регресс: те же 4000+4000 при available=8000 → reserve (граничный случай: exact fit)', async () => {
+      const r = await simulatePreflight({
+        reserveItems: [
+          { inv_item_id: 1, quantity: 4000 },
+          { inv_item_id: 1, quantity: 4000 },
+        ],
+        serverItems: [mkRemoteItem({ id: 1, received: 8 })], // available = 8000
+      })
+      expect(r.action).toBe('reserve')
     })
   })
 
