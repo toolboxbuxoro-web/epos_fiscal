@@ -13,6 +13,7 @@
 
 use encoding_rs::IBM866;
 use printers::common::base::job::PrinterJobOptions;
+use qrcodegen::{QrCode, QrCodeEcc};
 use serde::{Deserialize, Serialize};
 
 /// Метаданные принтера для UI выбора в Settings.
@@ -654,21 +655,152 @@ fn display_width(s: &str) -> usize {
 
 // ── QR-код ────────────────────────────────────────────────────────
 
+/// Печатаем QR РАСТРОМ (`GS v 0` — bit image), а НЕ нативной командой `GS ( k`.
+///
+/// Причина: часть 80мм-принтеров (не Xprinter XP-80) не поддерживают `GS ( k`
+/// и печатают её параметры текстом (`1A2…C…E0…P0<url>`) вместо картинки —
+/// клиент не может отсканировать чек для кешбэка. Растровое изображение через
+/// `GS v 0` понимает практически любой ESC/POS-принтер, поэтому QR перестаёт
+/// зависеть от модели. Работает и на Xprinter (raster даже шире поддержан).
+///
+/// Выравнивание (центр) ставит вызывающий код через `center(buf)` до вызова.
 fn append_qr_code(buf: &mut Vec<u8>, data: &str) {
-    let data_bytes = data.as_bytes();
+    // ECC Medium — устойчивее к смазу термопечати, чем Low (было у GS ( k).
+    let qr = match QrCode::encode_text(data, QrCodeEcc::Medium) {
+        Ok(q) => q,
+        Err(_) => {
+            // Данные длиннее лимита QR (для ОФД-URL не случается) — fallback:
+            // печатаем ссылку текстом, чтобы чек не остался совсем без неё.
+            write_line(buf, data);
+            return;
+        }
+    };
+    let n = qr.size(); // модулей на сторону
+    const QUIET: i32 = 4; // белая рамка (quiet zone) — обязательна для скана
+    let modules = n + 2 * QUIET;
+    // Точек-на-модуль: целимся в ~360 точек ширины (влезает и в 58мм, и в 80мм),
+    // но не мельче 2 (не сканируется) и не крупнее 10 (не гигантский QR).
+    let scale = (360 / modules).clamp(2, 10);
+    let width_dots = modules * scale;
+    let width_bytes = ((width_dots + 7) / 8) as usize;
+    let height_dots = width_dots;
 
-    // Set QR model = 2.
-    buf.extend_from_slice(&[0x1D, 0x28, 0x6B, 0x04, 0x00, 0x31, 0x41, 0x32, 0x00]);
-    // Module size = 8.
-    buf.extend_from_slice(&[0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x43, 0x08]);
-    // Error correction level L.
-    buf.extend_from_slice(&[0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x45, 0x30]);
-    // Store data.
-    let len = data_bytes.len() + 3;
-    let p_l = (len & 0xFF) as u8;
-    let p_h = ((len >> 8) & 0xFF) as u8;
-    buf.extend_from_slice(&[0x1D, 0x28, 0x6B, p_l, p_h, 0x31, 0x50, 0x30]);
-    buf.extend_from_slice(data_bytes);
-    // Print stored QR.
-    buf.extend_from_slice(&[0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x51, 0x30]);
+    // Разбиваем растр на горизонтальные полосы и шлём КАЖДУЮ отдельной командой
+    // GS v 0. Дешёвые 80мм-принтеры (те самые, что не тянули GS ( k) часто имеют
+    // маленький входной буфер и обрезают/глючат на одном большом (~16КБ) растре.
+    // Полосы по 128 строк надёжно влезают в любой буфер.
+    const BAND: i32 = 128;
+    let mut y0 = 0;
+    while y0 < height_dots {
+        let band_h = BAND.min(height_dots - y0);
+        // GS v 0 — растровое изображение: m=0, xL/xH = ширина в БАЙТАХ,
+        // yL/yH = высота полосы в ТОЧКАХ.
+        buf.extend_from_slice(&[0x1D, 0x76, 0x30, 0x00]);
+        buf.push((width_bytes & 0xFF) as u8);
+        buf.push(((width_bytes >> 8) & 0xFF) as u8);
+        buf.push((band_h as usize & 0xFF) as u8);
+        buf.push(((band_h as usize >> 8) & 0xFF) as u8);
+
+        for y in y0..y0 + band_h {
+            let my = y / scale - QUIET; // индекс модуля по вертикали (в quiet-зоне < 0)
+            let mut row = vec![0u8; width_bytes];
+            if my >= 0 && my < n {
+                for x in 0..width_dots {
+                    let mx = x / scale - QUIET;
+                    if mx >= 0 && mx < n && qr.get_module(mx, my) {
+                        row[(x / 8) as usize] |= 0x80 >> (x % 8);
+                    }
+                }
+            }
+            buf.extend_from_slice(&row);
+        }
+        y0 += band_h;
+    }
+}
+
+#[cfg(test)]
+mod qr_tests {
+    use super::*;
+
+    /// Разобрать буфер на полосы GS v 0. Возвращает (width_bytes, суммарная
+    /// высота в точках, все растровые данные подряд, кол-во полос).
+    fn parse_bands(buf: &[u8]) -> (usize, usize, Vec<u8>, usize) {
+        let mut pos = 0;
+        let mut total_h = 0;
+        let mut width_bytes = 0;
+        let mut data = Vec::new();
+        let mut bands = 0;
+        while pos < buf.len() {
+            assert_eq!(
+                &buf[pos..pos + 4],
+                &[0x1D, 0x76, 0x30, 0x00],
+                "полоса {bands}: нет заголовка GS v 0",
+            );
+            let wb = buf[pos + 4] as usize + ((buf[pos + 5] as usize) << 8);
+            let bh = buf[pos + 6] as usize + ((buf[pos + 7] as usize) << 8);
+            if bands == 0 {
+                width_bytes = wb;
+            } else {
+                assert_eq!(wb, width_bytes, "ширина полос разъехалась");
+            }
+            let start = pos + 8;
+            let end = start + wb * bh;
+            assert!(end <= buf.len(), "полоса {bands}: данные обрезаны");
+            data.extend_from_slice(&buf[start..end]);
+            total_h += bh;
+            bands += 1;
+            pos = end;
+        }
+        (width_bytes, total_h, data, bands)
+    }
+
+    /// Растровый QR: заголовки GS v 0 корректны, длина данных каждой полосы
+    /// сходится, картинка квадратная и не пустая. Реальный ОФД-URL.
+    #[test]
+    fn raster_qr_wellformed() {
+        let url = "https://ofd.soliq.uz/check?t=VG343420011185&r=8317&c=20260710174633&s=260038118524";
+        let mut buf = Vec::new();
+        append_qr_code(&mut buf, url);
+
+        let (width_bytes, height_dots, data, bands) = parse_bands(&buf);
+        assert!(width_bytes > 0 && height_dots > 0 && bands >= 1);
+        assert_eq!(data.len(), width_bytes * height_dots, "длина растра != размерам");
+
+        // QR квадратный: высота в точках ≈ ширина в точках (± паддинг байта).
+        let width_dots = width_bytes * 8;
+        assert!(
+            width_dots >= height_dots && width_dots - height_dots < 8,
+            "картинка не квадратная: {width_dots}×{height_dots}",
+        );
+
+        // Не пустая и не сплошь чёрная — есть и тёмные, и светлые модули.
+        let dark: usize = data.iter().map(|b| b.count_ones() as usize).sum();
+        assert!(dark > 0 && dark < width_bytes * 8 * height_dots, "QR пустой/сплошной");
+    }
+
+    /// Финдер-паттерн: угол (0,0) в quiet-зоне светлый, а в первой трети
+    /// есть тёмные модули финдера. Данные полос склеены в непрерывный растр.
+    #[test]
+    fn raster_qr_top_left_finder_dark() {
+        let mut buf = Vec::new();
+        append_qr_code(&mut buf, "https://ofd.soliq.uz/check?t=1&r=2&c=3&s=4");
+        let (width_bytes, height_dots, data, _) = parse_bands(&buf);
+
+        let dark_in = |bx: usize, by: usize| -> bool {
+            (data[by * width_bytes + bx / 8] & (0x80 >> (bx % 8))) != 0
+        };
+        // Верхний-левый угол (0,0) — в quiet-зоне, должен быть светлым.
+        assert!(!dark_in(0, 0), "quiet-зона в углу должна быть светлой");
+        // Где-то в первой трети есть тёмные модули финдера.
+        let third = ((width_bytes * 8) / 3).min(height_dots);
+        let mut found_dark = false;
+        for y in 0..third {
+            for x in 0..third {
+                if dark_in(x, y) {
+                    found_dark = true;
+                }
+            }
+        }
+        assert!(found_dark, "не нашли тёмных модулей финдер-паттерна");
+    }
 }

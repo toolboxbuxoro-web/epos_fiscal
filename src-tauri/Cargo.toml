@@ -29,6 +29,10 @@ printers = "2"
 # UTF-8 → CP866 (DOS Cyrillic) для печати русских букв на Xprinter.
 # CP866 = codepage 17 у Xprinter, проверенный стандарт.
 encoding_rs = "0.8"
+# Генерация QR-кода растром (GS v 0), а не нативной командой GS ( k —
+# часть 80мм-принтеров не поддерживают GS ( k и печатают её текстом.
+# qrcodegen (Nayuki) — лёгкий, без транзитивных зависимостей.
+qrcodegen = "1.8"
 
 [profile.dev]
 incremental = true
