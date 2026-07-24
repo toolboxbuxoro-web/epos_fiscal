@@ -38,6 +38,7 @@ import {
   RefundAlreadyExistsError,
 } from '@/lib/epos'
 import { extractPositions } from '@/lib/matcher'
+import { parseRequestJsonReceipt } from '@/lib/epos/request-json'
 import type { MsRetailDemand } from '@/lib/moysklad'
 import {
   Badge,
@@ -732,38 +733,24 @@ export default function Refund() {
 
 // ── Helpers ────────────────────────────────────────────────────────
 
-interface RpcReceiptShape {
-  Items?: Array<{
-    Name?: string
-    spic?: string
-    ClassCode?: string
-    Amount?: number
-    Price?: number
-    Discount?: number
-    VAT?: number
-    VATPercent?: number
-  }>
-  ReceivedCash?: number
-  ReceivedCard?: number
-}
-
+/**
+ * Позиции оригинального фискального чека из request_json. Через единый
+ * парсер (@/lib/epos/request-json) — понимает и EPOS (params.Receipt),
+ * и FiscalDriveService ({factoryId, receipt}). Раньше знал только EPOS —
+ * у FDS-магазинов возврат показывал «0 позиций, сумма чека 0» и блокировался.
+ */
 function parseItemsFromRequestJson(json: string): OriginalItem[] {
-  try {
-    const parsed = JSON.parse(json) as { params?: { Receipt?: RpcReceiptShape } }
-    const receipt = parsed?.params?.Receipt
-    if (!receipt?.Items) return []
-    return receipt.Items.map((it) => ({
-      name: it.Name ?? '',
-      classCode: it.spic ?? it.ClassCode ?? '',
-      qty: it.Amount ?? 1000,
-      price: it.Price ?? 0,
-      discount: it.Discount ?? 0,
-      vatTiyin: it.VAT ?? 0,
-      vatPercent: it.VATPercent ?? 0,
-    }))
-  } catch {
-    return []
-  }
+  const norm = parseRequestJsonReceipt(json)
+  if (!norm) return []
+  return norm.items.map((it) => ({
+    name: it.name,
+    classCode: it.classCode,
+    qty: it.amount,
+    price: it.priceTiyin,
+    discount: it.discountTiyin,
+    vatTiyin: it.vatTiyin,
+    vatPercent: it.vatPercent,
+  }))
 }
 
 function parseSumToTiyin(s: string): number {

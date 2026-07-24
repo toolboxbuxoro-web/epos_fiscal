@@ -19,6 +19,7 @@ import {
   printFiscalReceipt,
   type ReceiptData,
 } from '@/lib/printer'
+import { parseRequestJsonReceipt } from '@/lib/epos/request-json'
 import { Button } from '@/components/ui/Button'
 
 /** Сколько чеков на одной странице Истории. */
@@ -44,28 +45,18 @@ function parsePayment(requestJson: string): {
   total: number
   kind: 'cash' | 'card' | 'mixed'
 } | null {
-  try {
-    const req = JSON.parse(requestJson) as {
-      params?: {
-        Receipt?: {
-          ReceivedCash?: number
-          ReceivedCard?: number
-        }
-      }
-    }
-    const r = req?.params?.Receipt
-    if (!r) return null
-    const cash = Math.max(0, r.ReceivedCash ?? 0)
-    const card = Math.max(0, r.ReceivedCard ?? 0)
-    if (cash === 0 && card === 0) return null
-    let kind: 'cash' | 'card' | 'mixed'
-    if (cash > 0 && card > 0) kind = 'mixed'
-    else if (card > 0) kind = 'card'
-    else kind = 'cash'
-    return { cashTiyin: cash, cardTiyin: card, total: cash + card, kind }
-  } catch {
-    return null
-  }
+  // Единый парсер: EPOS (params.Receipt) И FiscalDriveService ({receipt}).
+  // Раньше знал только EPOS — у FDS-чеков колонки показывали прочерк.
+  const norm = parseRequestJsonReceipt(requestJson)
+  if (!norm) return null
+  const cash = norm.receivedCashTiyin
+  const card = norm.receivedCardTiyin
+  if (cash === 0 && card === 0) return null
+  let kind: 'cash' | 'card' | 'mixed'
+  if (cash > 0 && card > 0) kind = 'mixed'
+  else if (card > 0) kind = 'card'
+  else kind = 'cash'
+  return { cashTiyin: cash, cardTiyin: card, total: cash + card, kind }
 }
 
 export default function History() {
@@ -388,16 +379,8 @@ function buildReceiptDataFromHistory(
   receipt: FiscalReceiptRow,
   settings: Record<string, string>,
 ): ReceiptData {
-  // Парсим request_json с двумя возможными форматами.
-  type RpcItem = {
-    Price?: number
-    Discount?: number
-    VAT?: number
-    Name?: string
-    ClassCode?: string
-    Amount?: number
-    VATPercent?: number
-  }
+  // Современные форматы (EPOS/FDS) разбирает parseRequestJsonReceipt,
+  // ниже остался только тип для legacy /uzpos-чеков.
   type LegacyItem = {
     price?: number
     discount?: number
@@ -414,25 +397,25 @@ function buildReceiptDataFromHistory(
   try {
     const parsed = JSON.parse(receipt.request_json) as Record<string, unknown>
 
-    // JSON-RPC: { params: { Receipt: { Items: [...], ReceivedCash, ReceivedCard } } }
-    const rpcReceipt = (
-      parsed?.params as { Receipt?: unknown } | undefined
-    )?.Receipt as
-      | { Items?: RpcItem[]; ReceivedCash?: number; ReceivedCard?: number }
-      | undefined
-    if (rpcReceipt?.Items) {
-      items = rpcReceipt.Items.map((it) => ({
-        name: it.Name ?? '',
-        class_code: it.ClassCode ?? '',
-        qty_str: formatQtyForPrint(it.Amount ?? 1000),
-        price_str: formatTiyinForPrint(it.Price ?? 0),
+    // Современные форматы (EPOS params.Receipt / FDS {receipt}) — через единый
+    // парсер. Заодно чинит ИКПУ на копиях: EPOS шлёт поле `spic`, а старый
+    // код читал только `ClassCode` (пустой ИКПУ на перепечати).
+    const norm = parseRequestJsonReceipt(receipt.request_json)
+    if (norm) {
+      items = norm.items.map((it) => ({
+        name: it.name,
+        class_code: it.classCode,
+        qty_str: formatQtyForPrint(it.amount),
+        price_str: formatTiyinForPrint(it.priceTiyin),
         discount_str:
-          (it.Discount ?? 0) > 0 ? formatTiyinForPrint(it.Discount ?? 0) : '',
-        vat_str: formatTiyinForPrint(it.VAT ?? 0),
-        vat_percent: it.VATPercent ?? 12,
+          it.discountTiyin > 0 ? formatTiyinForPrint(it.discountTiyin) : '',
+        vat_str: formatTiyinForPrint(it.vatTiyin),
+        // Без дефолта в 12: наши payload всегда содержат VATPercent, а
+        // «|| 12» ломал бы законный 0% (магазин на упрощёнке).
+        vat_percent: it.vatPercent,
       }))
-      receivedCash = rpcReceipt.ReceivedCash ?? 0
-      receivedCard = rpcReceipt.ReceivedCard ?? 0
+      receivedCash = norm.receivedCashTiyin
+      receivedCard = norm.receivedCardTiyin
     } else {
       // Legacy /uzpos: { params: { items: [...], receivedCash, receivedCard } }
       const legacyParams = parsed?.params as
