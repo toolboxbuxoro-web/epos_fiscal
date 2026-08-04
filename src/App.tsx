@@ -18,6 +18,7 @@ import {
   stopInventoryRuntime,
 } from '@/lib/inventory'
 import { ensureTelemetryStarted } from '@/lib/telemetry'
+import { backfillSearchText } from '@/lib/db'
 import { Toaster } from '@/components/ui'
 import { AppVersionBadge } from '@/components/AppVersionBadge'
 
@@ -37,6 +38,16 @@ export default function App() {
     // Background-flusher раз в 30 сек, opt-out через Настройки.
     // Idempotent. Никогда не throw — не ломает основной поток.
     void ensureTelemetryStarted()
+
+    // Разовая индексация старых чеков для поиска в Истории (migration 014).
+    // Делаем на старте, чтобы к моменту открытия Истории поиск уже работал.
+    // Идемпотентно, после первого прохода почти бесплатно.
+    void backfillSearchText().catch((e) => {
+      void log.warn(
+        'app',
+        `Индексация Истории для поиска не завершилась: ${e instanceof Error ? e.message : String(e)}`,
+      )
+    })
 
     return () => {
       stopInventoryRuntime()

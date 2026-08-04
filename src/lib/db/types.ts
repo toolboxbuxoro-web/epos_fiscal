@@ -356,6 +356,14 @@ export interface FiscalReceiptRow {
    * В refund / reprint не влияет — refund работает с фискальным итогом.
    */
   excluded_payment_tiyin: Tiyin
+  /**
+   * Денормализованная строка для поиска в Истории (migration 014): имена
+   * товаров + ИКПУ + номера чека + фискальный признак, всё в НИЖНЕМ регистре.
+   *
+   * `null` — чек ещё не прошёл разовый backfill (`backfillSearchText`).
+   * Заполняется автоматически при вставке новых чеков.
+   */
+  search_text: string | null
 }
 
 // ── replacement_log ──────────────────────────────────────────────

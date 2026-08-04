@@ -385,6 +385,10 @@ export async function fiscalize(
     // чеков и тестового режима — null (строка «Karta turi» не печатается).
     card_kind: receivedCard > 0 ? (opts.cardKind ?? null) : null,
     excluded_payment_tiyin: excludePayment,
+    // Попадают в search_text: кассир ищет чек по номеру и по названиям из
+    // МойСклад («дрель»), а не по подменённым ИКПУ-именам, ушедшим в ОФД.
+    ms_name: build.receipt.name ?? null,
+    ms_item_names: build.positions.map((p) => p.source.name),
   })
 
   // 6. Статус.

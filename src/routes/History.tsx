@@ -1,12 +1,13 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { formatErrorForUser } from '@/lib/error-message'
 import { useNavigate } from 'react-router-dom'
-import { ChevronLeft, ChevronRight, Undo2 } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Search, Undo2, X } from 'lucide-react'
 import {
+  backfillSearchText,
   countFiscalReceipts,
   getAllSettings,
   getRefundStatesMap,
-  listFiscalReceipts,
+  searchFiscalReceipts,
   SettingKey,
   type FiscalReceiptRow,
   type RefundState,
@@ -59,6 +60,35 @@ function parsePayment(requestJson: string): {
   return { cashTiyin: cash, cardTiyin: card, total: cash + card, kind }
 }
 
+// ── Даты фильтра ─────────────────────────────────────────────────
+// <input type="date"> работает со строкой 'YYYY-MM-DD' в ЛОКАЛЬНОМ времени,
+// а fiscalized_at в БД — epoch-секунды. Конвертируем через локальный
+// конструктор Date: `new Date('2026-07-24')` распарсил бы строку как UTC и
+// на UZT (+5) сдвинул бы границу периода на 5 часов.
+
+/** Date → 'YYYY-MM-DD' (локальная дата) для value у <input type="date">. */
+function toDateInput(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+}
+
+/** Строгая форма даты: `Number('')` даёт 0, поэтому split+isFinite мало. */
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
+
+/** 'YYYY-MM-DD' → epoch-сек начала этого дня. Пустая/кривая строка → null. */
+function dayStartEpoch(s: string): number | null {
+  if (!DATE_RE.test(s)) return null
+  const [y, m, d] = s.split('-').map(Number) as [number, number, number]
+  return Math.floor(new Date(y, m - 1, d, 0, 0, 0, 0).getTime() / 1000)
+}
+
+/** 'YYYY-MM-DD' → epoch-сек конца этого дня (день входит в период целиком). */
+function dayEndEpoch(s: string): number | null {
+  if (!DATE_RE.test(s)) return null
+  const [y, m, d] = s.split('-').map(Number) as [number, number, number]
+  return Math.floor(new Date(y, m - 1, d, 23, 59, 59, 999).getTime() / 1000)
+}
+
 export default function History() {
   const nav = useNavigate()
   const [rows, setRows] = useState<FiscalReceiptRow[]>([])
@@ -79,22 +109,77 @@ export default function History() {
   const [printing, setPrinting] = useState<Record<number, boolean>>({})
   /** Текущая страница (0-based). */
   const [page, setPage] = useState(0)
-  /** Общее число чеков — для расчёта количества страниц. */
+  /** Число чеков, подходящих под текущие фильтры (для пагинации и счётчика). */
   const [total, setTotal] = useState(0)
+
+  // ── Поиск и фильтры ────────────────────────────────────────────
+  /** Что кассир печатает прямо сейчас (обновляется на каждый символ). */
+  const [query, setQuery] = useState('')
+  /** Запрос с задержкой — в БД ходим только по нему, а не на каждый символ. */
+  const [debouncedQuery, setDebouncedQuery] = useState('')
+  /** Границы периода, как их отдаёт <input type="date"> — 'YYYY-MM-DD' или ''. */
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo] = useState('')
+  const searchRef = useRef<HTMLInputElement>(null)
+  /**
+   * Номер последнего запущенного запроса. Ответы могут прийти не в том
+   * порядке, в котором ушли (быстрый ввод) — применяем только самый свежий,
+   * иначе в таблице окажется результат уже неактуального запроса.
+   */
+  const reqIdRef = useRef(0)
+
+  // Debounce ввода: 250 мс тишины — и только тогда идём в БД.
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedQuery(query), 250)
+    return () => clearTimeout(t)
+  }, [query])
+
+  /** Фильтры для DAO: даты → epoch-секунды (включая весь последний день). */
+  const filters = useMemo(
+    () => ({
+      query: debouncedQuery,
+      dateFrom: dayStartEpoch(dateFrom),
+      dateTo: dayEndEpoch(dateTo),
+    }),
+    [debouncedQuery, dateFrom, dateTo],
+  )
+  const hasFilters =
+    debouncedQuery.trim() !== '' || dateFrom !== '' || dateTo !== ''
+
+  // Разовая дозаливка search_text для чеков, созданных до migration 014.
+  // Идемпотентна и почти бесплатна после первого прохода (частичный индекс).
+  // Обычно уже отработала на старте приложения (App.tsx) — здесь подстраховка
+  // на случай, если Историю открыли раньше, чем она успела завершиться.
+  useEffect(() => {
+    void backfillSearchText()
+      .then((n) => {
+        // Что-то доиндексировали — перечитаем страницу, иначе кассир сразу
+        // после обновления ищет и не находит уже проиндексированный чек.
+        if (n > 0) void load()
+      })
+      .catch(() => {
+        // Не критично: поиск по старым чекам их не найдёт, новые чеки
+        // индексируются при вставке. Кассиру ошибку не показываем.
+      })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   useEffect(() => {
     void load()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page])
+  }, [page, filters])
 
   async function load() {
+    const reqId = ++reqIdRef.current
     setLoading(true)
     setError(null)
     try {
       const [list, count] = await Promise.all([
-        listFiscalReceipts(PAGE_SIZE, page * PAGE_SIZE),
-        countFiscalReceipts(),
+        searchFiscalReceipts(filters, PAGE_SIZE, page * PAGE_SIZE),
+        countFiscalReceipts(filters),
       ])
+      // Пока ждали — кассир успел изменить фильтр: этот ответ уже неактуален.
+      if (reqId !== reqIdRef.current) return
       setRows(list)
       setTotal(count)
       // Bulk-проверка состояния возвратов: полный / частичный / нет.
@@ -102,12 +187,42 @@ export default function History() {
       // - 'partial' → кнопка активна (можно довозвратить), бейдж «Частично»
       // - отсутствует → кнопка активна, бейджа нет
       const states = await getRefundStatesMap(list.map((r) => r.id))
+      if (reqId !== reqIdRef.current) return
       setRefundStates(states)
     } catch (e) {
+      if (reqId !== reqIdRef.current) return
       setError(formatErrorForUser(e))
     } finally {
-      setLoading(false)
+      if (reqId === reqIdRef.current) setLoading(false)
     }
+  }
+
+  /** Любое изменение фильтра сбрасывает пагинацию на первую страницу. */
+  function applyQuery(v: string) {
+    setQuery(v)
+    setPage(0)
+    // Очистку (крестик / Esc) применяем сразу, без debounce — ждать 250 мс
+    // после явного «стереть» выглядит как подвисание.
+    if (v === '') setDebouncedQuery('')
+  }
+  function applyDates(from: string, to: string) {
+    setDateFrom(from)
+    setDateTo(to)
+    setPage(0)
+  }
+  function resetFilters() {
+    setQuery('')
+    setDebouncedQuery('')
+    setDateFrom('')
+    setDateTo('')
+    setPage(0)
+  }
+  /** Пресет «последние N дней» (0 = только сегодня). */
+  function applyDayPreset(days: number) {
+    const today = new Date()
+    const from = new Date()
+    from.setDate(from.getDate() - days)
+    applyDates(toDateInput(from), toDateInput(today))
   }
 
   // Кол-во страниц (минимум 1, чтобы «Страница 1 из 1» при пустой Истории).
@@ -181,6 +296,91 @@ export default function History() {
         </div>
       )}
 
+      {/* Поиск и период. Всё фильтруется в SQL — в UI никогда не приезжает
+          больше одной страницы чеков. */}
+      <div className="space-y-3 rounded-lg border border-border bg-surface p-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="relative min-w-[260px] flex-1">
+            <Search
+              size={15}
+              className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-ink-subtle"
+            />
+            <input
+              ref={searchRef}
+              type="text"
+              value={query}
+              onChange={(e) => applyQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') applyQuery('')
+              }}
+              placeholder="Товар, ИКПУ, № чека, фискальный признак…"
+              className="w-full rounded-md border border-border bg-canvas py-1.5 pl-8 pr-8 text-sm outline-none placeholder:text-ink-subtle focus:border-ink-muted"
+            />
+            {query && (
+              <button
+                type="button"
+                title="Очистить (Esc)"
+                onClick={() => {
+                  applyQuery('')
+                  searchRef.current?.focus()
+                }}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-ink-subtle hover:text-ink"
+              >
+                <X size={14} />
+              </button>
+            )}
+          </div>
+
+          <div className="flex items-center gap-1.5 text-sm">
+            <span className="text-ink-muted">с</span>
+            <input
+              type="date"
+              value={dateFrom}
+              max={dateTo || undefined}
+              onChange={(e) => applyDates(e.target.value, dateTo)}
+              className="rounded-md border border-border bg-canvas px-2 py-1.5 text-sm outline-none focus:border-ink-muted"
+            />
+            <span className="text-ink-muted">по</span>
+            <input
+              type="date"
+              value={dateTo}
+              min={dateFrom || undefined}
+              onChange={(e) => applyDates(dateFrom, e.target.value)}
+              className="rounded-md border border-border bg-canvas px-2 py-1.5 text-sm outline-none focus:border-ink-muted"
+            />
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Button variant="ghost" size="sm" onClick={() => applyDayPreset(0)}>
+            Сегодня
+          </Button>
+          <Button variant="ghost" size="sm" onClick={() => applyDayPreset(6)}>
+            7 дней
+          </Button>
+          <Button variant="ghost" size="sm" onClick={() => applyDayPreset(29)}>
+            30 дней
+          </Button>
+          {hasFilters && (
+            <Button
+              variant="ghost"
+              size="sm"
+              icon={<X size={12} />}
+              onClick={resetFilters}
+            >
+              Сбросить
+            </Button>
+          )}
+          <div className="ml-auto text-sm tabular-nums text-ink-muted">
+            {loading
+              ? 'Поиск…'
+              : hasFilters
+                ? `Найдено: ${total}`
+                : `Всего чеков: ${total}`}
+          </div>
+        </div>
+      </div>
+
       <div className="overflow-x-auto rounded-lg border border-border bg-surface">
         <table className="min-w-full divide-y divide-border text-sm">
           <thead className="bg-canvas">
@@ -206,7 +406,16 @@ export default function History() {
             ) : rows.length === 0 ? (
               <tr>
                 <td className="px-3 py-8 text-center text-sm text-ink-muted" colSpan={9}>
-                  Пока нет ни одного фискализированного чека.
+                  {hasFilters ? (
+                    <div className="space-y-2">
+                      <div>По этому запросу ничего не найдено.</div>
+                      <Button variant="ghost" size="sm" onClick={resetFilters}>
+                        Сбросить фильтры
+                      </Button>
+                    </div>
+                  ) : (
+                    'Пока нет ни одного фискализированного чека.'
+                  )}
                 </td>
               </tr>
             ) : (

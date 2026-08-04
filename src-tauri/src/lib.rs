@@ -83,6 +83,12 @@ pub fn run() {
             sql: include_str!("../migrations/013_partial_refunds.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 14,
+            description: "history_search",
+            sql: include_str!("../migrations/014_history_search.sql"),
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()
