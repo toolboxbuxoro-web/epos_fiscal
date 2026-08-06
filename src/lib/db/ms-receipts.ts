@@ -49,19 +49,27 @@ export async function getMsReceiptByMsId(msId: string): Promise<MsReceiptRow | n
   return rows[0] ?? null
 }
 
-/** Идемпотентная вставка: если ms_id уже есть, ничего не меняет. Возвращает id строки. */
+/**
+ * Идемпотентная вставка: если ms_id уже есть, ничего не меняет. Возвращает id строки.
+ *
+ * ⚠️ Вставка идёт через `ON CONFLICT DO NOTHING`, а НЕ через «SELECT → если
+ * нет, INSERT». Проверка-перед-вставкой давала гонку: между SELECT и INSERT
+ * тот же чек успевал сохранить другой путь — поллер МС и фискализация
+ * (`fiscalize.ts` тоже зовёт upsert, когда `opts.msReceiptId` не задан), либо
+ * перекрывшиеся тики поллера при медленном ответе МС. В логах это выглядело
+ * как `UNIQUE constraint failed: ms_receipts.ms_id`, тик поллера падал целиком
+ * и остальные чеки из пачки в этот заход не сохранялись.
+ */
 export async function upsertMsReceipt(receipt: NewMsReceipt): Promise<number> {
   const db = await getDb()
   const ts = now()
   const status = receipt.status ?? 'pending'
 
-  const existing = await getMsReceiptByMsId(receipt.ms_id)
-  if (existing) return existing.id
-
-  const result = await db.execute(
+  await db.execute(
     `INSERT INTO ms_receipts (
        ms_id, ms_name, ms_moment, ms_sum_tiyin, raw_json, status, fetched_at, updated_at
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+     ON CONFLICT(ms_id) DO NOTHING`,
     [
       receipt.ms_id,
       receipt.ms_name,
@@ -73,7 +81,12 @@ export async function upsertMsReceipt(receipt: NewMsReceipt): Promise<number> {
       ts,
     ],
   )
-  return result.lastInsertId ?? 0
+
+  // `lastInsertId` при DO NOTHING не отражает нужную строку (0 либо id прошлой
+  // вставки в этом соединении), поэтому всегда перечитываем по ms_id — так
+  // возвращаемый id верен и для вставки, и для «уже существовало».
+  const row = await getMsReceiptByMsId(receipt.ms_id)
+  return row?.id ?? 0
 }
 
 export async function setMsReceiptStatus(id: number, status: MsReceiptStatus): Promise<void> {
