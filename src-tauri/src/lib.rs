@@ -89,6 +89,12 @@ pub fn run() {
             sql: include_str!("../migrations/014_history_search.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 15,
+            description: "sales_sync",
+            sql: include_str!("../migrations/015_sales_sync.sql"),
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()

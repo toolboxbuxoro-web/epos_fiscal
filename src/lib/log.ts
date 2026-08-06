@@ -16,6 +16,7 @@ export type LogSource =
   | 'inventory.sse'
   | 'inventory.retry'
   | 'inventory.housekeeping'
+  | 'sales-sync'
 
 export interface LogRow {
   id: number

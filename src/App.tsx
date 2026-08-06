@@ -18,6 +18,7 @@ import {
   stopInventoryRuntime,
 } from '@/lib/inventory'
 import { ensureTelemetryStarted } from '@/lib/telemetry'
+import { ensureSalesSyncStarted } from '@/lib/sales-sync'
 import { backfillSearchText } from '@/lib/db'
 import { Toaster } from '@/components/ui'
 import { AppVersionBadge } from '@/components/AppVersionBadge'
@@ -38,6 +39,11 @@ export default function App() {
     // Background-flusher раз в 30 сек, opt-out через Настройки.
     // Idempotent. Никогда не throw — не ломает основной поток.
     void ensureTelemetryStarted()
+
+    // Синхронизация фискальных чеков на mytoolbox: раз в 60 сек шлём пачку
+    // ещё не отправленных чеков (+ вложенные возвраты) для централизованной
+    // админ-панели/отчётов по 4 магазинам. Idempotent. Никогда не throw'ит.
+    void ensureSalesSyncStarted()
 
     // Разовая индексация старых чеков для поиска в Истории (migration 014).
     // Делаем на старте, чтобы к моменту открытия Истории поиск уже работал.

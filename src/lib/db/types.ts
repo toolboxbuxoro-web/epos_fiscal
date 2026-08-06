@@ -364,6 +364,11 @@ export interface FiscalReceiptRow {
    * Заполняется автоматически при вставке новых чеков.
    */
   search_text: string | null
+  /**
+   * Отправлен ли чек на mytoolbox через `POST /api/v1/inventory/sales`
+   * (migration 015). 0 — ещё нет, 1 — отправлен. См. `src/lib/sales-sync.ts`.
+   */
+  synced_to_server: number
 }
 
 // ── replacement_log ──────────────────────────────────────────────
@@ -424,6 +429,12 @@ export interface FiscalRefundRow {
    * NULL для full refund (там items_json содержит ВСЕ items оригинала).
    */
   refunded_items_snapshot: string | null
+  /**
+   * Отправлен ли возврат на mytoolbox через `POST /api/v1/inventory/sales`
+   * (вложенным в `sales[].refunds[]` родительского чека, migration 015).
+   * 0 — ещё нет, 1 — отправлен. См. `src/lib/sales-sync.ts`.
+   */
+  synced_to_server: number
 }
 
 /**

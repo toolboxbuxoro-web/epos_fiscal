@@ -784,6 +784,67 @@ footer без кешбэка («Tovar qaytarildi. Pul mijozga to'liq qaytarildi.
     идемпотентность по `refund_fiscal_sign` через `inv_events`.
   - `backend/src/routes/inventory.js::shopRouter.post('/unconsume')`.
 
+## Sync продаж — зеркало чеков на mytoolbox
+
+С 0.11.16 фискальные чеки уезжают на сервер, чтобы админ видел продажи всех
+магазинов централизованно. До этого сервер знал только «магазин списал N шт
+по чеку с признаком Z» (`inv_reservations`) — ни цены продажи, ни состава
+чека; ответить «за сколько продали товар X» без похода к кассе было нельзя.
+
+### Как устроено
+
+```
+fiscalize() → INSERT fiscal_receipts (synced_to_server = 0)
+                       │
+                       ▼  раз в 60 сек
+              src/lib/sales-sync.ts::flushSalesToServer
+                       │
+                       ├─ выбирает ≤20 чеков: не отправленные
+                       │    ИЛИ отправленные, но с новым возвратом  ← важно
+                       ├─ собирает payload: позиции ОФД (request_json) +
+                       │    inv_item_id/себестоимость (match_items→esf_items,
+                       │    сопоставление ПО ПОРЯДКУ) + состав чека МС
+                       │    (ms_receipts.raw_json) + вложенные возвраты
+                       ├─ POST /api/v1/inventory/sales  Bearer <InventoryShopApiKey>
+                       ├─ 2xx → synced_to_server = 1 (чеку и его возвратам)
+                       ├─ 404 → тоже помечаем (эндпоинт не задеплоен, не циклимся)
+                       └─ 5xx/сеть → exp backoff
+                       ▼
+              mytoolbox: inv_sales + inv_sale_items + inv_sale_refunds
+                       ▼
+              админка → вкладка «Продажи» (что купили ↔ что ушло в ОФД, маржа)
+```
+
+**Почему выборка включает уже отправленные чеки с новым возвратом:** покупатель
+приходит через день-два, когда чек давно на сервере. Если брать только
+`synced_to_server = 0`, возвраты не доедут никогда. Сервер обрабатывает блок
+`refunds` даже когда шапка чека приходит дублем.
+
+**Сопоставление позиций.** Привязки «строка плана ↔ позиция чека» в БД нет,
+поэтому `match_items` сопоставляются с позициями ОФД **по порядку**. При
+несовпадении количества строк обогащение (`inv_item_id`, себестоимость)
+обнуляется целиком — съехавшая на соседнюю позицию себестоимость дала бы
+молча неверную маржу в отчётах.
+
+**Себестоимость — снимок.** На сервере в `inv_sale_items.unit_cost_tiyin`
+хранится цена прихода на момент продажи, а не ссылка на `inv_items`. Бухгалтер
+правит цены задним числом (ошибки импорта ЭСФ), и отчёты по марже за прошлые
+периоды от этого не должны ехать.
+
+**Инвариант:** синхронизация строго best-effort — никогда не блокирует и не
+ломает фискализацию. Нет сервера — чеки копятся локально и уедут позже.
+
+### Файлы
+
+- `src-tauri/migrations/015_sales_sync.sql` — `synced_to_server` в
+  `fiscal_receipts` и `fiscal_refunds` + частичные индексы
+- `src/lib/sales-sync.ts` — флашер и сборка payload
+- `src/App.tsx` — `ensureSalesSyncStarted()` на старте
+- Backend `mytoolbox`: `backend/src/services/inventory/sales.js`,
+  `POST /api/v1/inventory/sales`, админ-эндпоинты `/admin/inventory/sales*`
+  и `/admin/inventory/logs`, схема в `backend/src/db.js`
+- План: `mytoolbox/SALES_HISTORY_PLAN.md`
+
 ## Sync приходов: сервер = источник правды
 
 `esf_items` — **зеркало** серверного `inv_items` (mytoolbox Postgres).
@@ -976,6 +1037,18 @@ src-tauri/
                                           печати «Karta turi» на refund/reprint
     010_fiscal_receipts_excluded_payment.sql ← + excluded_payment_tiyin
                             (тийины Click/Payme, не пошедшие в ОФД, для аудита)
+    011_logs_telemetry.sql   ← + sent_to_server в logs
+    012_zero_sum_not_required.sql ← чеки на 0 сум → status='not_required'
+    013_partial_refunds.sql  ← частичный возврат: снят UNIQUE на
+                            original_fiscal_id, + is_partial, + snapshot
+    014_history_search.sql   ← поиск в Истории: + search_text (нижний
+                            регистр!) + индекс fiscalized_at + частичный
+                            индекс для backfill
+    015_sales_sync.sql       ← + synced_to_server в fiscal_receipts и
+                            fiscal_refunds (зеркало продаж на mytoolbox)
+    ⚠️ Файл применённой миграции править НЕЛЬЗЯ: sqlx сверяет контрольные
+       суммы, и у обновившегося магазина приложение не стартует. Только
+       новая миграция следующим номером.
 src/
   lib/
     db/                   ← SQLite, типы и DAO (SettingKey enum)
