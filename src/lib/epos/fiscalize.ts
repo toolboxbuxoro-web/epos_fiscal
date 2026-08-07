@@ -48,7 +48,6 @@ import { JsonRpcEposClient, formatGoTime, type JsonRpcReceipt } from './jsonrpc-
 import {
   FiscalDriveClient,
   FISCAL_DRIVE_DEFAULT_URL,
-  OKEI_PIECE_DEFAULT,
   mapFdsFiscalAnswer,
   type FiscalDriveItem,
   type FiscalDriveReceipt,
@@ -961,7 +960,8 @@ async function buildReceiptData(
  *
  * Отличия payload от JSON-RPC:
  *   - SPIC (uppercase) вместо spic (lowercase)
- *   - Units (ОКЭИ-код) — обязательное поле, дефолт OKEI_PIECE_DEFAULT
+ *   - Units (ед. измерения) — НЕ отправляем: по спецификации поле
+ *     необязательное, а неверное значение портит налоговый отчёт
  *   - ExtraInfo.CardType вместо отдельного поля в Communicator
  *   - Operation=0 (продажа) и Type=0 (обычный чек) явно
  */
@@ -977,7 +977,6 @@ async function fiscalizeFiscalDrive(
     Name: c.esfItem.name,
     Barcode: c.esfItem.barcode ?? '0',
     SPIC: c.esfItem.class_code,
-    Units: OKEI_PIECE_DEFAULT,
     PackageCode: c.esfItem.package_code || '',
     OwnerType: (c.esfItem.owner_type ?? 0) as 0 | 1 | 2,
     Amount: c.quantity,

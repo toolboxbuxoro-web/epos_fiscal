@@ -221,20 +221,32 @@ describe('getReceiptTXID', () => {
     expect(body.Items[0]).not.toHaveProperty('spic')
   })
 
-  it('тело запроса содержит Units для каждой позиции', async () => {
+  // Units — необязательное поле (спецификация FiscalDriveService: `Units | uint64 | No`).
+  // Раньше слали 796 (российский ОКЕИ «штука»), и у ВСЕХ чеков магазина на
+  // FiscalDrive единица измерения в налоговом отчёте выходила неверной.
+  // Правильные значения — идентификаторы из Tasnif, привязанные к ИКПУ
+  // (как PackageCode), формата 241092 / 1372873 / 244272402. Пока их нет —
+  // поле опускаем: у магазинов на EPOS его в протоколе нет вообще, и отчёты
+  // там корректны, то есть отсутствие лучше неверного значения.
+  it('Units опционален: чек без него уходит корректно', async () => {
     const { client, fetch } = makeClient([{ status: 200, body: 1 }])
+    const base = makeReceipt().Items[0]!
+    const { Units: _omit, ...withoutUnits } = base
     const receipt = makeReceipt({
       Items: [
-        { ...makeReceipt().Items[0]!, Name: 'Товар 1' },
-        { ...makeReceipt().Items[0]!, Name: 'Товар 2', SPIC: '08300000000000000' },
+        { ...withoutUnits, Name: 'Товар 1' },
+        { ...withoutUnits, Name: 'Товар 2', SPIC: '08300000000000000' },
       ],
     })
     await client.getReceiptTXID(FACTORY_ID, receipt)
     const [, opts] = fetch.mock.calls[0] as [string, RequestInit]
     const body = JSON.parse(opts.body as string) as FiscalDriveReceipt
     for (const item of body.Items) {
-      expect(typeof item.Units).toBe('number')
-      expect(item.Units).toBeGreaterThan(0)
+      expect(item.Units).toBeUndefined()
+      // Остальные обязательные поля позиции на месте
+      expect(item.SPIC).toBeTruthy()
+      expect(item.Amount).toBeGreaterThan(0)
+      expect(item.Price).toBeGreaterThan(0)
     }
   })
 
