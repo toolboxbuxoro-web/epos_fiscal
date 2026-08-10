@@ -3,6 +3,7 @@ import { AlertCircle, Loader2, Minus, Plus, RotateCcw, Wand2, X } from 'lucide-r
 import { planHolistic } from '@/lib/matcher'
 import {
   costWithVat,
+  normalizeForLink,
   priceFloorTiyin,
   vatIncluded,
   type MatcherPool,
@@ -277,6 +278,35 @@ function ManualReceiptModalBody(props: BodyProps) {
   const [search, setSearch] = useState('')
 
   /**
+   * Анти-микс (тот же принцип что и в авто-подборе, см.
+   * `MatcherPool.chosenBatchByProduct` / `isBatchAllowed` в strategies.ts):
+   * товар (по нормализованному имени) → esf_item.id УЖЕ выбранной партии
+   * в текущем ручном наборе.
+   *
+   * Ручная модалка раньше не проверяла это вообще — кассир мог руками
+   * добавить из справочника два РАЗНЫХ прихода одного и того же товара
+   * (разные партии = разная себестоимость), и обе строки уходили в один
+   * фискальный чек. Используется в трёх местах:
+   *   - `addOne` — блокирует добавление НОВОЙ партии если для этого товара
+   *     уже выбрана другая
+   *   - рендер справочника — дизейблит кнопку «Добавить» для конфликтующих
+   *     строк с подсказкой, чтобы кассир не наступал на грабли вслепую
+   *   - `autofill` — исключает из суб-пула ВСЕ батчи товара кроме уже
+   *     выбранного, чтобы holistic не «дособрал» вторую партию сам
+   */
+  const chosenBatchByProduct = useMemo(() => {
+    const m = new Map<string, number>()
+    selected.forEach((qty, id) => {
+      if (qty <= 0) return
+      const pi = poolById.get(id)
+      if (!pi) return
+      const key = normalizeForLink(pi.item.name)
+      if (!m.has(key)) m.set(key, id)
+    })
+    return m
+  }, [selected, poolById])
+
+  /**
    * Когда SSE приходит апдейт пула (другой магазин фискализировал товар) —
    * clamp выбранные количества к новому available. Если кассир выбрал 5 шт,
    * а на сервере стало 3 → выставляем 3 и показываем toast «X шт. Y стало
@@ -345,6 +375,23 @@ function ManualReceiptModalBody(props: BodyProps) {
   }
 
   function addOne(id: number) {
+    const pi = poolById.get(id)
+    if (pi) {
+      // Анти-микс: если товар уже представлен ДРУГОЙ партией в наборе —
+      // не даём добавить эту (см. chosenBatchByProduct выше). Кнопка в
+      // справочнике для такой строки уже disabled — это defense-in-depth
+      // на случай гонки (SSE-апдейт между рендером и кликом).
+      const key = normalizeForLink(pi.item.name)
+      const lockedId = chosenBatchByProduct.get(key)
+      if (lockedId !== undefined && lockedId !== id) {
+        toast.error(
+          `«${pi.item.name}» уже выбран из другой партии в этом чеке — ` +
+            `сначала уберите её (нельзя смешивать партии одного товара)`,
+          { duration: 4500 },
+        )
+        return
+      }
+    }
     setQty(id, (selected.get(id) ?? 0) + 1)
   }
 
@@ -359,7 +406,22 @@ function ManualReceiptModalBody(props: BodyProps) {
     if (remaining <= 0) return
     // Пул с учётом уже выбранного: уменьшаем available на занятые штуки,
     // чтобы holistic не «взял» то что кассир уже добавил.
+    //
+    // Анти-микс: `planHolistic` сам по себе коллапсирует несколько батчей
+    // одного товара до FIFO-самого-старого (см. holistic.ts) — это НЕ
+    // обязательно та партия, которую кассир уже выбрал руками в этой
+    // модалке. Без доп. ограничения holistic мог бы «дособрать» товар из
+    // ДРУГОЙ партии, чем уже лежит в selected → в чеке окажутся два esf_item
+    // одного товара. Поэтому для товаров уже представленных в selected
+    // ЗАНУЛЯЕМ available у всех ИХ ДРУГИХ батчей — holistic физически не
+    // сможет их выбрать, останется только уже выбранная партия (с уменьшенным
+    // на использованное available) или ничего.
     const subPoolItems = pool.items.map((pi) => {
+      const key = normalizeForLink(pi.item.name)
+      const lockedId = chosenBatchByProduct.get(key)
+      if (lockedId !== undefined && lockedId !== pi.item.id) {
+        return { ...pi, item: { ...pi.item, available: 0 } }
+      }
       const usedPcs = selected.get(pi.item.id) ?? 0
       if (usedPcs <= 0) return pi
       return {
@@ -398,16 +460,35 @@ function ManualReceiptModalBody(props: BodyProps) {
     setSelected(buildInitialSelected())
   }
 
-  /** «Готово» — собрать HolisticPlan и отдать наверх. */
-  function done() {
+  /**
+   * Собрать HolisticPlan из текущего `selected` + проверить оба owner-правила
+   * (floor и анти-микс) ДО того как план уйдёт на фискализацию.
+   *
+   * Раньше `done()` считал `belowFloor` только для warning-тоста и ВСЁ РАВНО
+   * вызывал `onDone(plan)` — Receipt.tsx переводил результат в
+   * `mode:'holistic'`, для которого `hasUnmatched=false` (см. Receipt.tsx),
+   * кнопка «Фискализировать» разблокировалась, а в `fiscalize.ts` своей
+   * проверки floor нет — убыточная строка уходила прямо в ОФД. Плюс
+   * анти-микс вообще не проверялся — два разных esf_item одного товара
+   * могли попасть в один чек.
+   *
+   * Теперь это ЧИСТАЯ (без побочных эффектов) функция, пересчитывается в
+   * `useMemo` и используется И для рендера inline-баннера в подвале, И
+   * внутри `done()` для решения «отдавать план или нет». Единая логика —
+   * баннер в UI и фактическая блокировка никогда не разъедутся.
+   */
+  const manualPlan = useMemo(() => {
     const lines: HolisticLine[] = []
     let totalTiyin = 0
     let totalCostTiyin = 0
-    // Позиции ниже минимальной цены (себестоимость +5%) — для warning.
-    // Цена в manual = pi.sellingPrice (наценка ≥10% по дефолту, выше floor),
-    // поэтому срабатывает только при markup<5% (упрощёнка). Не блокируем —
-    // консистентно с правилом: цену не меняем, кассир решает сам.
-    const belowFloor: string[] = []
+    // Ниже минимальной цены (себестоимость +5%) — теперь БЛОКИРУЕТ «Готово»,
+    // не просто предупреждает. Цена в manual = pi.sellingPrice (наценка
+    // ≥10% по дефолту, выше floor), поэтому срабатывает только при
+    // markup<5% (упрощёнка/ручная настройка ниже MIN_MARKUP_PERCENT).
+    const belowFloor: { name: string; effective: number; floor: number }[] = []
+    // Анти-микс: товар (нормализованное имя) → Set из esf_item.id, которыми
+    // он представлен в наборе. Больше одного id = смешивание партий.
+    const productBatches = new Map<string, Set<number>>()
     selected.forEach((qty, id) => {
       const pi = poolById.get(id)
       if (!pi || qty <= 0) return
@@ -433,32 +514,63 @@ function ManualReceiptModalBody(props: BodyProps) {
         quantityMilli,
       )
       if (priceTiyin > 0 && priceTiyin < floor) {
-        belowFloor.push(pi.item.name)
+        belowFloor.push({ name: pi.item.name, effective: priceTiyin, floor })
       }
+      const key = normalizeForLink(pi.item.name)
+      if (!productBatches.has(key)) productBatches.set(key, new Set())
+      productBatches.get(key)!.add(id)
     })
+    const mixedBatches: { name: string; ids: number[] }[] = []
+    productBatches.forEach((ids) => {
+      if (ids.size <= 1) return
+      const anyId = [...ids][0]!
+      mixedBatches.push({ name: poolById.get(anyId)?.item.name ?? '?', ids: [...ids] })
+    })
+    return { lines, totalTiyin, totalCostTiyin, belowFloor, mixedBatches }
+  }, [selected, poolById])
+
+  /** «Готово» — собрать HolisticPlan и отдать наверх. Блокирует при нарушении floor/анти-микс. */
+  function done() {
+    const { lines, totalTiyin, totalCostTiyin, belowFloor, mixedBatches } = manualPlan
     if (lines.length === 0) {
       toast.error('Добавьте хотя бы один товар', { duration: 4000 })
       return
     }
-    if (belowFloor.length > 0) {
+    // Анти-микс — жёсткий блок, план НЕ отдаём. Модалка остаётся открытой,
+    // кассир должен убрать лишнюю партию (см. баннер в подвале).
+    if (mixedBatches.length > 0) {
+      const first = mixedBatches[0]!
       toast.error(
-        `${belowFloor.length} ${belowFloor.length === 1 ? 'товар' : 'товара'} ` +
-          `ниже минимальной цены (себестоимость +5%): ${belowFloor[0]}` +
-          (belowFloor.length > 1 ? ` и др.` : '') +
-          `. Проверьте наценку магазина в Настройках.`,
-        { duration: 6000 },
+        `${mixedBatches.length === 1 ? 'Товар' : 'Товары'} добавлен(ы) из ` +
+          `нескольких разных партий одновременно: «${first.name}»` +
+          (mixedBatches.length > 1 ? ` и ещё ${mixedBatches.length - 1}` : '') +
+          `. В одном чеке нельзя продавать две партии одного товара — ` +
+          `уберите лишнюю партию из набора.`,
+        { duration: 8000 },
       )
+      return
+    }
+    // Жёсткий запрет продажи ниже себестоимости+5% — план НЕ отдаём. Раньше
+    // это было лишь предупреждением, и убыточная строка всё равно уходила в
+    // ОФД в обход floor-guard'а, который есть в classic/holistic авто-подборе.
+    if (belowFloor.length > 0) {
+      const first = belowFloor[0]!
+      toast.error(
+        `${belowFloor.length} ${belowFloor.length === 1 ? 'товар' : 'товара'} ниже ` +
+          `минимальной цены (себестоимость +5%): «${first.name}» — цена ` +
+          `${tiyinToSumDisplay(first.effective)} сум, минимум ` +
+          `${tiyinToSumDisplay(first.floor)} сум` +
+          (belowFloor.length > 1 ? ` и ещё ${belowFloor.length - 1}` : '') +
+          `. Уменьшите количество, замените товар или поднимите наценку в Настройках.`,
+        { duration: 8000 },
+      )
+      return
     }
     onDone({
       lines,
       totalTiyin,
       totalCostTiyin,
-      notes: [
-        'Чек собран вручную кассиром',
-        ...(belowFloor.length > 0
-          ? [`⚠️ ${belowFloor.length} позиций ниже минимальной наценки 5%`]
-          : []),
-      ],
+      notes: ['Чек собран вручную кассиром'],
     })
   }
 
@@ -664,6 +776,11 @@ function ManualReceiptModalBody(props: BodyProps) {
                 catalogResults.map((pi) => {
                   const cap = availablePcs(pi)
                   const inCart = selected.get(pi.item.id) ?? 0
+                  // Анти-микс: этот товар (по имени) уже представлен в наборе
+                  // ДРУГОЙ партией — не даём добавить эту, иначе в чеке
+                  // окажутся два esf_item одного товара (см. chosenBatchByProduct).
+                  const lockedId = chosenBatchByProduct.get(normalizeForLink(pi.item.name))
+                  const lockedToOther = lockedId !== undefined && lockedId !== pi.item.id
                   return (
                     <div
                       key={pi.item.id}
@@ -679,16 +796,31 @@ function ManualReceiptModalBody(props: BodyProps) {
                           {inCart > 0 && (
                             <span className="text-primary"> · в чеке {inCart}</span>
                           )}
+                          {lockedToOther && (
+                            <span className="text-warning">
+                              {' '}
+                              · другая партия уже в чеке
+                            </span>
+                          )}
                         </div>
                       </div>
                       <Button
                         variant="ghost"
                         size="sm"
                         icon={<Plus size={13} />}
-                        disabled={inCart >= cap}
+                        disabled={inCart >= cap || lockedToOther}
                         onClick={() => addOne(pi.item.id)}
+                        title={
+                          lockedToOther
+                            ? 'Этот товар уже добавлен из другой партии — нельзя смешивать'
+                            : undefined
+                        }
                       >
-                        {inCart >= cap ? 'Нет остатка' : 'Добавить'}
+                        {lockedToOther
+                          ? 'Другая партия в чеке'
+                          : inCart >= cap
+                            ? 'Нет остатка'
+                            : 'Добавить'}
                       </Button>
                     </div>
                   )
@@ -698,25 +830,62 @@ function ManualReceiptModalBody(props: BodyProps) {
           </div>
         </div>
 
-        {/* ── Подвал: Готово / Отмена ── */}
-        <div className="flex items-center justify-between gap-3 border-t border-border px-5 py-4">
-          <div className="text-caption text-ink-muted">
-            Чек уйдёт в ОФД на{' '}
-            <span className="font-mono font-medium text-ink">
-              {tiyinToSumDisplay(selectedTotal)} сум
-            </span>
-          </div>
-          <div className="flex gap-2">
-            <Button variant="ghost" onClick={onClose}>
-              Отмена
-            </Button>
-            <Button
-              variant="primary"
-              onClick={done}
-              disabled={selectedCards.length === 0}
-            >
-              Готово
-            </Button>
+        {/* ── Подвал: баннер нарушений + Готово / Отмена ── */}
+        <div className="border-t border-border">
+          {(manualPlan.mixedBatches.length > 0 || manualPlan.belowFloor.length > 0) && (
+            <div className="flex items-start gap-2 border-b border-border bg-danger-soft px-5 py-2.5 text-caption text-danger">
+              <AlertCircle size={15} className="mt-0.5 shrink-0" />
+              <div>
+                {manualPlan.mixedBatches.length > 0 && (
+                  <div>
+                    Смешаны партии одного товара: «
+                    {manualPlan.mixedBatches.map((m) => m.name).join('», «')}» —
+                    оставьте только одну партию каждого товара.
+                  </div>
+                )}
+                {manualPlan.belowFloor.length > 0 && (
+                  <div>
+                    Ниже минимальной цены (себестоимость +5%): «
+                    {manualPlan.belowFloor.map((b) => b.name).join('», «')}» — уменьшите
+                    количество, замените товар или поднимите наценку в Настройках.
+                  </div>
+                )}
+                <div className="text-ink-muted">
+                  «Готово» заблокировано пока эти позиции не устранены.
+                </div>
+              </div>
+            </div>
+          )}
+          <div className="flex items-center justify-between gap-3 px-5 py-4">
+            <div className="text-caption text-ink-muted">
+              Чек уйдёт в ОФД на{' '}
+              <span className="font-mono font-medium text-ink">
+                {tiyinToSumDisplay(selectedTotal)} сум
+              </span>
+            </div>
+            <div className="flex gap-2">
+              <Button variant="ghost" onClick={onClose}>
+                Отмена
+              </Button>
+              <Button
+                variant="primary"
+                onClick={done}
+                disabled={
+                  selectedCards.length === 0 ||
+                  manualPlan.mixedBatches.length > 0 ||
+                  manualPlan.belowFloor.length > 0
+                }
+                title={
+                  manualPlan.mixedBatches.length > 0
+                    ? 'Смешаны партии одного товара — уберите лишнюю'
+                    : manualPlan.belowFloor.length > 0
+                      ? 'Есть позиции ниже минимальной цены'
+                      : undefined
+                }
+              >
+                Готово
+              </Button>
+            </div>
           </div>
         </div>
       </div>

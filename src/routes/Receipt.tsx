@@ -489,6 +489,38 @@ export default function Receipt() {
   }
 
   /**
+   * Свап товара через стрелки `←`/`→` на swappable-позиции (price-bucket).
+   *
+   * `recalculateAfterSwap` может ОТКЛОНИТЬ свап (анти-микс: другая позиция
+   * чека уже держит тот же товар из другой партии) — в этом случае она
+   * возвращает `result` с ТЕМИ ЖЕ positions (selectedAlternativeIndex не
+   * меняется), но с добавленным warning'ом в `warnings[]`. Без явного
+   * тоста кассир видел бы что стрелка «не сработала» без объяснения —
+   * warning есть, но лежит в свёрнутом по умолчанию блоке «Предупреждения»
+   * внизу экрана, легко не заметить сразу после клика. Поэтому здесь
+   * дополнительно детектим этот случай (selectedAlternativeIndex не
+   * изменился хотя мы просили другой) и кидаем toast с причиной.
+   */
+  function applySwap(positionIndex: number, newAlternativeIndex: number): void {
+    if (!match) return
+    const before = match.positions[positionIndex]
+    const result = recalculateAfterSwap(match, positionIndex, newAlternativeIndex, matcherOpts)
+    const after = result.positions[positionIndex]
+    const swapRejected =
+      before &&
+      after &&
+      after.selectedAlternativeIndex === before.selectedAlternativeIndex &&
+      after.selectedAlternativeIndex !== newAlternativeIndex
+    if (swapRejected) {
+      const reason = result.warnings.find((w) => w.startsWith('Свап отклонён'))
+      toast.error(reason ?? 'Свап отклонён: нельзя смешивать партии одного товара', {
+        duration: 6000,
+      })
+    }
+    setMatch(result)
+  }
+
+  /**
    * Клик «Фискализировать»: если оплата чисто наличкой — сразу фискализируем.
    * Иначе — открываем модалку выбора типа карты, фискализация запустится
    * после клика «Jismoniy shaxs» / «Korporativ» в модалке.
@@ -1110,27 +1142,11 @@ export default function Receipt() {
                         altCount: pm.alternatives.length,
                         onPrev:
                           pm.selectedAlternativeIndex > 0
-                            ? () =>
-                                setMatch(
-                                  recalculateAfterSwap(
-                                    match,
-                                    posIdx,
-                                    pm.selectedAlternativeIndex - 1,
-                                    matcherOpts,
-                                  ),
-                                )
+                            ? () => applySwap(posIdx, pm.selectedAlternativeIndex - 1)
                             : undefined,
                         onNext:
                           pm.selectedAlternativeIndex < pm.alternatives.length - 1
-                            ? () =>
-                                setMatch(
-                                  recalculateAfterSwap(
-                                    match,
-                                    posIdx,
-                                    pm.selectedAlternativeIndex + 1,
-                                    matcherOpts,
-                                  ),
-                                )
+                            ? () => applySwap(posIdx, pm.selectedAlternativeIndex + 1)
                             : undefined,
                       }
                     : undefined

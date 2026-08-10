@@ -74,6 +74,28 @@ export interface MatcherPool {
    * Единицы: миллидоли (1000 = 1 шт) — такие же как `item.available`.
    */
   remainingById: Map<number, number>
+  /**
+   * Партия (esf_item.id), «залоченная» за товаром в рамках ТЕКУЩЕГО чека.
+   * Ключ — нормализованное имя товара (`normalizeForLink`, та же нормализация
+   * что для linked-ms). Значение — id конкретной партии (esf_item), которую
+   * выбрала любая из стратегий для этого товара.
+   *
+   * Бизнес-правило владельца: один товар (по имени) = одна партия на весь
+   * чек, даже если в чеке несколько позиций этого товара или несколько
+   * стратегий его подбирают. ИКПУ не годится ключом — под одним ИКПУ
+   * законно живут разные товары.
+   *
+   * Заполняется в `index.ts::lockChosenBatches` сразу после того как позиция
+   * окончательно замэтчена (тем же местом где `decrementPool` списывает
+   * остаток). Стратегии читают через `isBatchAllowed()` чтобы не предложить
+   * другую партию того же товара следующей позиции.
+   *
+   * Optional — ad-hoc пулы (тесты, `ManualReceiptModal` subPool для
+   * `planHolistic`) могут его не заполнять: `isBatchAllowed` трактует
+   * отсутствие Map как «нет ограничений». `planHolistic` анти-микс партий
+   * решает своим локальным дедупом (см. holistic.ts), это поле не читает.
+   */
+  chosenBatchByProduct?: Map<string, number>
 }
 
 export interface PoolItem {
@@ -161,7 +183,20 @@ export async function loadMatcherPool(opts: MatcherOptions = {}): Promise<Matche
     overrideVat !== null
       ? rawWithIkpu.map((i) => ({ ...i, vat_percent: overrideVat }))
       : rawWithIkpu
-  const markup = opts.markupPercent ?? DEFAULT_MARKUP
+  // Клампим наценку к MIN_MARKUP_PERCENT снизу. `markupPercent` — локальная
+  // настройка магазина (Settings.tsx), у которой раньше не было нижней
+  // границы. Замер на реальном пуле (см. также MIN_MARKUP_PERCENT ниже):
+  // при наценке 10/8/5% floor-фильтры (введённые вместе с этим клампом)
+  // инертны — отсекают 0% пула; при 3% отсекается 88.5% пула; при 0% —
+  // 95.4% пула. Т.е. магазин, выставивший наценку ниже 5%, при floor-guard
+  // без клампа получил бы почти полностью неработающий подбор (auto- и
+  // classic-стратегии массово проваливаются в «не подобрано»/holistic
+  // reject, потому что sellingPrice < priceFloorTiyin для почти всех
+  // товаров). Settings.tsx запрещает сохранить < MIN_MARKUP_PERCENT в UI,
+  // но этот кламп — независимая серверная (в смысле «в коде подбора»)
+  // страховка: старые сохранённые значения до этого изменения, ручное
+  // редактирование БД, или баг в форме не должны положить магазин.
+  const markup = Math.max(opts.markupPercent ?? DEFAULT_MARKUP, MIN_MARKUP_PERCENT)
   const roundUp = opts.roundUpToSum ?? DEFAULT_ROUND_UP_SUM
   let minSellingPrice = Number.POSITIVE_INFINITY
   const items: PoolItem[] = raw.map((item) => {
@@ -187,6 +222,8 @@ export async function loadMatcherPool(opts: MatcherOptions = {}): Promise<Matche
     items,
     minSellingPrice: Number.isFinite(minSellingPrice) ? minSellingPrice : 0,
     remainingById,
+    // Пустая на старте — заполняется по ходу buildMatch, см. lockChosenBatches.
+    chosenBatchByProduct: new Map<string, number>(),
   }
 }
 
@@ -203,9 +240,43 @@ export async function loadMatcherPool(opts: MatcherOptions = {}): Promise<Matche
  * («HR-2470» vs «HR 2470» — отличаются только дефисом, но это та же модель,
  * а вот «ТЭПК-3000K» vs «ТЭПК-3000» — разные). Поэтому только
  * пробельная нормализация.
+ *
+ * ВАЖНО: это ЕДИНСТВЕННАЯ нормализация имени товара во всём matcher'е.
+ * Используется и для linked-ms smart-search (см. `findLinkedCandidates`),
+ * и как ключ группировки «одна и та же партия/товар» для анти-микс правила
+ * (см. `isBatchAllowed`, `MatcherPool.chosenBatchByProduct`, `index.ts::
+ * lockChosenBatches`, `holistic.ts`). Не создавай вторую нормализацию —
+ * ключи должны совпадать между стратегиями.
  */
-function normalizeForLink(s: string): string {
+export function normalizeForLink(s: string): string {
   return s.toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ').trim()
+}
+
+/**
+ * Можно ли использовать эту партию (esf_item/приход) для товара в рамках
+ * ТЕКУЩЕГО чека — с учётом того, что уже выбрано для этого же товара
+ * (по нормализованному имени) в других позициях чека.
+ *
+ * Бизнес-правило: один товар = одна партия на весь чек (не смешивать
+ * партии с разной себестоимостью даже в пределах одного чека). См.
+ * `MatcherPool.chosenBatchByProduct`.
+ *
+ * true если:
+ *   - товар (по имени) ещё ни разу не выбирался в этом чеке, ИЛИ
+ *   - уже выбрана именно ЭТА партия (тот же esf_item.id) — т.е. мы
+ *     добираем из той же самой партии дальше.
+ *
+ * false если для этого товара уже залочена ДРУГАЯ партия (другой id).
+ *
+ * `pool.chosenBatchByProduct` optional — если Map отсутствует (ad-hoc
+ * пул без locking, например в старых тестах), ограничений нет.
+ */
+export function isBatchAllowed(
+  pool: MatcherPool,
+  item: EsfItemWithAvailable,
+): boolean {
+  const locked = pool.chosenBatchByProduct?.get(normalizeForLink(item.name))
+  return locked === undefined || locked === item.id
 }
 
 /**
@@ -317,6 +388,10 @@ function findLinkedCandidates(
  *   - в позиции нет `linkedBuhName` (товар без модификации/характеристики)
  *   - smart-search не нашёл inv_item с этим именем
  *   - найдено, но нет остатка (qty_received - consumed < pos.quantity)
+ *   - есть остаток, но НИ ОДНА подходящая партия не проходит по минимальной
+ *     цене (`priceFloorTiyin` — себестоимость +5% — выше того, что заплатил
+ *     клиент в МС), либо все партии уже «заняты» другим товаром через
+ *     анти-микс правило (`isBatchAllowed`)
  *
  * В fallback кейсах matcher пойдёт дальше по pipeline: passthrough → price-bucket.
  */
@@ -362,11 +437,43 @@ export function tryLinkedMsVariant(
     return null
   }
 
+  // ЖЁСТКИЙ ЗАПРЕТ продажи ниже себестоимости (+5%) — цена linked-ms всегда
+  // = pos.totalTiyin (то что заплатил клиент в МС), она НЕ пересчитывается.
+  // Если партия дороже той цены — продажа была бы в убыток, такую партию
+  // нельзя предлагать вообще (ни как выбор, ни как swap-альтернативу).
+  //
+  // Плюс анти-микс: партия того же товара уже могла быть «залочена» другой
+  // позицией этого же чека (isBatchAllowed) — другие батчи исключаем.
+  const eligible = withStock.filter((p) => {
+    if (!isBatchAllowed(pool, p.item)) return false
+    const floor = priceFloorTiyin(
+      p.item.unit_price_tiyin,
+      p.item.vat_percent,
+      pos.quantity,
+    )
+    return floor <= pos.totalTiyin
+  })
+  if (eligible.length === 0) {
+    // Все найденные партии либо ниже минимальной наценки (клиент заплатил
+    // меньше чем себестоимость+5% этой партии), либо уже заняты другим
+    // товаром чека. Fallback на passthrough/price-bucket/multi-item —
+    // возможно среди обычного пула найдётся более дешёвая партия.
+    void log.debug(
+      'matcher',
+      `[linked-ms] "${pos.linkedBuhName}" — ${withStock.length} партий с остатком, ` +
+        `но ни одна не проходит по минимальной цене (клиент заплатил ` +
+        `${pos.totalTiyin}) или уже занята другим товаром чека (анти-микс)`,
+    )
+    return null
+  }
+
   // FIFO — самые старые приходы вначале (типичный учётный порядок).
-  // Берём все батчи с остатком как альтернативы для swap-стрелок:
-  // например бухгалтер импортнул две партии «Сварочный аппарат ARC-220
-  // ALTECO» с разными received_at — кассир переключается между ними ←/→.
-  const sorted = [...withStock].sort(
+  // Берём все батчи с остатком (прошедшие floor+анти-микс) как альтернативы
+  // для swap-стрелок: например бухгалтер импортнул две партии «Сварочный
+  // аппарат ARC-220 ALTECO» с разными received_at — кассир переключается
+  // между ними ←/→. Партии ниже floor сюда не попадают — кассир не может
+  // случайно свапнуть на убыточную.
+  const sorted = [...eligible].sort(
     (a, b) => a.item.received_at - b.item.received_at,
   )
   const chosen = sorted[0]!
@@ -433,12 +540,23 @@ export function tryPassthrough(
   if (!pos.classCode) return null
 
   const strictVat = opts.vatStrict === true
-  const candidates = pool.items.filter(
-    (p) =>
-      p.item.class_code === pos.classCode &&
-      poolRemaining(pool, p.item.id) >= pos.quantity &&
-      (!strictVat || p.item.vat_percent === pos.vatPercent),
-  )
+  const candidates = pool.items.filter((p) => {
+    if (p.item.class_code !== pos.classCode) return false
+    if (poolRemaining(pool, p.item.id) < pos.quantity) return false
+    if (strictVat && p.item.vat_percent !== pos.vatPercent) return false
+    // Анти-микс: партия этого товара уже занята другой позицией чека.
+    if (!isBatchAllowed(pool, p.item)) return false
+    // Жёсткий запрет продажи ниже себестоимости+5%. Цена passthrough
+    // расчётная (обычно ≥ floor при дефолтной наценке 10%), но проверяем
+    // явно — магазин может выставить наценку < 5% (упрощёнка/ручная настройка).
+    const totalSelling = p.sellingPrice * (pos.quantity / 1000)
+    const floor = priceFloorTiyin(
+      p.item.unit_price_tiyin,
+      p.item.vat_percent,
+      pos.quantity,
+    )
+    return totalSelling >= floor
+  })
 
   if (candidates.length === 0) return null
 
@@ -517,6 +635,13 @@ export function tryPriceBucket(
   for (const p of pool.items) {
     if (strictVat && p.item.vat_percent !== pos.vatPercent) continue
     if (poolRemaining(pool, p.item.id) < 1000) continue // 1 шт минимум
+    // Анти-микс: партия этого товара уже занята другой позицией чека.
+    if (!isBatchAllowed(pool, p.item)) continue
+    // Жёсткий запрет продажи ниже себестоимости+5%. В чек пишем
+    // pos.totalTiyin (см. докстринг выше) — значит именно эту сумму и
+    // сверяем с floor конкретного кандидата, а не с его sellingPrice.
+    const floor = priceFloorTiyin(p.item.unit_price_tiyin, p.item.vat_percent, 1000)
+    if (floor > pos.totalTiyin) continue
     const diff = Math.abs(p.sellingPrice - pos.totalTiyin)
     if (diff > swapTolerance) continue
     inRange.push({ item: p.item, sellingPrice: p.sellingPrice, diff })
@@ -591,12 +716,28 @@ export function tryMultiItem(
 
   const picks: { item: EsfItemWithAvailable; quantity: number; sellingPrice: Tiyin }[] = []
   let remaining = pos.totalTiyin
+  // Анти-микс ЛОКАЛЬНО для этой позиции: knapsack не должен набрать 2 разные
+  // партии ОДНОГО товара (реальный баг: 1 шт партии 191к + 4 шт партии 121к
+  // в одном чеке). Ключ — нормализованное имя (та же нормализация что для
+  // linked-ms). Кросс-позиционный анти-микс (через pool.chosenBatchByProduct)
+  // проверяется через isBatchAllowed ниже.
+  const usedProductKeys = new Set<string>()
 
   for (const { item, sellingPrice } of sorted) {
     if (picks.length >= maxItems) break
     if (remaining <= 0) break
     if (sellingPrice <= 0) continue
     if (sellingPrice > remaining + tolerance) continue
+    // Анти-микс: партия этого товара уже занята другой позицией чека
+    // (глобально) ИЛИ уже выбрана для этой же позиции другим SKU-слотом.
+    if (!isBatchAllowed(pool, item)) continue
+    const productKey = normalizeForLink(item.name)
+    if (usedProductKeys.has(productKey)) continue
+    // Жёсткий запрет продажи ниже себестоимости+5%. При дефолтной наценке
+    // (≥10%) sellingPrice уже выше floor, но проверяем явно на случай
+    // низкой наценки в настройках магазина.
+    const floor = priceFloorTiyin(item.unit_price_tiyin, item.vat_percent, 1000)
+    if (sellingPrice < floor) continue
 
     const fitsByPrice = Math.floor(remaining / sellingPrice)
     const fitsByStock = Math.floor(poolRemaining(pool, item.id) / 1000)
@@ -604,6 +745,7 @@ export function tryMultiItem(
     if (qty <= 0) continue
 
     picks.push({ item, quantity: qty, sellingPrice })
+    usedProductKeys.add(productKey)
     remaining -= qty * sellingPrice
   }
 

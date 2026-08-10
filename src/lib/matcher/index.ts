@@ -4,6 +4,7 @@ import {
   ceilToSum,
   floorToSum,
   loadMatcherPool,
+  normalizeForLink,
   priceFloorTiyin,
   tryLinkedMsVariant,
   tryMultiItem,
@@ -45,6 +46,35 @@ function decrementPool(pool: MatcherPool, candidates: import('./types').MatchCan
     const current = pool.remainingById.get(id)
     if (current === undefined) continue
     pool.remainingById.set(id, Math.max(0, current - c.quantity))
+  }
+}
+
+/**
+ * Залочить партию за товаром на весь чек (анти-микс правило).
+ *
+ * Вызывается сразу после финализации каждой позиции — рядом с
+ * `decrementPool`, тем же паттерном. Для каждого кандидата запоминаем
+ * «нормализованное имя товара → esf_item.id» в `pool.chosenBatchByProduct`.
+ * Если товар уже залочен (первый писатель выигрывает — ключ не
+ * перезаписывается), это НЕ ошибка: стратегии (`isBatchAllowed`) уже не
+ * должны были предложить другую партию, но в defensive style мы всё равно
+ * не даём записи гонку.
+ *
+ * Один и тот же товар может встретиться в кандидатах позиции несколько
+ * раз (например multi-item может добавить несколько строк одной партии
+ * для одной позиции — это не запрещено, запрещено только СМЕШИВАТЬ
+ * РАЗНЫЕ партии).
+ */
+function lockChosenBatches(
+  pool: MatcherPool,
+  candidates: import('./types').MatchCandidate[],
+): void {
+  if (!pool.chosenBatchByProduct) pool.chosenBatchByProduct = new Map()
+  for (const c of candidates) {
+    const key = normalizeForLink(c.esfItem.name)
+    if (!pool.chosenBatchByProduct.has(key)) {
+      pool.chosenBatchByProduct.set(key, c.esfItem.id)
+    }
   }
 }
 
@@ -182,6 +212,10 @@ export async function buildMatch(
       // мог «матчиться» в несколько позиций суммарно сверх available —
       // reserve на сервере падал с InventoryConflictError.
       decrementPool(pool, m.candidates)
+      // Анти-микс: залочить партию за товаром на весь чек. Следующие позиции
+      // (и все стратегии через isBatchAllowed) не смогут выбрать ДРУГУЮ
+      // партию того же товара — только эту же или ничего.
+      lockChosenBatches(pool, m.candidates)
     } else {
       const reason = await explainNoMatch(pos, pool, opts)
       warnings.push(
@@ -253,6 +287,18 @@ export async function buildMatch(
   warnings.push(...discountWarnings)
   const bumpWarnings = distributeBump(matches, effectiveTarget, opts)
   warnings.push(...bumpWarnings)
+
+  // ── Финальная страховка (defense-in-depth): жёсткий запрет ниже floor ──
+  // Каждая стратегия уже фильтрует кандидатов по priceFloorTiyin при выборе
+  // (tryLinkedMsVariant/tryPassthrough/tryPriceBucket/tryMultiItem), а
+  // distributeDiscount не режет ниже floor по конструкции. В норме сюда
+  // попадать не должны — это защита от багов/граничных случаев. Позиция,
+  // хоть одна строка которой ниже floor, ПОЛНОСТЬЮ обнуляется до
+  // «не подобрано» (тот же протокол что и для явно неподобранных позиций
+  // выше) — чек не должен уйти в ОФД с убыточной строкой ни при каких
+  // условиях. Мутирует `matches` in-place, поэтому matchedTotal/totalDiff/
+  // hasUnmatched/holistic-фоллбэк ниже уже видят актуальное состояние.
+  warnings.push(...enforceFloorOrUnmatch(matches))
 
   // matchedTotal теперь = сумма (priceTiyin - discountTiyin) каждого кандидата.
   // Это то что реально пойдёт в EPOS как сумма к оплате (Price - Discount).
@@ -394,6 +440,51 @@ export function recalculateAfterSwap(
   const alt = target.alternatives[newAlternativeIndex]
   if (!alt) return result // индекс вне диапазона
 
+  // ── Анти-микс защита от «дыры свапа» ────────────────────────────────
+  //
+  // Баг: позиция 1 (тот же товар что и позиция 2) строится ДО того как
+  // позиция 2 «залочила» свою партию через `lockChosenBatches` — на
+  // момент постройки `matches` в `buildMatch` обе позиции обрабатываются
+  // ПОСЛЕДОВАТЕЛЬНО, так что `alternatives` позиции 1 честно ограничены
+  // тем, что isBatchAllowed() разрешал В МОМЕНТ её построения (это могло
+  // быть ДО того как позиция 2 существовала как «залоченная», если позиция
+  // 2 обрабатывается позже, или наоборот). Но после того как ОБЕ позиции
+  // уже размэтчены и залочены, `alternatives[]` каждой позиции — это
+  // застывший снимок с МОМЕНТА её собственной постройки, который UI не
+  // обновляет заново при рендере. Кассир жмёт стрелку `←`/`→` на позиции 1
+  // и получает частично устаревший список альтернатив, где партия B
+  // (уже занятая позицией 2) всё ещё присутствует → свап на неё создаёт
+  // в чеке ДВЕ партии одного товара.
+  //
+  // Защита: перед тем как принять `alt`, проверяем — не держит ли уже
+  // КАКАЯ-ТО ДРУГАЯ позиция чека тот же нормализованный товар из ДРУГОЙ
+  // партии (esf_item.id). Если да — свап отклоняется, `result` возвращается
+  // БЕЗ ИЗМЕНЕНИЙ ПОЗИЦИЙ, но с добавленным warning'ом (виден кассиру в
+  // блоке «Предупреждения», плюс Receipt.tsx кидает toast — см. вызов
+  // recalculateAfterSwap в UI).
+  const ANTI_MIX_SWAP_PREFIX = 'Свап отклонён (анти-микс):'
+  const altKey = normalizeForLink(alt.esfItem.name)
+  const conflict = result.positions
+    .filter((_, i) => i !== positionIndex)
+    .flatMap((p) => p.candidates.map((c) => ({ posName: p.source.name, c })))
+    .find(({ c }) => normalizeForLink(c.esfItem.name) === altKey && c.esfItem.id !== alt.esfItem.id)
+  if (conflict) {
+    const reason =
+      `${ANTI_MIX_SWAP_PREFIX} «${alt.esfItem.name}» (партия esf_item.id=` +
+      `${alt.esfItem.id}) уже представлен в позиции «${conflict.posName}» ` +
+      `ДРУГОЙ партией (esf_item.id=${conflict.c.esfItem.id}). Нельзя продавать ` +
+      `две партии одного товара в одном чеке — сначала измените ту позицию, ` +
+      `либо выберите другую альтернативу.`
+    void log.warn('matcher', `[swap-guard] ${reason}`, {
+      positionIndex,
+      newAlternativeIndex,
+      altItemId: alt.esfItem.id,
+      conflictItemId: conflict.c.esfItem.id,
+    })
+    const filtered = result.warnings.filter((w) => !w.startsWith(ANTI_MIX_SWAP_PREFIX))
+    return { ...result, warnings: [...filtered, reason] }
+  }
+
   // Глубокий клон позиций. Мутируем только клон.
   const newPositions = result.positions.map((p, i) => {
     if (i !== positionIndex) {
@@ -457,9 +548,12 @@ export function recalculateAfterSwap(
 
   // Пересобираем warnings: убираем старые below-floor (от прошлого набора) и
   // добавляем актуальные для нового набора. Без этого после swap на дорогой
-  // приход warning «ниже минимальной цены» не появился бы.
+  // приход warning «ниже минимальной цены» не появился бы. Плюс убираем
+  // стейл anti-mix-swap warning — если этот свап УСПЕШНО применился (мы
+  // дошли до этой точки, значит conflict-проверка выше не сработала),
+  // старое предупреждение об отклонённом свапе больше не актуально.
   const nonFloorWarnings = result.warnings.filter(
-    (w) => !w.includes('ниже минимальной цены'),
+    (w) => !w.includes('ниже минимальной цены') && !w.startsWith(ANTI_MIX_SWAP_PREFIX),
   )
   const floorWarnings = collectBelowFloorWarnings(newPositions)
 
@@ -473,13 +567,103 @@ export function recalculateAfterSwap(
 }
 
 /**
- * Собрать warnings про позиции продаваемые ниже минимальной цены
- * (себестоимость + 5%). Возникает при linked-ms / price-bucket где цена =
- * pos.totalTiyin (клиент заплатил мало), а также после swap на более дорогой
- * приход. Не блокирует — цену МС менять нельзя.
+ * Финальная страховка (defense-in-depth) классического режима: заменить
+ * ЛЮБУЮ позицию, у которой хоть одна строка (candidate) продаётся ниже
+ * `priceFloorTiyin` (себестоимость +5%), на «не подобрано» (candidates: []).
  *
- * Используется в `buildMatch` (классический проход) И `recalculateAfterSwap`
- * (после ручного swap товара) — чтобы warning не пропал после замены.
+ * ЖЁСТКИЙ запрет, не warning: раньше нарушение floor только логировалось
+ * (`collectBelowFloorWarnings`) и чек всё равно уходил в ОФД. Бизнес-правило
+ * владельца — «ниже себестоимости не должно продаваться вообще» — требует
+ * блокировки, а не предупреждения. Стратегии (`tryLinkedMsVariant` /
+ * `tryPassthrough` / `tryPriceBucket` / `tryMultiItem`) уже фильтруют
+ * кандидатов по floor при выборе, так что в норме сюда попадать не должны —
+ * это последний рубеж защиты от багов и граничных случаев (например если
+ * distributeDiscount/Bump в будущем поменяют и floor-cap случайно потеряется).
+ *
+ * Мутирует `matches` in-place (заменяет элемент целиком на unmatched-заглушку
+ * с тем же `source`), так что `hasUnmatched`, `matchedTotal`, holistic-фоллбэк
+ * дальше по `buildMatch` уже видят актуальное состояние. UI рисует такую
+ * позицию как обычное «не подобрано» — строка + кнопка «Подобрать вручную»,
+ * фискализация блокирована (`hasUnmatched` в Receipt.tsx).
+ *
+ * Возвращает human-readable warnings — что именно отклонено и почему.
+ */
+export function enforceFloorOrUnmatch(matches: PositionMatch[]): string[] {
+  const out: string[] = []
+  for (let i = 0; i < matches.length; i++) {
+    const m = matches[i]!
+    if (m.candidates.length === 0) continue // уже «не подобрано»
+
+    let violation: { name: string; effective: number; floor: number } | null = null
+    for (const c of m.candidates) {
+      const effective = c.priceTiyin - c.discountTiyin
+      const floor = priceFloorTiyin(
+        c.esfItem.unit_price_tiyin,
+        c.esfItem.vat_percent,
+        c.quantity,
+      )
+      // ВАЖНО: без `effective > 0` — раньше строка с ценой 0 при реальной
+      // положительной себестоимости (floor > 0) проходила classic-проверку
+      // необнаруженной (0 > 0 ложно, условие не срабатывало), хотя holistic
+      // (`findBelowFloorLine`) её ловил через простое `effective < floor`
+      // без доп. условия. Несогласованность между classic и holistic —
+      // classic мог пропустить в ОФД позицию по цене 0 сум с ненулевой
+      // себестоимостью. `effective < floor` само по себе уже корректно
+      // покрывает и 0, и отрицательные (гипотетически) значения.
+      if (effective < floor) {
+        violation = { name: c.esfItem.name, effective, floor }
+        break
+      }
+    }
+    if (!violation) continue
+
+    void log.warn(
+      'matcher',
+      `[floor-guard] позиция «${m.source.name}» отклонена: «${violation.name}» ` +
+        `продавался бы за ${violation.effective} тийинов < floor ${violation.floor} ` +
+        `тийинов. Это не должно происходить в норме — стратегии фильтруют ` +
+        `заранее. Проверьте distributeDiscount/Bump на регрессию.`,
+      { position: m.source.name, strategy: m.strategy },
+    )
+
+    const reason =
+      `Товар «${violation.name}» продавался бы за ` +
+      `${tiyinToSumDisplay(violation.effective)} сум — ниже минимальной цены ` +
+      `${tiyinToSumDisplay(violation.floor)} сум (себестоимость +5%). ` +
+      `Продажа ниже себестоимости запрещена — подберите товар вручную.`
+    out.push(`Позиция «${m.source.name}» отклонена: ${reason}`)
+
+    matches[i] = {
+      source: m.source,
+      candidates: [],
+      strategy: 'manual',
+      diffTiyin: 0,
+      warnings: [reason],
+      swappable: false,
+      alternatives: [],
+      selectedAlternativeIndex: -1,
+      splitLevel: 1,
+      canSplitMore: false,
+      splittable: false,
+    }
+  }
+  return out
+}
+
+/**
+ * Собрать warnings про позиции продаваемые ниже минимальной цены
+ * (себестоимость + 5%). Раньше это была ЕДИНСТВЕННАЯ защита (только
+ * предупреждение, чек всё равно уходил в ОФД) — теперь основная защита
+ * блокирующая (`enforceFloorOrUnmatch` для classic, per-line reject в
+ * `planHolistic` для holistic). Эта функция осталась как ДИАГНОСТИКА для
+ * путей, которые сознательно не блокируют — прежде всего
+ * `recalculateAfterSwap` (кассир вручную свапнул товар через UI-стрелки;
+ * альтернативы для swap теперь тоже фильтруются по floor в стратегиях,
+ * так что сработать она должна только если что-то обошло фильтр).
+ *
+ * Используется в `buildMatch` (классический проход, informational, ПОСЛЕ
+ * enforceFloorOrUnmatch — на этом этапе срабатывать уже не должна) И
+ * `recalculateAfterSwap` (после ручного swap товара).
  */
 export function collectBelowFloorWarnings(matches: PositionMatch[]): string[] {
   const out: string[] = []
@@ -575,26 +759,49 @@ async function explainNoMatch(
     return `в справочнике нет товаров с НДС ${pos.vatPercent}% и доступными остатками`
   }
 
-  // Найти ближайшую продажную цену одним проходом.
-  let closestSellingPrice = filtered[0]!.sellingPrice
-  let closestDiff = Math.abs(closestSellingPrice - pos.totalTiyin)
-  let minPrice = closestSellingPrice
+  // Найти ближайшую продажную цену одним проходом (запоминаем сам item —
+  // нужен для floor-проверки ниже, не только цена).
+  let closest = filtered[0]!
+  let closestDiff = Math.abs(closest.sellingPrice - pos.totalTiyin)
+  let minPrice = closest.sellingPrice
   for (const p of filtered) {
     const diff = Math.abs(p.sellingPrice - pos.totalTiyin)
     if (diff < closestDiff) {
       closestDiff = diff
-      closestSellingPrice = p.sellingPrice
+      closest = p
     }
     if (p.sellingPrice > 0 && p.sellingPrice < minPrice) {
       minPrice = p.sellingPrice
     }
   }
+  const closestSellingPrice = closest.sellingPrice
 
   const tolerance = opts.toleranceTiyin ?? 0
   const vatHint = strictVat ? ` с НДС ${pos.vatPercent}%` : ''
   const priceCtx = `(наценка ${markup}%, округление до ${roundUp} сум)`
 
   if (closestDiff <= tolerance) {
+    // Цена похожа (в пределах tolerance) — по старой логике сообщение было
+    // «возможна гонка остатков», хотя частая РЕАЛЬНАЯ причина: этот же
+    // товар отфильтрован по `priceFloorTiyin` в tryPriceBucket, потому что
+    // цена ПОЗИЦИИ (то что заплатил клиент, не calculated sellingPrice)
+    // ниже минимальной цены этого прихода (себестоимость +5%). Проверяем
+    // явно и даём кассиру конкретную причину вместо неверной догадки про
+    // гонку остатков.
+    const floor = priceFloorTiyin(
+      closest.item.unit_price_tiyin,
+      closest.item.vat_percent,
+      1000,
+    )
+    if (floor > pos.totalTiyin) {
+      return (
+        `товар «${closest.item.name}» подошёл бы по цене ` +
+        `(${tiyinToSumDisplay(closestSellingPrice)} сум ${priceCtx}), но сумма ` +
+        `позиции ${tiyinToSumDisplay(pos.totalTiyin)} сум ниже его минимальной ` +
+        `цены ${tiyinToSumDisplay(floor)} сум (себестоимость +5%) — продажа в ` +
+        `убыток запрещена, подберите вручную`
+      )
+    }
     return (
       `найден товар${vatHint} с подходящей продажной ценой ` +
       `${tiyinToSumDisplay(closestSellingPrice)} сум ${priceCtx}, ` +
@@ -636,8 +843,14 @@ async function explainNoMatch(
  * После распределения VAT каждой позиции пересчитывается от (price - discount).
  *
  * Mutates candidates.discountTiyin / .vatTiyin in-place. Возвращает warnings.
+ *
+ * Экспортирована (как `enforceFloorOrUnmatch`/`collectBelowFloorWarnings`)
+ * ТОЛЬКО чтобы юнит-тест мог проверить порядок вызовов внутри `buildMatch`
+ * (distributeDiscount → distributeBump → enforceFloorOrUnmatch, см.
+ * build-match-integration.test.ts) — не предполагается использовать
+ * снаружи matcher-модуля в обычном коде.
  */
-function distributeDiscount(
+export function distributeDiscount(
   matches: PositionMatch[],
   targetSum: number,
   opts: MatcherOptions,
@@ -740,8 +953,11 @@ function distributeDiscount(
  *
  * Mutates `priceTiyin` и `vatTiyin` каждого кандидата in-place. Скидка
  * (`discountTiyin`) не трогается. Возвращает warnings.
+ *
+ * Экспортирована по той же причине что и `distributeDiscount` — тестируемость
+ * порядка вызовов в `buildMatch`, не для внешнего использования.
  */
-function distributeBump(
+export function distributeBump(
   matches: PositionMatch[],
   targetSum: number,
   opts: MatcherOptions,

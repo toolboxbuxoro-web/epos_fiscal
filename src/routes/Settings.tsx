@@ -29,6 +29,7 @@ import { Button } from '@/components/ui/Button'
 import { Input } from '@/components/ui/Input'
 import { Select } from '@/components/ui/Select'
 import { toast } from '@/components/ui'
+import { MIN_MARKUP_PERCENT } from '@/lib/matcher/strategies'
 
 interface FormState {
   // МойСклад логин
@@ -342,6 +343,25 @@ export default function Settings() {
   }
 
   async function save() {
+    // Нижняя граница наценки — MIN_MARKUP_PERCENT (см. strategies.ts).
+    // Замер на реальном пуле: при наценке 10/8/5% floor-фильтры инертны
+    // (0% пула отсекается), но уже при 3% отсекается 88.5% пула, при 0% —
+    // 95.4%. Т.е. магазин с наценкой ниже 5% практически перестаёт
+    // подбирать товары (auto/classic проваливаются в «не подобрано»,
+    // holistic — в reject). loadMatcherPool клампит наценку тоже (защита
+    // от старых сохранённых значений/ручной правки БД), но здесь блокируем
+    // ДО сохранения — чтобы магазин вообще не мог выставить ниже этого
+    // значения через форму и не узнал о проблеме только по факту простоя.
+    const markupNum = Number(form.markupPercent)
+    if (!Number.isFinite(markupNum) || markupNum < MIN_MARKUP_PERCENT) {
+      const msg =
+        `Наценка не может быть ниже ${MIN_MARKUP_PERCENT}% — при более низкой ` +
+        `подбор товаров почти перестаёт работать (это минимальная маржа, ниже ` +
+        `которой продавать нельзя по правилу «не в убыток»).`
+      setError(msg)
+      toast.error(msg, { duration: 6000 })
+      return
+    }
     setBusy(true)
     setError(null)
     try {
@@ -984,14 +1004,18 @@ export default function Settings() {
         <Field label="Наценка на приходную цену, %">
           <Input
             type="number"
-            min={0}
+            min={MIN_MARKUP_PERCENT}
             max={500}
             value={form.markupPercent}
             onChange={(e) => setField('markupPercent', e.target.value)}
           />
           <div className="mt-1 text-xs text-ink-muted">
             К приходной цене из справочника добавляется эта наценка, потом
-            начисляется НДС товара. По умолчанию <strong>10</strong>.
+            начисляется НДС товара. По умолчанию <strong>10</strong>. Минимум{' '}
+            <strong>{MIN_MARKUP_PERCENT}%</strong> — ниже подбор товаров
+            почти перестаёт работать (замер: при 3% отсекается 88.5% склада,
+            при 0% — 95.4%, потому что ни один товар не проходит по правилу
+            «не продавать ниже себестоимости+5%»).
           </div>
         </Field>
         <Field label="Округление продажной цены до, сум">

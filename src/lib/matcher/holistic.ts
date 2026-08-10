@@ -29,8 +29,16 @@
  *
  * Гарантии (если возвращён Ok):
  *   - Σ (line.priceTiyin - line.discountTiyin) = target (exact)
- *   - Σ cost_with_vat(line) ≤ target (не в убыток глобально)
+ *   - КАЖДАЯ строка: (priceTiyin - discountTiyin) ≥ priceFloorTiyin(line)
+ *     (себестоимость +5%) — не только план в среднем прибыльный, а каждая
+ *     партия по отдельности. Одна строка ниже floor отклоняет ВЕСЬ план
+ *     (см. финальную построчную проверку в конце функции).
  *   - line.quantity ≤ available[line.esfItem.id] (уважение остатков)
+ *   - НЕТ двух строк с одним нормализованным именем товара, но разным
+ *     esf_item.id — один товар = одна партия на весь план (анти-микс,
+ *     working коллапсируется ДО фаз 1/2 до батча с максимальным
+ *     `sellingPrice × available` — то есть с наибольшим потенциалом закрыть
+ *     сумму чека; при равенстве — FIFO-самый-старый, см. `normalizeForLink`)
  *   - lines.length ≤ holisticMaxLines (default 30)
  *
  * Не уважает:
@@ -43,6 +51,7 @@
 import type { Tiyin } from '@/lib/db/types'
 import {
   costWithVat,
+  normalizeForLink,
   priceFloorTiyin,
   vatIncluded,
   MIN_MARKUP_PERCENT,
@@ -68,6 +77,38 @@ export type HolisticRejectReason =
 export type HolisticOutcome =
   | { ok: true; plan: HolisticPlan }
   | { ok: false; reason: HolisticRejectReason; detail: string }
+
+/**
+ * Найти первую строку плана, которая продаётся НИЖЕ своего собственного
+ * floor (себестоимость +`MIN_MARKUP_PERCENT`%), или `null` если все строки
+ * в порядке.
+ *
+ * Бизнес-правило: КАЖДАЯ строка (партия) должна быть ≥ floor сама по себе —
+ * недостаточно чтобы план был прибыльным «в среднем» (одна прибыльная
+ * строка компенсирует другую убыточную). Используется как финальная
+ * страховка в конце `planHolistic` — если найдена хоть одна нарушающая
+ * строка, весь план отклоняется (`BELOW_COST`), а не отправляется частично.
+ *
+ * Вынесена отдельной экспортируемой функцией, чтобы можно было юнит-тестить
+ * именно это правило напрямую (сконструировать `HolisticLine[]` руками),
+ * не пытаясь обойти фильтры фаз 1/2 алгоритма через `planHolistic`.
+ */
+export function findBelowFloorLine(
+  lines: HolisticLine[],
+): { line: HolisticLine; effective: Tiyin; floor: Tiyin } | null {
+  for (const line of lines) {
+    const effective = line.priceTiyin - line.discountTiyin
+    const floor = priceFloorTiyin(
+      line.esfItem.unit_price_tiyin,
+      line.esfItem.vat_percent,
+      line.quantity,
+    )
+    if (effective < floor) {
+      return { line, effective, floor }
+    }
+  }
+  return null
+}
 
 /**
  * Собрать holistic-план на сумму `target` из `pool`.
@@ -99,19 +140,61 @@ export function planHolistic(
 
   // Working pool — клонируем `available` чтобы не мутировать оригинал.
   // Сортировка по (sellingPrice DESC, item.id ASC) — детерминизм.
-  const working: WorkingItem[] = pool.items
+  const rawWorking: WorkingItem[] = pool.items
     .filter((p) => p.sellingPrice > 0 && Math.floor(p.item.available / 1000) >= 1)
     .map((p) => ({
       poolItem: p,
       remainingAvailable: Math.floor(p.item.available / 1000), // в штуках
       pickedQty: 0,
     }))
-    .sort((a, b) => {
-      if (b.poolItem.sellingPrice !== a.poolItem.sellingPrice) {
-        return b.poolItem.sellingPrice - a.poolItem.sellingPrice
-      }
-      return a.poolItem.item.id - b.poolItem.item.id
-    })
+
+  // ── Анти-микс: один товар (по нормализованному имени) = одна партия ──
+  //
+  // `rawWorking` может содержать НЕСКОЛЬКО батчей одного товара (разные
+  // esf_item.id с разной received_at/unit_price, но тем же именем —
+  // например партия за 191к и партия того же товара за 121к). Без коллапса
+  // фазы 1/2 могли выбрать РАЗНЫЕ батчи одного товара для точной сборки
+  // суммы (реальный баг: 1 шт партии 191к + 4 шт партии 121к в одном чеке).
+  //
+  // Коллапсируем до ОДНОГО батча на товар — выбираем батч с максимальным
+  // `sellingPrice × remainingAvailable` («потолок стоимости» этой партии).
+  // Раньше выбирался FIFO самый старый (`received_at` минимальный), тот же
+  // принцип что и в tryLinkedMsVariant/tryPassthrough — но для holistic это
+  // системно невыгодно: самая старая партия обычно и самая распроданная
+  // (меньше остатка), а holistic решает задачу subset-sum, где нужен ЗАПАС
+  // возможностей закрыть произвольную сумму — чем больше available × price,
+  // тем больше диапазон сумм, которые этот батч способен покрыть один. FIFO
+  // мог выбрать батч с остатком 1 шт вместо батча с остатком 50 шт того же
+  // товара — план искусственно проваливался (NO_FIT/INSUFFICIENT_POOL) там,
+  // где с «богатым» батчем задача решалась легко. При равном потенциале —
+  // тай-брейк на FIFO-самый-старый (сохраняет учётную логику при прочих
+  // равных). Остальные батчи того же товара полностью исключаются из
+  // holistic-плана (не как fallback, не как филлер) — это осознанно
+  // сокращает пространство подбора, это и есть цель анти-микс правила.
+  const byProductKey = new Map<string, WorkingItem>()
+  for (const w of rawWorking) {
+    const key = normalizeForLink(w.poolItem.item.name)
+    const existing = byProductKey.get(key)
+    if (!existing) {
+      byProductKey.set(key, w)
+      continue
+    }
+    const wValue = w.poolItem.sellingPrice * w.remainingAvailable
+    const existingValue = existing.poolItem.sellingPrice * existing.remainingAvailable
+    const better =
+      wValue > existingValue ||
+      (wValue === existingValue &&
+        w.poolItem.item.received_at < existing.poolItem.item.received_at)
+    if (better) {
+      byProductKey.set(key, w)
+    }
+  }
+  const working: WorkingItem[] = [...byProductKey.values()].sort((a, b) => {
+    if (b.poolItem.sellingPrice !== a.poolItem.sellingPrice) {
+      return b.poolItem.sellingPrice - a.poolItem.sellingPrice
+    }
+    return a.poolItem.item.id - b.poolItem.item.id
+  })
 
   if (working.length === 0) {
     return { ok: false, reason: 'POOL_EMPTY', detail: 'нет товаров с остатками >= 1шт' }
@@ -186,11 +269,20 @@ export function planHolistic(
   // ── Фаза 2: точная сборка остатка через DP subset-sum (с повторами) ──
   if (remaining > 0) {
     const fillers = working
-      .filter(
-        (w) =>
-          w.poolItem.sellingPrice <= fillerThreshold &&
-          w.remainingAvailable > 0,
-      )
+      .filter((w) => {
+        if (w.poolItem.sellingPrice > fillerThreshold) return false
+        if (w.remainingAvailable <= 0) return false
+        // Floor per-line — та же защита что в фазе 1 (см. комментарий выше):
+        // не берём филлер который продавался бы ниже себестоимости+5%.
+        // DP/closest-below не знают про floor сами по себе, поэтому
+        // фильтруем на входе — иначе они могли бы выбрать убыточный филлер.
+        const unitFloor = priceFloorTiyin(
+          w.poolItem.item.unit_price_tiyin,
+          w.poolItem.item.vat_percent,
+          1000,
+        )
+        return unitFloor <= w.poolItem.sellingPrice
+      })
       // Снова сортируем по убыванию цены (после фазы 1 могли остаться разные).
       .sort((a, b) => b.poolItem.sellingPrice - a.poolItem.sellingPrice)
 
@@ -355,6 +447,40 @@ export function planHolistic(
       detail: `итог plan ${totalTiyin} ≠ target ${target} (delta ${totalTiyin - target})`,
     }
   }
+
+  // ── Финальная страховка (defense-in-depth): жёсткий запрет ниже floor ──
+  // ПОСТРОЧНАЯ проверка — основная защита. Бизнес-правило владельца: КАЖДАЯ
+  // партия не должна продаваться ниже своей себестоимости+5%, а не «план
+  // в среднем прибыльный». Раньше проверялась только агрегатная сумма
+  // (totalFloorTiyin vs totalTiyin ниже) — план мог пройти если одна
+  // прибыльная строка компенсировала другую убыточную. Теперь ЛЮБАЯ строка
+  // ниже своего floor отклоняет ВЕСЬ план целиком (holistic либо весь
+  // легальный, либо не возвращается вообще) — план НЕ уходит в ОФД
+  // частично, кассир получает classic-результат с unmatched → ручная сборка.
+  //
+  // В норме фаза 1 (unitFloor check) и фаза 2 (filler floor filter) уже не
+  // должны допустить такую строку — это последний рубеж на случай фазы 3
+  // (bump/discount) или будущих изменений алгоритма. Вынесено отдельной
+  // функцией `findBelowFloorLine` чтобы юнит-тест мог проверить именно это
+  // правило напрямую, не пытаясь обойти фильтры фаз 1/2.
+  {
+    const violation = findBelowFloorLine(lines)
+    if (violation) {
+      return {
+        ok: false,
+        reason: 'BELOW_COST',
+        detail:
+          `строка «${violation.line.esfItem.name}» продавалась бы за ` +
+          `${violation.effective} тийинов — ниже собственной минимальной цены ` +
+          `${violation.floor} тийинов (себестоимость +${MIN_MARKUP_PERCENT}%). ` +
+          `План отклонён целиком, продажа ниже себестоимости запрещена.`,
+      }
+    }
+  }
+
+  // Агрегатная проверка — оставлена как дополнительная подстраховка
+  // (не должна срабатывать отдельно от построчной выше, но дёшева и
+  // документирует инвариант плана как единого целого).
   if (totalFloorTiyin > totalTiyin) {
     return {
       ok: false,
