@@ -93,12 +93,41 @@ export interface JsonRpcItem {
   OwnerType?: 0 | 1 | 2
 }
 
+/**
+ * Доп. сведения о покупателе/транзакции. В кабинете soliq.uz это поле
+ * «Банк картаси тури» (Корпоратив / Шахсий).
+ *
+ * ⚠️ Мы это НЕ отправляли, и ОФД проставлял «Шахсий» по умолчанию ВСЕМ
+ * чекам — даже когда кассир выбрал «Корпоративная». Бухгалтеру приходилось
+ * править каждый корпоративный чек руками в кабинете (с капчей и загрузкой
+ * подтверждающего документа).
+ *
+ * Поле есть и в legacy-протоколе `/uzpos` (`extraInfo.cardType`, помечено
+ * обязательным), и в FiscalDriveService (`ExtraInfo.CardType`) — под ними
+ * один и тот же фискальный модуль, так что JSON-RPC его тоже должен
+ * понимать. Точное написание ключа для JSON-RPC не задокументировано,
+ * поэтому шлём ОБА варианта (PascalCase и camelCase) — тот же приём, что
+ * с `refundInfo`/`RefundInfo` и с `spic`. Лишний ключ Communicator молча
+ * игнорирует, риска для чека нет.
+ */
+export interface JsonRpcExtraInfo {
+  /** 1 = корпоративная карта, 2 = карта физлица. */
+  cardType?: 1 | 2
+  /** ИНН покупателя-юрлица (если собран кассиром). */
+  tin?: string
+  /** ПИНФЛ покупателя-физлица (если собран кассиром). */
+  pinfl?: string
+}
+
 export interface JsonRpcReceipt {
   /** Go-style "2026-05-01 15:30:00" (с пробелом, без T). */
   Time: string
   Items: JsonRpcItem[]
   ReceivedCash: number
   ReceivedCard: number
+  /** См. JsonRpcExtraInfo — шлём в обоих написаниях. */
+  ExtraInfo?: JsonRpcExtraInfo
+  extraInfo?: JsonRpcExtraInfo
   /**
    * Опционально: имя кассира. В декомпиле API GBS Market 6 этого поля нет,
    * но мы шлём «на всякий случай» — если актуальная версия Communicator

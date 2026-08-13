@@ -44,7 +44,12 @@ import {
   printFiscalReceipt,
   type ReceiptData,
 } from '@/lib/printer'
-import { JsonRpcEposClient, formatGoTime, type JsonRpcReceipt } from './jsonrpc-client'
+import {
+  JsonRpcEposClient,
+  formatGoTime,
+  type JsonRpcExtraInfo,
+  type JsonRpcReceipt,
+} from './jsonrpc-client'
 import {
   FiscalDriveClient,
   FISCAL_DRIVE_DEFAULT_URL,
@@ -65,8 +70,12 @@ export interface FiscalizeOptions {
   receivedCard?: number
   msReceiptId?: number
   /**
-   * Тип карты для печати на ленте (НЕ уходит в ОФД — JSON-RPC такого
-   * аргумента не имеет, см. epos-mobile-api.md).
+   * Тип банковской карты. Уходит В ОФД (в кабинете soliq это поле
+   * «Банк картаси тури»: Корпоратив / Шахсий) и печатается на ленте.
+   *
+   * ⚠️ До 0.11.20 отправлялся только у FiscalDrive, а у EPOS Communicator
+   * лишь печатался — из-за чего ОФД проставлял «Шахсий» ВСЕМ чекам, и
+   * бухгалтер правил каждый корпоративный чек вручную в кабинете.
    *
    * - `'fiz'`  → лента: «Karta turi: Jismoniy shaxs»
    * - `'corp'` → лента: «Karta turi: Korporativ»
@@ -305,6 +314,7 @@ export async function fiscalize(
         effectiveLines,
         receivedCash,
         receivedCard,
+        opts.cardKind,
       )
     }
     fiscal = result.fiscal
@@ -1062,6 +1072,7 @@ async function fiscalizeJsonRpc(
   effectiveLines: FiscalLine[],
   receivedCash: number,
   receivedCard: number,
+  cardKind?: 'fiz' | 'corp',
 ): Promise<{ fiscal: FiscalReceiptInfo; requestJson: string }> {
   // Guard ИКПУ перенесён на верхний уровень `fiscalize()` (см. там же,
   // он срабатывает ДО резервации). Здесь — точка построения JSON-RPC payload.
@@ -1091,6 +1102,17 @@ async function fiscalizeJsonRpc(
     OwnerType: c.esfItem.owner_type,
   }))
 
+  // Тип банковской карты → ОФД (в кабинете soliq это «Банк картаси тури»).
+  // Раньше выбор кассира только печатался на ленте, а в ОФД уходило пусто —
+  // и налоговая проставляла «Шахсий» ВСЕМ чекам, включая корпоративные.
+  // Бухгалтер правил каждый такой чек руками в кабинете. Шлём только когда
+  // карточная оплата реально была: для чисто наличного чека поле не имеет
+  // смысла. Ключ дублируем в двух написаниях — точное имя для JSON-RPC не
+  // задокументировано, а лишний ключ Communicator игнорирует.
+  const cardTypeMapRpc: Record<'fiz' | 'corp', 1 | 2> = { corp: 1, fiz: 2 }
+  const extraInfoRpc: JsonRpcExtraInfo | undefined =
+    receivedCard > 0 && cardKind ? { cardType: cardTypeMapRpc[cardKind] } : undefined
+
   const receipt: JsonRpcReceipt = {
     // Go-style "2026-05-01 15:30:00" с ПРОБЕЛОМ. ISO с T парсер
     // Communicator не понимает: "cannot parse \"T05:47:34\" as \" \"".
@@ -1099,6 +1121,9 @@ async function fiscalizeJsonRpc(
     Items: items,
     ReceivedCash: receivedCash,
     ReceivedCard: receivedCard,
+    ...(extraInfoRpc
+      ? { ExtraInfo: extraInfoRpc, extraInfo: extraInfoRpc }
+      : {}),
   }
 
   const client = new JsonRpcEposClient({ url })
