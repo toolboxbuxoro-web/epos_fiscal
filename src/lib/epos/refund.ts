@@ -53,6 +53,7 @@ import {
   getInventoryClient,
   loadInventoryConfig,
 } from '@/lib/inventory'
+import { ShiftNotOpenError, isShiftClosedError } from './fiscalize'
 import {
   JsonRpcEposClient,
   formatGoTime,
@@ -60,6 +61,7 @@ import {
   type JsonRpcReceipt,
   type JsonRpcRefundInfo,
   type JsonRpcFiscalAnswer,
+  type JsonRpcExtraInfo,
 } from './jsonrpc-client'
 import {
   FiscalDriveClient,
@@ -276,73 +278,106 @@ export async function processRefund(opts: ProcessRefundOptions): Promise<Process
   let fiscal: FiscalReceiptInfo
   let requestJson: string
 
-  if (fiscalBackend === 'fiscaldrive') {
-    const r = await sendRefundFiscalDrive(original, refundItems, refundCash, refundCard)
-    fiscal = r.fiscal
-    requestJson = r.requestJson
-  } else {
-    // ⚠️ КРИТИЧНО для привязки к оригиналу в ОФД (иначе «бириктирилмаган»):
-    //   1. `refundInfo` camelCase — основной по доке E-POS. PascalCase игнорируется.
-    //   2. `dateTime` — строго 14 цифр YYYYMMDDHHMMSS без разделителей.
-    const refundInfo: JsonRpcRefundInfo = {
-      terminalId: original.fr.terminal_id,
-      receiptSeq: original.fr.receipt_seq,
-      dateTime: toRefundDateTime(original.fr.fiscal_datetime),
-      fiscalSign: original.fr.fiscal_sign,
-    }
-    const refundReceipt = {
-      Time: formatGoTime(new Date()),
-      Items: refundItems,
-      ReceivedCash: refundCash,
-      ReceivedCard: refundCard,
-      RefundInfo: refundInfo,
-      refundInfo,
-    } as unknown as JsonRpcReceipt
+  // Обе ветки (FiscalDrive и EPOS) обёрнуты ОДНИМ try — проверка «смена
+  // закрыта» стоит НИЖЕ, над обеими, а не дублируется в каждой отдельно
+  // (см. isShiftClosedError). До этой правки проверка была только в
+  // EPOS-catch, и возврат на FiscalDrive при закрытой смене показывал
+  // кассиру сырой дамп ошибки вместо баннера «откройте смену» — а ведь
+  // именно формулировкой FDS (`9023 - ZREPORT_IS_ALREADY_CLOSED`) и
+  // обоснован сам хелпер. Тот же приём что и в fiscalize() — см. там.
+  try {
+    if (fiscalBackend === 'fiscaldrive') {
+      const r = await sendRefundFiscalDrive(original, refundItems, refundCash, refundCard)
+      fiscal = r.fiscal
+      requestJson = r.requestJson
+    } else {
+      // ⚠️ КРИТИЧНО для привязки к оригиналу в ОФД (иначе «бириктирилмаган»):
+      //   1. `refundInfo` camelCase — основной по доке E-POS. PascalCase игнорируется.
+      //   2. `dateTime` — строго 14 цифр YYYYMMDDHHMMSS без разделителей.
+      const refundInfo: JsonRpcRefundInfo = {
+        terminalId: original.fr.terminal_id,
+        receiptSeq: original.fr.receipt_seq,
+        dateTime: toRefundDateTime(original.fr.fiscal_datetime),
+        fiscalSign: original.fr.fiscal_sign,
+      }
+      // Тип карты ОРИГИНАЛЬНОГО чека → тот же ExtraInfo что и при продаже
+      // (см. fiscalize.ts::fiscalizeJsonRpc). Без этого возврат корпоративной
+      // покупки уходит в ОФД как «Шахсий», и бухгалтер правит его руками —
+      // та же дыра что чинили для продажи в 0.11.20, только для refund.
+      // Шлём только когда в возврате реально есть карточная часть.
+      const cardKind = original.fr.card_kind
+      const cardTypeMapRpc: Record<'fiz' | 'corp', 1 | 2> = { corp: 1, fiz: 2 }
+      const extraInfoRpc: JsonRpcExtraInfo | undefined =
+        refundCard > 0 && cardKind ? { cardType: cardTypeMapRpc[cardKind] } : undefined
+      const refundReceipt = {
+        Time: formatGoTime(new Date()),
+        Items: refundItems,
+        ReceivedCash: refundCash,
+        ReceivedCard: refundCard,
+        RefundInfo: refundInfo,
+        refundInfo,
+        ...(extraInfoRpc ? { ExtraInfo: extraInfoRpc, extraInfo: extraInfoRpc } : {}),
+      } as unknown as JsonRpcReceipt
 
-    const eposUrl =
-      (await getSetting(SettingKey.EposCommunicatorUrl)) ??
-      'http://localhost:3448/rpc/api'
-    const client = new JsonRpcEposClient({ url: eposUrl })
-    requestJson = JSON.stringify({
-      jsonrpc: '2.0',
-      method: 'Api.SendRefundReceipt',
-      params: { Receipt: refundReceipt },
-    })
-
-    await log.info('refund', 'Отправляю Api.SendRefundReceipt', {
-      url: eposUrl,
-      originalFiscalId: opts.originalFiscalId,
-      refundInfo,
-      refundCash,
-      refundCard,
-      itemsCount: refundReceipt.Items.length,
-    })
-
-    let answer: JsonRpcFiscalAnswer
-    try {
-      answer = await client.sendRefundReceipt(refundReceipt)
-    } catch (e) {
-      const eposError = e as { code?: number; data?: unknown; message?: string }
-      await log.error('refund', `❌ Refund НЕ пробился: ${eposError.message ?? e}`, {
-        url: eposUrl,
-        jsonRpcCode: eposError.code,
-        jsonRpcData: eposError.data,
-        request: refundReceipt,
+      const eposUrl =
+        (await getSetting(SettingKey.EposCommunicatorUrl)) ??
+        'http://localhost:3448/rpc/api'
+      const client = new JsonRpcEposClient({ url: eposUrl })
+      requestJson = JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'Api.SendRefundReceipt',
+        params: { Receipt: refundReceipt },
       })
-      throw e
-    }
 
-    fiscal = {
-      TerminalID: answer.TerminalID,
-      ReceiptSeq: answer.ReceiptSeq,
-      DateTime:
-        typeof answer.DateTime === 'string'
-          ? answer.DateTime
-          : new Date(answer.DateTime).toISOString(),
-      FiscalSign: answer.FiscalSign,
-      AppletVersion: answer.AppletVersion,
-      QRCodeURL: answer.QRCodeURL,
+      await log.info('refund', 'Отправляю Api.SendRefundReceipt', {
+        url: eposUrl,
+        originalFiscalId: opts.originalFiscalId,
+        refundInfo,
+        refundCash,
+        refundCard,
+        itemsCount: refundReceipt.Items.length,
+      })
+
+      let answer: JsonRpcFiscalAnswer
+      try {
+        answer = await client.sendRefundReceipt(refundReceipt)
+      } catch (e) {
+        const eposError = e as { code?: number; data?: unknown; message?: string }
+        await log.error('refund', `❌ Refund НЕ пробился: ${eposError.message ?? e}`, {
+          url: eposUrl,
+          jsonRpcCode: eposError.code,
+          jsonRpcData: eposError.data,
+          request: refundReceipt,
+        })
+        throw e
+      }
+
+      fiscal = {
+        TerminalID: answer.TerminalID,
+        ReceiptSeq: answer.ReceiptSeq,
+        DateTime:
+          typeof answer.DateTime === 'string'
+            ? answer.DateTime
+            : new Date(answer.DateTime).toISOString(),
+        FiscalSign: answer.FiscalSign,
+        AppletVersion: answer.AppletVersion,
+        QRCodeURL: answer.QRCodeURL,
+      }
     }
+  } catch (refundErr) {
+    // Смена закрыта — распознаём формулировку ОБОИХ протоколов (EPOS code
+    // 36909 / ZREPORT_IS_NOT_OPEN; FiscalDriveService HTTP 500 с телом
+    // "9023 - ZREPORT_IS_ALREADY_CLOSED"). Оригинальная ошибка уже
+    // залогирована выше (EPOS-catch на sendRefundReceipt, либо внутри
+    // sendRefundFiscalDrive для FDS) — здесь только подмена типа для UI,
+    // одна проверка на обе ветки вместо дублирования в каждой.
+    const err = refundErr as { code?: number; data?: unknown; message?: string }
+    const dataStr =
+      typeof err.data === 'string' ? err.data : JSON.stringify(err.data ?? '')
+    if (isShiftClosedError(String(err.message ?? refundErr), dataStr, err.code)) {
+      throw new ShiftNotOpenError()
+    }
+    throw refundErr
   }
 
   await log.info('refund', `Refund фискализирован: ${fiscal.FiscalSign}`, {
@@ -513,6 +548,14 @@ async function sendRefundFiscalDrive(
     FiscalSign: original.fr.fiscal_sign,
   }
 
+  // Тип карты оригинального чека → ExtraInfo.CardType, тот же приём что и
+  // в EPOS-ветке processRefund и в fiscalizeFiscalDrive для продажи.
+  // Только когда в возврате реально есть карточная часть.
+  const cardKind = original.fr.card_kind
+  const cardTypeMap: Record<'fiz' | 'corp', 1 | 2> = { corp: 1, fiz: 2 }
+  const extraInfo =
+    refundCard > 0 && cardKind ? { CardType: cardTypeMap[cardKind] } : undefined
+
   const receipt: FiscalDriveReceipt = {
     Time: formatGoTime(new Date()),
     ReceivedCash: refundCash,
@@ -521,6 +564,7 @@ async function sendRefundFiscalDrive(
     Operation: 1, // возврат
     Items: items,
     RefundInfo: refundInfo,
+    ExtraInfo: extraInfo,
   }
 
   const requestJson = JSON.stringify({ factoryId, receipt })

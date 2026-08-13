@@ -376,7 +376,9 @@ fn build_receipt(d: &ReceiptData) -> Vec<u8> {
     // Тип карты — печатается только если кассир выбрал в модалке перед
     // фискализацией (см. Receipt.tsx). Формат как в чеке E-POS Cashdesk:
     //   «Karta turi: Korporativ» / «Karta turi: Jismoniy shaxs».
-    // В ОФД через JSON-RPC это поле не уходит — только на ленту для учёта.
+    // С 0.11.20 это поле ТАКЖЕ уходит в ОФД через JSON-RPC
+    // (ExtraInfo/extraInfo.cardType, см. fiscalize.ts/refund.ts) — печать
+    // здесь не единственный канал, а просто дублирует значение на ленту.
     let karta_turi_label = match d.karta_turi.as_str() {
         "corp" => Some("Korporativ"),
         "fiz" => Some("Jismoniy shaxs"),

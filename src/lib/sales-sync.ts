@@ -233,6 +233,37 @@ function safeParseJson(s: string | null | undefined): unknown {
   }
 }
 
+/**
+ * Вычистить `ExtraInfo`/`extraInfo` из распарсенного `request_json` перед тем
+ * как класть его в `raw_request` (payload шлётся на сервер ДОСЛОВНО).
+ *
+ * Сегодня в extraInfo лежит только `cardType` — утечки ПД нет. Но
+ * `JsonRpcExtraInfo` (см. jsonrpc-client.ts) уже объявляет `tin`/`pinfl`
+ * (ИНН/ПИНФЛ покупателя) — тот же ключ у обоих написаний. Как только UI
+ * начнёт их собирать, они уедут на сервер без единой правки ЭТОГО файла и
+ * без падающего теста — raw_request копирует request_json как есть. Чистим
+ * на входе заранее, пока это дёшево, а не когда поле уже используется.
+ *
+ * Рекурсивно и без привязки к конкретной вложенности — EPOS кладёт
+ * ExtraInfo/extraInfo в `params.Receipt`, FiscalDriveService в `receipt`
+ * (только PascalCase), но обходить оба пути отдельно не нужно: любой ключ
+ * `ExtraInfo`/`extraInfo` на любом уровне вырезается целиком.
+ */
+export function stripExtraInfo(raw: unknown): unknown {
+  if (Array.isArray(raw)) {
+    return raw.map(stripExtraInfo)
+  }
+  if (raw !== null && typeof raw === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+      if (key === 'ExtraInfo' || key === 'extraInfo') continue
+      out[key] = stripExtraInfo(value)
+    }
+    return out
+  }
+  return raw
+}
+
 /** Информация из esf_items, нужная для одной позиции payload. */
 export interface EsfJoinInfo {
   serverItemId: number | null
@@ -348,6 +379,10 @@ interface MsReceiptSlice {
  * `matches.total_tiyin` если у чека есть `match_id` (кладём в cash_tiyin,
  * т.к. реального сплита cash/card без парсинга не знаем — total=cash+card
  * остаётся инвариантом), иначе 0.
+ *
+ * Тот же мотив (extraInfo может нести ПД) применяется и к РАСПОЗНАННОМУ
+ * `request_json` ниже: `raw_request` идёт через `stripExtraInfo`, а не
+ * кладётся как есть — см. её doc-comment.
  */
 export function buildSaleEntry(input: {
   receipt: FiscalReceiptRow
@@ -416,7 +451,9 @@ export function buildSaleEntry(input: {
     matcher_strategy: matchStrategy,
     is_test: false,
     fiscalized_at: new Date(receipt.fiscalized_at * 1000).toISOString(),
-    raw_request: safeParseJson(receipt.request_json),
+    // stripExtraInfo — см. её doc-comment: ExtraInfo/extraInfo может содержать
+    // ПД покупателя (tin/pinfl), request_json копируется на сервер дословно.
+    raw_request: stripExtraInfo(safeParseJson(receipt.request_json)),
     ms_items: buildMsItems(msReceipt?.raw_json),
     items,
     refunds: refunds.map(buildRefundPayload),

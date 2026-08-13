@@ -21,7 +21,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { formatErrorForUser } from '@/lib/error-message'
 import { useNavigate, useParams } from 'react-router-dom'
-import { AlertCircle, ArrowLeft, Undo2 } from 'lucide-react'
+import { AlertCircle, ArrowLeft, TriangleAlert, Undo2 } from 'lucide-react'
 import {
   getDb,
   getMsReceipt,
@@ -36,6 +36,7 @@ import {
   getDefaultRefundAmounts,
   processRefund,
   RefundAlreadyExistsError,
+  ShiftNotOpenError,
 } from '@/lib/epos'
 import { extractPositions } from '@/lib/matcher'
 import { parseRequestJsonReceipt } from '@/lib/epos/request-json'
@@ -92,6 +93,10 @@ export default function Refund() {
   const [busy, setBusy] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
+  // Смена ККМ закрыта — тот же баннер что в Receipt.tsx при фискализации
+  // продажи. Отдельно от `error`, чтобы показать понятный баннер с кнопкой
+  // «Перейти в Смену» вместо generic-текста formatErrorForUser.
+  const [shiftNotOpen, setShiftNotOpen] = useState(false)
   /**
    * Режим возврата:
    *   - 'full' — возвращаем ВСЕ позиции оригинала (default если refund'ов ещё нет)
@@ -287,6 +292,7 @@ export default function Refund() {
     submitLockRef.current = true
     setSubmitting(true)
     setError(null)
+    setShiftNotOpen(false)
     try {
       // TOCTOU-защита: между загрузкой страницы и кликом мог пройти большой
       // промежуток времени — другой пользователь/сессия могла оформить refund.
@@ -341,6 +347,18 @@ export default function Refund() {
         // Перезагружаем чтобы UI отразил уже-существующий возврат.
         await load()
         toast.error(e.message, { duration: 5000 })
+        return
+      }
+      // Смена не открыта — НЕ generic-ошибка. Раньше (до isShiftClosedError)
+      // сюда прилетал сырой JsonRpcEposError с code=36909, и formatEposError
+      // (error-message.ts) сам превращал его в понятный текст. Теперь
+      // fiscalize.ts/refund.ts бросают типизированный ShiftNotOpenError,
+      // который formatErrorForUser не узнаёт и заворачивает в generic
+      // «Техническая ошибка: …» fallback — регресс относительно старого
+      // поведения. Ловим отдельно, как в Receipt.tsx.
+      if (e instanceof ShiftNotOpenError) {
+        setShiftNotOpen(true)
+        toast.error(e.message, { duration: 6000 })
         return
       }
       setError(formatErrorForUser(e))
@@ -426,6 +444,32 @@ export default function Refund() {
               {formatDateTime(existing.refunded_at)}. FiscalSign возврата:{' '}
               <span className="font-mono">{existing.fiscal_sign}</span>.
               Повторный возврат невозможен (один продажный чек — один refund).
+            </div>
+          </Card.Body>
+        </Card>
+      )}
+
+      {shiftNotOpen && (
+        <Card className="border-warning/30 bg-warning-soft">
+          <Card.Body className="flex items-start gap-3">
+            <TriangleAlert size={18} className="text-warning shrink-0 mt-0.5" />
+            <div className="flex-1">
+              <div className="text-body font-medium text-warning">
+                Смена ККМ не открыта
+              </div>
+              <div className="mt-1 text-caption text-ink">
+                Communicator отказал: возврат невозможен без открытой смены.
+                Откройте смену в разделе «Смена», затем повторите возврат.
+              </div>
+              <div className="mt-2">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => nav('/zreport')}
+                >
+                  Перейти в Смену
+                </Button>
+              </div>
             </div>
           </Card.Body>
         </Card>

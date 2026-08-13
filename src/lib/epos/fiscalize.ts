@@ -357,11 +357,7 @@ export async function fiscalize(
       typeof eposExtra.data === 'string'
         ? eposExtra.data
         : JSON.stringify(eposExtra.data ?? '')
-    if (
-      eposExtra.code === 36909 ||
-      /ZREPORT_IS_NOT_OPEN/i.test(errMsg) ||
-      /ZREPORT_IS_NOT_OPEN/i.test(dataStr)
-    ) {
+    if (isShiftClosedError(errMsg, dataStr, eposExtra.code)) {
       throw new ShiftNotOpenError()
     }
     throw eposErr
@@ -417,6 +413,33 @@ export async function fiscalize(
   )
 
   return { fiscal, fiscalReceiptDbId, matchDbId }
+}
+
+/**
+ * Смена ККМ недоступна — распознаём формулировки ОБОИХ протоколов.
+ *
+ * EPOS Communicator: `ERROR_ZREPORT_IS_NOT_OPEN`, jsonRpcCode 36909.
+ * FiscalDriveService: HTTP 500 с телом `{"Reason":"9023 - ZREPORT_IS_ALREADY_CLOSED"}`.
+ *
+ * Раньше распознавался только вариант EPOS, из-за чего кассир на
+ * FiscalDrive видел сырой дамп `applet0400.SWError` вместо понятного
+ * «откройте смену» с кнопкой. На проде это стоило 8 непробитых чеков
+ * подряд за одно утро — кассир не понимал, что делать.
+ *
+ * Смысл у обеих формулировок один: смена не открыта (закрыта), лечится
+ * открытием новой — поэтому и ошибка одна на оба случая.
+ */
+export function isShiftClosedError(
+  message: string,
+  data: string,
+  code?: number,
+): boolean {
+  if (code === 36909) return true
+  const haystack = `${message} ${data}`
+  return (
+    /ZREPORT_IS_NOT_OPEN/i.test(haystack) ||
+    /ZREPORT_IS_ALREADY_CLOSED/i.test(haystack)
+  )
 }
 
 /**

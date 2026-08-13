@@ -10,6 +10,7 @@ import {
   buildRefundPayload,
   buildSaleEntry,
   buildSaleItems,
+  stripExtraInfo,
   toIso,
   type EsfJoinInfo,
 } from '../sales-sync'
@@ -19,6 +20,12 @@ import type { MsRetailDemand } from '@/lib/moysklad/types'
 
 // ── Фикстуры request_json (те же форматы что и в epos/__tests__/request-json.test.ts) ──
 
+// ExtraInfo/extraInfo — как реально шлёт fiscalizeJsonRpc/processRefund с
+// 0.11.20/0.11.21 (оба написания, cardType). `tin`/`pinfl` добавлены НЕ
+// потому что UI их сегодня собирает (не собирает), а чтобы зафиксировать,
+// что buildSaleEntry вычищает ExtraInfo/extraInfo ЦЕЛИКОМ из raw_request —
+// см. stripExtraInfo в sales-sync.ts и тесты ниже «raw_request не содержит
+// ExtraInfo/extraInfo».
 const EPOS_JSON = JSON.stringify({
   jsonrpc: '2.0',
   id: 1,
@@ -40,6 +47,8 @@ const EPOS_JSON = JSON.stringify({
           packageCode: '1435794',
         },
       ],
+      ExtraInfo: { cardType: 2, tin: '987654321', pinfl: '11122233344455' },
+      extraInfo: { cardType: 2, tin: '987654321', pinfl: '11122233344455' },
     },
   },
 })
@@ -68,6 +77,37 @@ const FDS_JSON = JSON.stringify({
         VAT: 2517857,
       },
     ],
+  },
+})
+
+// FDS-форма ExtraInfo — только PascalCase (FiscalDriveExtraInfo не знает
+// camelCase-алиаса, в отличие от JSON-RPC). Отдельная фикстура от FDS_JSON
+// выше, чтобы не трогать её существующих потребителей (buildSaleItems-тест).
+const FDS_JSON_WITH_EXTRA_INFO = JSON.stringify({
+  factoryId: 'FDS_FACTORY_1',
+  receipt: {
+    Time: '2026-07-24 17:19:00',
+    ReceivedCash: 0,
+    ReceivedCard: 3500000,
+    Type: 0,
+    Operation: 0,
+    Items: [
+      {
+        Name: 'Коронка алмазного сверления',
+        Barcode: '0',
+        SPIC: '08207001007000000',
+        Units: 796,
+        PackageCode: '1435794',
+        OwnerType: 0,
+        Amount: 1000,
+        Price: 3500000,
+        Discount: 0,
+        Other: 0,
+        VATPercent: 12,
+        VAT: 375000,
+      },
+    ],
+    ExtraInfo: { CardType: 1, TIN: '987654321' },
   },
 })
 
@@ -518,7 +558,22 @@ describe('buildSaleEntry', () => {
     expect(entry.excluded_payment_tiyin).toBe(200000)
     expect(entry.matcher_strategy).toBe('passthrough')
     expect(entry.is_test).toBe(false)
-    expect(entry.raw_request).toEqual(JSON.parse(EPOS_JSON))
+    // raw_request = request_json ПОЛНОСТЬЮ, КРОМЕ ExtraInfo/extraInfo —
+    // EPOS_JSON несёт их (cardType/tin/pinfl, см. фикстуру выше), и
+    // stripExtraInfo должен вырезать оба написания целиком, не оставляя
+    // даже пустой объект/cardType. Остальная форма payload (Time/Items/…)
+    // не тронута.
+    const parsedRequest = JSON.parse(EPOS_JSON) as {
+      params: { Receipt: Record<string, unknown> }
+    }
+    delete parsedRequest.params.Receipt.ExtraInfo
+    delete parsedRequest.params.Receipt.extraInfo
+    expect(entry.raw_request).toEqual(parsedRequest)
+    const serializedRawRequest = JSON.stringify(entry.raw_request)
+    expect(serializedRawRequest).not.toContain('ExtraInfo')
+    expect(serializedRawRequest).not.toContain('extraInfo')
+    expect(serializedRawRequest).not.toContain('987654321') // tin
+    expect(serializedRawRequest).not.toContain('11122233344455') // pinfl
   })
 
   it('fiscalized_at (epoch-секунды) конвертируется в ISO', () => {
@@ -594,5 +649,86 @@ describe('buildSaleEntry', () => {
       expect(serialized).not.toContain('legacy-fixed-token') // token
       expect(serialized).not.toContain('extraInfo')
     })
+  })
+
+  // Тест выше покрывает ТОЛЬКО легаси-путь, где raw_request и так всегда
+  // null (parseRequestJsonReceipt возвращает null → деградированная запись,
+  // stripExtraInfo даже не вызывается). Он ничего не говорит про обычный,
+  // успешно распознанный чек — а именно туда ExtraInfo/extraInfo реально
+  // попадает (см. fiscalizeJsonRpc/processRefund). Блок ниже — тот самый
+  // «другой» сценарий, согласованный с guard-тестом выше: тот же принцип
+  // (ПД не должна утечь в payload), но для ЖИВОГО пути через stripExtraInfo.
+  describe('raw_request не содержит ExtraInfo/extraInfo (живой, распознанный request_json)', () => {
+    it('EPOS: ExtraInfo и extraInfo (оба написания) вычищены, остальной payload не тронут', () => {
+      const entry = buildSaleEntry({
+        receipt: makeReceipt(), // request_json по умолчанию = EPOS_JSON (несёт ExtraInfo/extraInfo)
+        msReceipt: null,
+        matchStrategy: 'passthrough',
+        matchTotalTiyin: null,
+        matchItemsOrdered: [],
+        esfInfoByLocalId: new Map(),
+        refunds: [],
+      })
+      expect(entry.raw_request).not.toBeNull()
+      const raw = entry.raw_request as { params: { Receipt: Record<string, unknown> } }
+      expect(raw.params.Receipt).not.toHaveProperty('ExtraInfo')
+      expect(raw.params.Receipt).not.toHaveProperty('extraInfo')
+      // Позиции и суммы остались — вычищаем только ExtraInfo/extraInfo, не всё подряд.
+      expect(raw.params.Receipt.ReceivedCash).toBe(3500000)
+      expect((raw.params.Receipt.Items as unknown[]).length).toBe(1)
+    })
+
+    it('FDS: ExtraInfo (PascalCase-only) тоже вычищен', () => {
+      const entry = buildSaleEntry({
+        receipt: makeReceipt({ request_json: FDS_JSON_WITH_EXTRA_INFO }),
+        msReceipt: null,
+        matchStrategy: 'passthrough',
+        matchTotalTiyin: null,
+        matchItemsOrdered: [],
+        esfInfoByLocalId: new Map(),
+        refunds: [],
+      })
+      expect(entry.raw_request).not.toBeNull()
+      const raw = entry.raw_request as { receipt: Record<string, unknown> }
+      expect(raw.receipt).not.toHaveProperty('ExtraInfo')
+      expect(raw.receipt.ReceivedCard).toBe(3500000)
+      const serialized = JSON.stringify(entry.raw_request)
+      expect(serialized).not.toContain('987654321') // TIN из фикстуры
+      expect(serialized).not.toContain('ExtraInfo')
+    })
+  })
+})
+
+describe('stripExtraInfo', () => {
+  it('вырезает ExtraInfo/extraInfo на верхнем уровне, остальные ключи сохраняет', () => {
+    const input = { Time: '2026-01-01', ExtraInfo: { cardType: 1 }, extraInfo: { cardType: 1 } }
+    expect(stripExtraInfo(input)).toEqual({ Time: '2026-01-01' })
+  })
+
+  it('рекурсивно вырезает на любой вложенности (EPOS params.Receipt.ExtraInfo, FDS receipt.ExtraInfo)', () => {
+    const eposShape = {
+      params: { Receipt: { Time: 't', ExtraInfo: { cardType: 1 }, extraInfo: { cardType: 1 } } },
+    }
+    expect(stripExtraInfo(eposShape)).toEqual({ params: { Receipt: { Time: 't' } } })
+
+    const fdsShape = { factoryId: 'X', receipt: { Time: 't', ExtraInfo: { CardType: 2 } } }
+    expect(stripExtraInfo(fdsShape)).toEqual({ factoryId: 'X', receipt: { Time: 't' } })
+  })
+
+  it('массивы обходятся поэлементно (Items[] с гипотетическим ExtraInfo внутри позиции)', () => {
+    const input = { Items: [{ Name: 'A', ExtraInfo: { cardType: 1 } }, { Name: 'B' }] }
+    expect(stripExtraInfo(input)).toEqual({ Items: [{ Name: 'A' }, { Name: 'B' }] })
+  })
+
+  it('null/примитивы/массив на верхнем уровне — не падает', () => {
+    expect(stripExtraInfo(null)).toBeNull()
+    expect(stripExtraInfo('string')).toBe('string')
+    expect(stripExtraInfo(42)).toBe(42)
+    expect(stripExtraInfo([1, 2, 3])).toEqual([1, 2, 3])
+  })
+
+  it('нет ExtraInfo/extraInfo вообще → объект возвращается как есть (по значению)', () => {
+    const input = { Time: 't', ReceivedCash: 100 }
+    expect(stripExtraInfo(input)).toEqual(input)
   })
 })
