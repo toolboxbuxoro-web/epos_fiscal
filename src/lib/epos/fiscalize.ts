@@ -167,8 +167,12 @@ export async function fiscalize(
   // относительно фактической фискальной части.
   const excludePayment = Math.max(0, opts.excludePaymentTiyin ?? 0)
   const auto = determinePaymentFromMs(build.receipt, matchedTotal, excludePayment)
-  const receivedCash = opts.receivedCash ?? auto.receivedCash
-  const receivedCard = opts.receivedCard ?? auto.receivedCard
+  // Финальная страховка: в фискальные бэкенды НИКОГДА не должно уйти
+  // отрицательное значение — FiscalDrive ждёт беззнаковое и отвергает чек
+  // целиком, а EPOS может принять молча и записать в ОФД неверную оплату.
+  // Клампим и авто-расчёт, и явное переопределение из UI.
+  const receivedCash = Math.max(0, opts.receivedCash ?? auto.receivedCash)
+  const receivedCard = Math.max(0, opts.receivedCard ?? auto.receivedCard)
 
   // ── Тестовый режим (сухой прогон) ────────────────────────────
   // UI отрабатывает «как будто» фискализация прошла, но в Communicator
@@ -808,13 +812,18 @@ async function releaseRemote(
  *   receivedCash = round(1800000 × 0.667) = 1200600
  *   receivedCard = 1800000 - 1200600 = 599400
  */
-function determinePaymentFromMs(
+export function determinePaymentFromMs(
   rd: import('@/lib/moysklad/types').MsRetailDemand,
   matchedTotal: number,
   excludeFromNonCash: number = 0,
 ): { receivedCash: number; receivedCard: number } {
-  const cash = rd.cashSum ?? 0
-  const rawCard = (rd.noCashSum ?? 0) + (rd.qrSum ?? 0)
+  // ⚠️ Клампим ВХОД по нулю. МойСклад иногда отдаёт крошечные отрицательные
+  // суммы (артефакт округления/бонусов — на проде прилетал cashSum = −1 тийин).
+  // Без клампа пропорция ниже давала отрицательный ReceivedCash, а фискальные
+  // бэкенды ждут беззнаковое: FiscalDrive отвечал HTTP 400 «cannot unmarshal
+  // number -1 into Go struct field Receipt.ReceivedCash» и чек не пробивался.
+  const cash = Math.max(0, rd.cashSum ?? 0)
+  const rawCard = Math.max(0, (rd.noCashSum ?? 0) + (rd.qrSum ?? 0))
   // excludeFromNonCash — это сумма Click/Payme которую кассир пометил как
   // НЕ фискализируется (она была в noCashSum/qrSum МС). Вычитаем её ИЗ карты:
   // оставшаяся часть rawCard − exclude фискализируется как ReceivedCard.
@@ -837,8 +846,12 @@ function determinePaymentFromMs(
   }
   // Смешанная — пропорционально по cash/card соотношению ПОСЛЕ exclude.
   // Остаток уходит в карту чтобы тийины не потерялись при округлении.
-  const receivedCash = Math.round((matchedTotal * cash) / total)
-  const receivedCard = matchedTotal - receivedCash
+  // Клампим и ВЫХОД: доля не может выйти за [0, matchedTotal]. Остаток всегда
+  // уходит в карту, поэтому сумма частей строго равна matchedTotal — иначе
+  // чек не сойдётся с позициями.
+  const rawCash = Math.round((matchedTotal * cash) / total)
+  const receivedCash = Math.min(Math.max(0, rawCash), Math.max(0, matchedTotal))
+  const receivedCard = Math.max(0, matchedTotal) - receivedCash
   return { receivedCash, receivedCard }
 }
 
