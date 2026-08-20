@@ -47,7 +47,47 @@ export class InventoryServerClient {
    * распарсенное тело на 2xx. Также возвращает 409 как обычное тело
    * (это ожидаемая ошибка «не хватило остатков», не exceptional).
    */
+  /**
+   * Один запрос к inventory-серверу с ПОВТОРОМ на кратковременных сбоях шлюза.
+   *
+   * Зачем: сервер живёт на Railway, и при каждом деплое он на несколько секунд
+   * отдаёт 502. Раньше кассир в этот момент получал «Сервер inventory
+   * недоступен, попробуйте через минуту» посреди продажи и жал
+   * «Фискализировать» заново (реальный случай 20.08 у Дон бозори).
+   *
+   * Повторяем ТОЛЬКО транзиентное: 502/503/504 и сетевые обрывы. Бизнес-ответы
+   * (409 «товар закончился», 400, 401) отдаём сразу — их повтор не исправит,
+   * а задержка навредит.
+   *
+   * Повтор безопасен: и `reserve` (идемпотентен по shop_id+ms_receipt_id →
+   * idempotent_replay), и `confirm` (идемпотентен по статусу резервации)
+   * рассчитаны на повторную отправку — см. CLAUDE.md, раздел про атомарность.
+   */
   private async request<T>(
+    path: string,
+    init: RequestInit & { allowStatuses?: number[] } = {},
+  ): Promise<T> {
+    const TRANSIENT = new Set([502, 503, 504])
+    const MAX_ATTEMPTS = 3
+    const BACKOFF_MS = [400, 1200]
+
+    let lastErr: unknown
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        return await this.requestOnce<T>(path, init)
+      } catch (e) {
+        lastErr = e
+        const status = e instanceof InventoryServerError ? e.status : undefined
+        // Сетевой обрыв (status undefined) или транзиентный код шлюза.
+        const retriable = status === undefined || TRANSIENT.has(status)
+        if (!retriable || attempt === MAX_ATTEMPTS) throw e
+        await new Promise((r) => setTimeout(r, BACKOFF_MS[attempt - 1] ?? 1200))
+      }
+    }
+    throw lastErr
+  }
+
+  private async requestOnce<T>(
     path: string,
     init: RequestInit & { allowStatuses?: number[] } = {},
   ): Promise<T> {
