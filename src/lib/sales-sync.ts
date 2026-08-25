@@ -43,7 +43,7 @@
  */
 
 import type Database from '@tauri-apps/plugin-sql'
-import { fetch } from '@tauri-apps/plugin-http'
+import { fetchWithTimeout } from './http'
 import { getDb, getSetting, SettingKey } from '@/lib/db'
 import type { FiscalReceiptRow, FiscalRefundRow } from '@/lib/db'
 import { log } from '@/lib/log'
@@ -61,6 +61,12 @@ const BATCH_SIZE = 20
 
 let started = false
 let timer: ReturnType<typeof setInterval> | null = null
+/** Сколько подряд-неудач до эскалации в log.error (тик = 60 сек, т.е. ~5 минут). */
+const STALL_THRESHOLD = 5
+
+/** Разовая эскалация залипшей очереди, сбрасывается при первом успехе. */
+let loggedStallOnce = false
+
 /** Кол-во подряд-failed flush'ей для exp backoff. */
 let consecutiveFailures = 0
 
@@ -572,6 +578,37 @@ let inFlight: Promise<void> | null = null
  */
 let logged404Once = false
 
+/**
+ * Потолок ожидания сервера при отправке пачки чеков.
+ *
+ * До этого таймаута не было вовсе, и цена оказалась высокой: зависший POST
+ * навсегда залипал guard `inFlight` (см. `flushSalesToServer`), магазин
+ * переставал синхронизироваться совсем и не писал об этом ни строчки.
+ * 60 сек с запасом хватает на пачку из 20 чеков даже на плохом канале.
+ */
+const SALES_TIMEOUT_MS = 60_000
+
+/**
+ * Сколько держим guard `inFlight` прежде чем счесть флаш зависшим.
+ * Заведомо больше `SALES_TIMEOUT_MS` × запас на цепочку догоняющих флашей.
+ */
+const INFLIGHT_MAX_MS = 10 * 60_000
+
+/** Когда стартовал текущий флаш — для сторожа выше. */
+let inFlightStartedAt = 0
+
+/** Раз во сколько тиков проверяем здоровье очереди (тик = 60 сек → раз в 30 мин). */
+const QUEUE_CHECK_EVERY = 30
+
+/** С какого возраста самого старого неотправленного чека бьём тревогу. */
+const BACKLOG_ALERT_HOURS = 24
+
+let queueCheckCounter = 0
+let loggedBacklogOnce = false
+
+/** Сообщали ли уже про ненастроенный сервер — чтобы не писать это каждую минуту. */
+let loggedNoConfigOnce = false
+
 /** Потолок доп.флашей подряд в рамках одного тика — см. `runFlushCycle`. */
 const MAX_CHAIN_FLUSHES = 25
 
@@ -588,9 +625,29 @@ const MAX_CHAIN_FLUSHES = 25
  * Никогда не throw'ит — вся обработка ошибок внутри `runFlushCycle`.
  */
 export async function flushSalesToServer(): Promise<void> {
-  if (inFlight) return inFlight
-  inFlight = runFlushChain(0).finally(() => {
+  // Сторож на случай, если промис всё-таки залипнет.
+  //
+  // Сам guard `inFlight` — правильный, но у него есть цена: пока промис не
+  // завершился, флашер стоит. Один незавершающийся вызов = магазин молча
+  // выпадает из синхронизации навсегда. Именно так и вышло: POST без
+  // таймаута висел, guard не снимался, и Хонабод три месяца не отправил ни
+  // одного чека. Таймаут в `fetchWithTimeout` закрывает известную причину,
+  // сторож — все остальные: держим guard не дольше INFLIGHT_MAX_MS.
+  if (inFlight) {
+    const heldMs = Date.now() - inFlightStartedAt
+    if (heldMs < INFLIGHT_MAX_MS) return inFlight
+    void log.error(
+      'sales-sync',
+      `предыдущий флаш висит ${Math.round(heldMs / 1000)} сек — снимаю блокировку и начинаю заново`,
+    )
     inFlight = null
+  }
+
+  inFlightStartedAt = Date.now()
+  const started = inFlight = runFlushChain(0).finally(() => {
+    // Только если это всё ещё НАШ промис: сторож мог обнулить inFlight и
+    // запустить новый флаш, и зависший старый не должен его затирать.
+    if (inFlight === started) inFlight = null
   })
   return inFlight
 }
@@ -632,7 +689,20 @@ async function runFlushCycle(): Promise<boolean> {
   try {
     const serverUrl = await getSetting(SettingKey.InventoryServerUrl)
     const apiKey = await getSetting(SettingKey.InventoryShopApiKey)
-    if (!serverUrl || !apiKey) return false
+    if (!serverUrl || !apiKey) {
+      // Раньше здесь был немой `return` — магазин без настроек не отправлял
+      // ничего и молчал об этом. Один log.error за сессию: и админ увидит
+      // в телеметрии, и логи не заспамим (тик раз в 60 сек).
+      if (!loggedNoConfigOnce) {
+        loggedNoConfigOnce = true
+        void log.error(
+          'sales-sync',
+          'синхронизация продаж выключена: не заданы адрес сервера или ключ магазина (Настройки → Inventory)',
+        )
+      }
+      return false
+    }
+    loggedNoConfigOnce = false
 
     // Exp backoff после подряд-failures, тот же приём что в telemetry.ts:
     // шанс попытки = 1 / 2^failures, просто пропускаем тик если не повезло.
@@ -642,6 +712,8 @@ async function runFlushCycle(): Promise<boolean> {
     }
 
     const db = await getDb()
+    await checkQueueHealth(db)
+
     // Берём и чеки, которые ещё не уехали, и уже уехавшие, у которых появился
     // неотправленный возврат. Без второго условия возвраты не доезжали бы почти
     // никогда: покупатель приходит через день-два, а чек уходит на сервер
@@ -709,23 +781,43 @@ async function runFlushCycle(): Promise<boolean> {
     }
 
     const url = serverUrl.replace(/\/$/, '') + '/api/v1/inventory/sales'
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
+    const res = await fetchWithTimeout(
+      url,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({
+          app_version: APP_VERSION,
+          sales,
+        } satisfies SalesSyncPayload),
       },
-      body: JSON.stringify({
-        app_version: APP_VERSION,
-        sales,
-      } satisfies SalesSyncPayload),
-    })
+      SALES_TIMEOUT_MS,
+      'POST /inventory/sales',
+    )
 
     if (res.status >= 200 && res.status < 300) {
       await markSynced(db, includedReceiptIds, includedRefundIds)
       consecutiveFailures = 0
       logged404Once = false
+      loggedStallOnce = false
+
+      // Сервер мог принять пачку, но отклонить отдельные чеки (он изолирует
+      // каждый SAVEPOINT'ом). Такие чеки помечены synced выше вместе со всеми —
+      // это осознанно: повторная отправка даст ту же ошибку, а очередь встанет
+      // колом. Чек остаётся в ОФД и в локальной БД, теряется только серверная
+      // копия — поэтому log.error, чтобы админ увидел причину в телеметрии.
+      const failed = await readFailed(res)
+      if (failed.length > 0) {
+        void log.error(
+          'sales-sync',
+          `сервер отклонил ${failed.length} чек(ов), они помечены synced без серверной копии: ` +
+            failed.map((f) => `${f.fiscal_sign}: ${f.reason}`).join(' | '),
+        )
+      }
       return receipts.length === BATCH_SIZE
     }
 
@@ -753,18 +845,96 @@ async function runFlushCycle(): Promise<boolean> {
         )
       }
     } else {
-      void log.warn(
-        'sales-sync',
-        `HTTP ${res.status} при POST /api/v1/inventory/sales (подряд-ошибок ${consecutiveFailures})`,
-      )
+      reportStall(`HTTP ${res.status} при POST /api/v1/inventory/sales`)
     }
     return false
   } catch (e) {
     consecutiveFailures += 1
-    void log.warn(
-      'sales-sync',
-      `flush упал — ${e instanceof Error ? e.message : String(e)} (подряд-ошибок ${consecutiveFailures})`,
-    )
+    reportStall(`flush упал — ${e instanceof Error ? e.message : String(e)}`)
     return false
+  }
+}
+
+/**
+ * Ошибка синхронизации: пока она разовая — warn (сеть моргнула, идёт деплой).
+ * Но если очередь стоит STALL_THRESHOLD тиков подряд — это уже поломка, и
+ * её надо увидеть.
+ *
+ * Почему это важно: раньше здесь был только log.warn, а warn остаётся
+ * ЛОКАЛЬНО (в телеметрию уходит лишь level='error'). Из-за этого магазин
+ * Хонабод месяц не отправлял на сервер ни одного чека — очередь упёрлась в
+ * чек, который сервер не мог принять, клиент честно писал warn в свою
+ * SQLite, и снаружи это выглядело просто как «продаж нет».
+ */
+function reportStall(message: string): void {
+  if (consecutiveFailures >= STALL_THRESHOLD && !loggedStallOnce) {
+    loggedStallOnce = true
+    void log.error(
+      'sales-sync',
+      `очередь продаж не уезжает на сервер ${consecutiveFailures} попыток подряд — ${message}`,
+    )
+    return
+  }
+  void log.warn('sales-sync', `${message} (подряд-ошибок ${consecutiveFailures})`)
+}
+
+/**
+ * Проверка «а очередь вообще движется?».
+ *
+ * Все ошибки отправки — сетевые, поэтому обычно это warn: канал моргнул,
+ * идёт деплой, через минуту повторим. Из-за этого поломка синхронизации
+ * выглядит ровно как исправная работа, и заметить её можно только по
+ * отсутствию продаж на сервере — то есть недели спустя. Здесь мы смотрим на
+ * результат, а не на попытки: если самый старый неотправленный чек висит
+ * дольше суток, что-то сломано, независимо от причины.
+ *
+ * Считаем редко (раз в QUEUE_CHECK_EVERY тиков) — запрос по частичному
+ * индексу дешёвый, но и раз в минуту он не нужен.
+ */
+async function checkQueueHealth(db: Database): Promise<void> {
+  queueCheckCounter += 1
+  if (queueCheckCounter % QUEUE_CHECK_EVERY !== 1) return
+
+  try {
+    const rows = await db.select<Array<{ oldest: number | null; total: number }>>(
+      `SELECT MIN(fiscalized_at) AS oldest, COUNT(*) AS total
+         FROM fiscal_receipts WHERE synced_to_server = 0`,
+    )
+    const oldest = rows[0]?.oldest
+    const total = rows[0]?.total ?? 0
+    if (!oldest || total === 0) {
+      loggedBacklogOnce = false
+      return
+    }
+
+    const ageHours = (Date.now() / 1000 - oldest) / 3600
+    if (ageHours < BACKLOG_ALERT_HOURS) {
+      loggedBacklogOnce = false
+      return
+    }
+    if (loggedBacklogOnce) return
+
+    loggedBacklogOnce = true
+    void log.error(
+      'sales-sync',
+      `очередь продаж не уезжает: ${total} чек(ов) не отправлено, самый старый ждёт ${Math.round(ageHours)} ч. ` +
+        `Чеки целы (они в ОФД и в локальной базе), но на сервере их нет — проверьте связь с mytoolbox.`,
+    )
+  } catch {
+    // Диагностика не должна ронять сам флаш.
+  }
+}
+
+/** Разбор `failed[]` из ответа сервера. Тело может быть чем угодно — не роняем flush. */
+async function readFailed(res: Response): Promise<Array<{ fiscal_sign: string; reason: string }>> {
+  try {
+    const body = (await res.json()) as { failed?: unknown }
+    if (!Array.isArray(body?.failed)) return []
+    return body.failed.map((f) => ({
+      fiscal_sign: String((f as { fiscal_sign?: unknown })?.fiscal_sign ?? '?'),
+      reason: String((f as { reason?: unknown })?.reason ?? 'причина не указана'),
+    }))
+  } catch {
+    return []
   }
 }

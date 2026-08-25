@@ -33,12 +33,15 @@
  *   - Telegram-bot слушает INSERT'ы level='error' с маркером CRITICAL
  */
 
-import { fetch } from '@tauri-apps/plugin-http'
+import { fetchWithTimeout } from './http'
 import { getSetting, SettingKey } from '@/lib/db'
 import { listUnsentLogsForServer, markLogsSentToServer } from '@/lib/log'
 import { APP_VERSION } from '@/lib/app-version'
 
 /** Интервал между попытками flush'а — 30 сек. */
+/** Потолок ожидания сервера телеметрии. Логи не срочные — но и висеть вечно нельзя. */
+const TELEMETRY_TIMEOUT_MS = 20_000
+
 const FLUSH_INTERVAL_MS = 30_000
 /** Сколько строк за один POST. */
 const BATCH_SIZE = 50
@@ -120,19 +123,24 @@ export async function flushLogsToServer(): Promise<void> {
     // существующий `requireShopApiKey` middleware. URL получается длинным,
     // но не плодим дублирующий middleware на сервере.
     const url = serverUrl.replace(/\/$/, '') + '/api/v1/inventory/telemetry/logs'
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
+    const res = await fetchWithTimeout(
+      url,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({
+          shop_slug: shopSlug,
+          app_version: APP_VERSION,
+          logs: cleaned,
+        }),
       },
-      body: JSON.stringify({
-        shop_slug: shopSlug,
-        app_version: APP_VERSION,
-        logs: cleaned,
-      }),
-    })
+      TELEMETRY_TIMEOUT_MS,
+      'POST /telemetry/logs',
+    )
 
     if (res.status >= 200 && res.status < 300) {
       // Успех — помечаем все эти id как sent.

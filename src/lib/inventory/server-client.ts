@@ -9,7 +9,7 @@
  * broad allow по нашей домену, см. CLAUDE.md «не сужать allow-list»).
  */
 
-import { fetch } from '@tauri-apps/plugin-http'
+import { fetchWithTimeout } from '../http'
 import type {
   ConfirmRequest,
   ConfirmResponse,
@@ -24,6 +24,12 @@ import type {
   UnconsumeRequest,
   UnconsumeResponse,
 } from './types'
+
+/**
+ * Потолок ожидания ответа сервера. Резерв/подтверждение делаются, пока кассир
+ * стоит у чека, — ждать дольше нет смысла, лучше показать ошибку и повторить.
+ */
+const REQUEST_TIMEOUT_MS = 20_000
 
 export class InventoryServerError extends Error {
   constructor(
@@ -100,10 +106,9 @@ export class InventoryServerClient {
     if (init.body && !headers.has('Content-Type')) {
       headers.set('Content-Type', 'application/json')
     }
-    const res = await fetch(url, {
-      ...init,
-      headers,
-    })
+    // Таймаут обязателен: без него зависший запрос к серверу блокирует
+    // кассу на неопределённое время (fetch сам по себе не сдаётся никогда).
+    const res = await fetchWithTimeout(url, { ...init, headers }, REQUEST_TIMEOUT_MS, `${init.method ?? 'GET'} ${path}`)
     const text = await res.text()
     let body: unknown = text
     if (text) {
