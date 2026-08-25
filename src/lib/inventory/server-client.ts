@@ -31,6 +31,17 @@ import type {
  */
 const REQUEST_TIMEOUT_MS = 20_000
 
+/**
+ * Потолок для объёмных выгрузок (полный список приходов).
+ *
+ * Отдельный от `REQUEST_TIMEOUT_MS` намеренно: страница из 1000 позиций —
+ * это сотни килобайт, и на канале магазина она может идти дольше, чем
+ * короткий резерв. Оборвать её по «кассирскому» таймауту значит вернуть
+ * поломку со stale-кэшем: sync не доходит до конца, локальный справочник
+ * устаревает, и подбор начинает биться о несуществующие остатки.
+ */
+const BULK_TIMEOUT_MS = 60_000
+
 export class InventoryServerError extends Error {
   constructor(
     message: string,
@@ -71,7 +82,7 @@ export class InventoryServerClient {
    */
   private async request<T>(
     path: string,
-    init: RequestInit & { allowStatuses?: number[] } = {},
+    init: RequestInit & { allowStatuses?: number[]; timeoutMs?: number } = {},
   ): Promise<T> {
     const TRANSIENT = new Set([502, 503, 504])
     const MAX_ATTEMPTS = 3
@@ -95,7 +106,7 @@ export class InventoryServerClient {
 
   private async requestOnce<T>(
     path: string,
-    init: RequestInit & { allowStatuses?: number[] } = {},
+    init: RequestInit & { allowStatuses?: number[]; timeoutMs?: number } = {},
   ): Promise<T> {
     const url = path.startsWith('http')
       ? path
@@ -108,7 +119,12 @@ export class InventoryServerClient {
     }
     // Таймаут обязателен: без него зависший запрос к серверу блокирует
     // кассу на неопределённое время (fetch сам по себе не сдаётся никогда).
-    const res = await fetchWithTimeout(url, { ...init, headers }, REQUEST_TIMEOUT_MS, `${init.method ?? 'GET'} ${path}`)
+    const res = await fetchWithTimeout(
+      url,
+      { ...init, headers },
+      init.timeoutMs ?? REQUEST_TIMEOUT_MS,
+      `${init.method ?? 'GET'} ${path}`,
+    )
     const text = await res.text()
     let body: unknown = text
     if (text) {
@@ -214,6 +230,7 @@ export class InventoryServerClient {
     const qs = params.toString()
     return this.request<ItemsListResponse>(
       `/api/v1/inventory/items${qs ? '?' + qs : ''}`,
+      { timeoutMs: BULK_TIMEOUT_MS },
     )
   }
 
