@@ -364,6 +364,10 @@ export async function fiscalize(
     if (isShiftClosedError(errMsg, dataStr, eposExtra.code)) {
       throw new ShiftNotOpenError()
     }
+    // Фискальная карта не отозвалась — см. isCardNotConnectedError.
+    if (isCardNotConnectedError(errMsg, dataStr)) {
+      throw new CardNotConnectedError()
+    }
     throw eposErr
   }
 
@@ -457,6 +461,39 @@ export class ShiftNotOpenError extends Error {
       'Смена ККМ не открыта. Откройте смену в разделе «Смена» перед фискализацией.',
     )
     this.name = 'ShiftNotOpenError'
+  }
+}
+
+/**
+ * Communicator не смог достучаться до физической фискальной карты
+ * («cannot connect card», jsonRpcCode 65534).
+ *
+ * Ловим ПО ТЕКСТУ, а не по коду: 65534 — это 0xFFFE, дежурный «прочая
+ * ошибка» у Communicator, под ним приезжает что угодно. Совпадение по коду
+ * подменило бы понятным сообщением про карту любую постороннюю ошибку.
+ *
+ * Отказ перемежающийся: на Дон бозори за неделю 13 срывов, и каждый раз
+ * следующая же попытка проходила (12:25 не пробился — 12:28 пробился).
+ * Причина вне программы: USB-модуль теряет связь. Но кассиру про это
+ * ничего не сообщалось — он видел английский техтекст и не понимал, что
+ * достаточно нажать «Фискализировать» ещё раз.
+ */
+export function isCardNotConnectedError(message: string, data: string): boolean {
+  return /cannot\s+connect\s+card/i.test(`${message} ${data}`)
+}
+
+/**
+ * Фискальная карта не отвечает. Чек в ОФД НЕ ушёл — Communicator обрывается
+ * до отправки, — поэтому повтор безопасен и дублем не станет.
+ */
+export class CardNotConnectedError extends Error {
+  constructor() {
+    super(
+      'Фискальная карта не отвечает. Нажмите «Фискализировать» ещё раз — ' +
+        'чек в ОФД не ушёл, дубля не будет. Если повторяется несколько раз ' +
+        'подряд — проверьте USB-модуль ККМ и перезапустите EPOS Communicator.',
+    )
+    this.name = 'CardNotConnectedError'
   }
 }
 

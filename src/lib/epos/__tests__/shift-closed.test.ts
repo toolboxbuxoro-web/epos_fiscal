@@ -13,7 +13,7 @@
  *   - code=undefined + пустые message/data → false
  */
 import { describe, expect, it } from 'vitest'
-import { isShiftClosedError } from '@/lib/epos/fiscalize'
+import { isShiftClosedError, isCardNotConnectedError } from '@/lib/epos/fiscalize'
 
 describe('isShiftClosedError', () => {
   it('EPOS jsonRpcCode 36909 → true независимо от текста message/data', () => {
@@ -64,5 +64,30 @@ describe('isShiftClosedError', () => {
 
   it('code задан, но НЕ 36909, и текст не матчит → false', () => {
     expect(isShiftClosedError('терминал не подключён', '', 36912)).toBe(false)
+  })
+})
+
+describe('isCardNotConnectedError', () => {
+  it('ловит реальный ответ Communicator', () => {
+    expect(isCardNotConnectedError('cannot connect card', '')).toBe(true)
+  })
+
+  it('не зависит от регистра и лишних пробелов', () => {
+    expect(isCardNotConnectedError('Cannot  Connect  Card', '')).toBe(true)
+  })
+
+  it('находит текст в data, а не только в message', () => {
+    expect(isCardNotConnectedError('', '{"detail":"cannot connect card"}')).toBe(true)
+  })
+
+  it('НЕ срабатывает на посторонней ошибке с тем же кодом 65534', () => {
+    // 65534 = 0xFFFE, дежурный «прочая ошибка» Communicator: под ним
+    // приезжает что угодно, поэтому ловим только по тексту.
+    expect(isCardNotConnectedError('printer is offline', '')).toBe(false)
+    expect(isCardNotConnectedError('ZREPORT_IS_NOT_OPEN', '')).toBe(false)
+  })
+
+  it('не путается со смежной формулировкой про карту оплаты', () => {
+    expect(isCardNotConnectedError('card payment declined', '')).toBe(false)
   })
 })

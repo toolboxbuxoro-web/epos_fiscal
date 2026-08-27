@@ -38,6 +38,7 @@ import {
   InventoryConflictError,
   InventoryStaleError,
   ShiftNotOpenError,
+  CardNotConnectedError,
 } from '@/lib/epos'
 import { syncFromServer } from '@/lib/inventory'
 import {
@@ -684,6 +685,16 @@ export default function Receipt() {
       if (e instanceof ShiftNotOpenError) {
         setShiftNotOpen(true)
         toast.error(e.message, { duration: 6000 })
+        return
+      }
+      // Карта ККМ не отозвалась — НЕ failed: чек валиден, в ОФД ничего не
+      // ушло, и следующая попытка почти всегда проходит. Пометить его
+      // сбойным значило бы отправить кассира разбираться с исправным чеком.
+      if (e instanceof CardNotConnectedError) {
+        setError(e.message)
+        toast.error('Фискальная карта не отвечает — нажмите «Фискализировать» ещё раз', {
+          duration: 8000,
+        })
         return
       }
       setError(formatErrorForUser(e))
