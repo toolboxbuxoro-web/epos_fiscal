@@ -11,7 +11,7 @@ import Login from '@/routes/Login'
 import Zreport from '@/routes/Zreport'
 import { AppGate, RedirectIfAuthed } from '@/components/AppGate'
 import { useEffect } from 'react'
-import { autoApplyOnStartup } from '@/lib/updater'
+import { autoApplyOnStartup, ensureUpdateCheckStarted } from '@/lib/updater'
 import { log } from '@/lib/log'
 import {
   ensureInventoryRuntime,
@@ -29,6 +29,9 @@ export default function App() {
     // Авто-обновление: если есть новая версия — само скачивается
     // и перезапускает приложение в новой версии. Без диалогов.
     void autoApplyOnStartup()
+    // Касса не закрывает приложение сутками, поэтому одной проверки на старте
+    // мало: магазины неделями сидели на старой версии. Дальше следим фоном.
+    ensureUpdateCheckStarted()
 
     // Inventory runtime — если включён remote-режим, тянет конфиг от админа,
     // подписывается на SSE-обновления, гоняет periodic sync. Если выключен —

@@ -16,6 +16,7 @@ import { getSetting, SettingKey } from '@/lib/db'
 import { stopShiftRuntime } from '@/lib/moysklad'
 import { SystemStatusPanel } from './SystemStatusPanel'
 import { TestModeBanner, TestModeDot } from './TestModeBanner'
+import { UpdateBanner } from './UpdateBanner'
 import { DevMarker } from './DevMarker'
 import logoUrl from '@/assets/toolbox-fiscal.png'
 
@@ -146,6 +147,7 @@ export default function Layout() {
 
       {/* Outlet */}
       <main className="flex-1 overflow-auto bg-canvas">
+        <UpdateBanner />
         <TestModeBanner />
         <div className="mx-auto max-w-6xl px-6 py-6">
           <Outlet />
