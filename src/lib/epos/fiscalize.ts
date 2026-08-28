@@ -49,6 +49,7 @@ import {
   formatGoTime,
   type JsonRpcExtraInfo,
   type JsonRpcReceipt,
+  type JsonRpcFiscalAnswer,
 } from './jsonrpc-client'
 import {
   FiscalDriveClient,
@@ -269,21 +270,7 @@ export async function fiscalize(
   // и попытка стучаться на :3448 даёт ненужный warning в логах.
   let communicatorVersion: string | null = null
   if (fiscalBackend !== 'fiscaldrive') {
-    try {
-      const probe = new JsonRpcEposClient({ url: eposUrl })
-      const status = await probe.status()
-      communicatorVersion = JSON.stringify(status).slice(0, 200)
-      await log.info('fiscalize', `Communicator status: ${communicatorVersion}`, {
-        eposUrl,
-      })
-    } catch (verErr) {
-      const msg = verErr instanceof Error ? verErr.message : String(verErr)
-      await log.warn(
-        'fiscalize',
-        `Не удалось получить статус Communicator (продолжаем sale): ${msg}`,
-        { eposUrl },
-      )
-    }
+    communicatorVersion = await getCommunicatorVersionCached(eposUrl)
   }
 
   // 4. Фискализация — выбираем бэкенд по настройке FiscalBackend:
@@ -461,6 +448,48 @@ export class ShiftNotOpenError extends Error {
       'Смена ККМ не открыта. Откройте смену в разделе «Смена» перед фискализацией.',
     )
     this.name = 'ShiftNotOpenError'
+  }
+}
+
+/**
+ * Версия Communicator для диагностики — ОДИН раз за запуск приложения.
+ *
+ * Api.Status возвращает в том числе TerminalID и TotalFilesSent, то есть
+ * читает данные с физического фискального модуля. Раньше мы звали его
+ * перед КАЖДОЙ продажей — и трогали карту дважды на чек: сначала зондом
+ * ради строчки в логе, потом собственно продажей.
+ *
+ * Зонд остался с 0.10.9, когда мы отлаживали legacy-протокол; его польза
+ * давно исчерпана, а на кассе с капризным USB-модулем он вдвое расширял
+ * окно, в котором карта может не отозваться («cannot connect card»).
+ * Держим кеш на весь запуск: диагностика сохраняется, карту перед
+ * продажей больше не дёргаем.
+ */
+let cachedCommunicatorVersion: string | null = null
+
+export function resetCommunicatorVersionCache(): void {
+  cachedCommunicatorVersion = null
+}
+
+async function getCommunicatorVersionCached(eposUrl: string): Promise<string | null> {
+  if (cachedCommunicatorVersion !== null) return cachedCommunicatorVersion
+  try {
+    const probe = new JsonRpcEposClient({ url: eposUrl })
+    const status = await probe.status()
+    cachedCommunicatorVersion = JSON.stringify(status).slice(0, 200)
+    await log.info('fiscalize', `Communicator status: ${cachedCommunicatorVersion}`, {
+      eposUrl,
+    })
+    return cachedCommunicatorVersion
+  } catch (verErr) {
+    const msg = verErr instanceof Error ? verErr.message : String(verErr)
+    await log.warn(
+      'fiscalize',
+      `Не удалось получить статус Communicator (продолжаем sale): ${msg}`,
+      { eposUrl },
+    )
+    // Не кешируем неудачу — на следующем чеке попробуем снова.
+    return null
   }
 }
 
@@ -1216,7 +1245,7 @@ async function fiscalizeJsonRpc(
 
   let answer
   try {
-    answer = await client.sendSaleReceipt(receipt)
+    answer = await sendSaleWithCardRetry(client, receipt, url)
   } catch (e) {
     // При ошибке тоже дампим всё — request + текст ошибки + любой data из JSON-RPC.
     const eposError = e as { code?: number; data?: unknown; message?: string }
@@ -1248,6 +1277,57 @@ async function fiscalizeJsonRpc(
     QRCodeURL: answer.QRCodeURL,
   }
   return { fiscal, requestJson }
+}
+
+/** Пауза перед повтором: карте нужно время отпустить занятый канал. */
+const CARD_RETRY_DELAY_MS = 1_500
+
+/**
+ * Отправка продажи с ОДНИМ автоповтором при «cannot connect card».
+ *
+ * Повторяем ТОЛЬКО эту ошибку и ТОЛЬКО один раз. Обоснование безопасности:
+ * фискальную подпись ставит сама карта, поэтому «не смог подключиться к
+ * карте» означает, что подписывать было нечем и в ОФД не ушло ничего —
+ * дубля повтор не создаст. Косвенно это подтверждает и практика: кассиры
+ * Дон бозори неделю жали повтор руками по 2–4 раза, и за 300 чеков номера
+ * идут подряд, без единого дубля.
+ *
+ * Любая другая ошибка пробрасывается сразу: вслепую повторять фискализацию
+ * нельзя — там, где ответ потерялся уже ПОСЛЕ отправки в ОФД, повтор дал бы
+ * второй чек на ту же покупку.
+ *
+ * Повтор идёт ДО releaseRemote в вызывающем catch — резерв на складе всё
+ * это время держится, поэтому второй попытке не с кем гоняться за остатком.
+ */
+export async function sendSaleWithCardRetry(
+  client: JsonRpcEposClient,
+  receipt: JsonRpcReceipt,
+  url: string,
+): Promise<JsonRpcFiscalAnswer> {
+  try {
+    return await client.sendSaleReceipt(receipt)
+  } catch (e) {
+    const err = e as { code?: number; data?: unknown; message?: string }
+    const dataStr = typeof err.data === 'string' ? err.data : JSON.stringify(err.data ?? '')
+    if (!isCardNotConnectedError(err.message ?? String(e), dataStr)) throw e
+
+    await log.warn(
+      'fiscalize',
+      'Карта не отозвалась — повторяю отправку один раз через 1.5 сек',
+      { url },
+    )
+    await new Promise((resolve) => setTimeout(resolve, CARD_RETRY_DELAY_MS))
+
+    const answer = await client.sendSaleReceipt(receipt)
+    // Явный след в телеметрии: сколько чеков спас автоповтор и не растёт ли
+    // частота — рост означает, что USB-модуль на кассе пора менять.
+    await log.error(
+      'fiscalize',
+      'Карта не отозвалась с первого раза, но автоповтор прошёл — проверьте USB-модуль ККМ',
+      { url, fiscalSign: answer.FiscalSign },
+    )
+    return answer
+  }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
