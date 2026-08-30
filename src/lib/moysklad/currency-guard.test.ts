@@ -18,7 +18,11 @@ const UZS_ID = 'f1a5d963-4c70-11ed-0a80-0784001a9248'
 const USD_ID = '77d87aa9-5b74-11ed-0a80-042b00119142'
 
 const refTo = (id: string) => ({
-  meta: { href: `https://api.moysklad.ru/api/remap/1.2/entity/currency/${id}` },
+  meta: {
+    href: `https://api.moysklad.ru/api/remap/1.2/entity/currency/${id}`,
+    type: 'currency',
+    mediaType: 'application/json',
+  },
 })
 
 const book = (base: string | null) => ({

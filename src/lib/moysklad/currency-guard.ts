@@ -33,7 +33,7 @@ export function currencyIdFromRef(ref?: { meta?: { href?: string } }): string | 
   const href = ref?.meta?.href
   if (!href) return null
   const m = /currency\/([0-9a-f-]{36})/i.exec(href)
-  return m ? m[1] : null
+  return m?.[1] ?? null
 }
 
 /** Справочник валют аккаунта. Валют единицы, меняются почти никогда — держим час. */

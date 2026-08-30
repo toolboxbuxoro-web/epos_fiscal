@@ -4,6 +4,7 @@ import {
   upsertMsReceipt,
   SettingKey,
   now,
+  type MsReceiptStatus,
 } from '@/lib/db'
 import { log } from '@/lib/log'
 import { MoyskladClient, MoyskladError } from './client'
@@ -175,7 +176,7 @@ export class MoyskladPoller {
     // ОФД физически не примет товар на 0 сум. Сразу помечаем такой
     // чек как not_required чтобы он не висел в списке pending и не
     // тревожил кассира «нужно фискализировать».
-    let status = rd.sum <= 0 ? 'not_required' as const : undefined
+    let status: MsReceiptStatus | undefined = rd.sum <= 0 ? 'not_required' : undefined
 
     // Валюта. Пока учёт в сумах, проверка молчит и ничего не меняет.
     // Если базовая валюта аккаунта сменится, суммы начнут приходить в других

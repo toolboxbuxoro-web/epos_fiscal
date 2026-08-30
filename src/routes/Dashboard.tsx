@@ -74,6 +74,7 @@ const STATUS_TO_BADGE: Record<
   manual: { label: 'Ручной', status: 'warning' },
   skipped: { label: 'Пропущен', status: 'neutral' },
   not_required: { label: 'Не фискальный', status: 'neutral' },
+  currency_mismatch: { label: 'Чужая валюта', status: 'warning' },
 }
 
 type Scope = 'shift' | 'all'
@@ -137,6 +138,7 @@ export default function Dashboard() {
     manual: 0,
     skipped: 0,
     not_required: 0,
+    currency_mismatch: 0,
   })
   const [pollerStatus, setPollerStatus] = useState<PollerStatus | null>(null)
   const [loading, setLoading] = useState(true)
@@ -235,6 +237,7 @@ export default function Dashboard() {
       manual: 0,
       skipped: 0,
       not_required: 0,
+      currency_mismatch: 0,
     }
     for (const r of shiftItems) c[r.status]++
     return c

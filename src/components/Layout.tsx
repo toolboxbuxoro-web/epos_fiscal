@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet } from 'react-router-dom'
 import {
+  Calculator,
   ClipboardList,
   FileText,
   History as HistoryIcon,
@@ -44,6 +45,7 @@ interface NavItem {
 
 const NAV_LINKS: NavItem[] = [
   { to: '/', label: 'Касса', icon: ReceiptIcon, end: true },
+  { to: '/free-receipt', label: 'Чек по сумме', icon: Calculator },
   { to: '/zreport', label: 'Смена', icon: ClipboardList },
   { to: '/history', label: 'Чеки', icon: HistoryIcon },
   { to: '/catalog', label: 'Справочник', icon: Package },

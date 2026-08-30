@@ -2,6 +2,7 @@ import { Routes, Route } from 'react-router-dom'
 import Layout from '@/components/Layout'
 import Dashboard from '@/routes/Dashboard'
 import Receipt from '@/routes/Receipt'
+import FreeReceipt from '@/routes/FreeReceipt'
 import Refund from '@/routes/Refund'
 import Catalog from '@/routes/Catalog'
 import History from '@/routes/History'
@@ -86,6 +87,7 @@ export default function App() {
         >
           <Route path="/" element={<Dashboard />} />
           <Route path="/receipts/:id" element={<Receipt />} />
+          <Route path="/free-receipt" element={<FreeReceipt />} />
           <Route path="/refund/:id" element={<Refund />} />
           <Route path="/zreport" element={<Zreport />} />
           <Route path="/history" element={<History />} />
