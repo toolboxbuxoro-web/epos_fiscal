@@ -8,6 +8,7 @@ import {
 import { log } from '@/lib/log'
 import { MoyskladClient, MoyskladError } from './client'
 import { parseMsMoment, type MsRetailDemand } from './types'
+import { loadCurrencies, verifyReceiptCurrency } from './currency-guard'
 
 /** Сколько часов истории тянуть при первом запуске. */
 const INITIAL_LOOKBACK_HOURS = 6
@@ -126,7 +127,7 @@ export class MoyskladPoller {
       )
 
       for (const item of items) {
-        await this.persist(item)
+        await this.persist(item, client)
       }
 
       // Курсор сдвигаем на момент самой свежей записи (плюс 1 секунда),
@@ -169,12 +170,32 @@ export class MoyskladPoller {
     }
   }
 
-  private async persist(rd: MsRetailDemand): Promise<void> {
+  private async persist(rd: MsRetailDemand, client: MoyskladClient): Promise<void> {
     // Чек на 0 сум (вся покупка за бонусные баллы / 100% скидка) —
     // ОФД физически не примет товар на 0 сум. Сразу помечаем такой
     // чек как not_required чтобы он не висел в списке pending и не
     // тревожил кассира «нужно фискализировать».
-    const status = rd.sum <= 0 ? 'not_required' as const : undefined
+    let status = rd.sum <= 0 ? 'not_required' as const : undefined
+
+    // Валюта. Пока учёт в сумах, проверка молчит и ничего не меняет.
+    // Если базовая валюта аккаунта сменится, суммы начнут приходить в других
+    // минорных единицах — и тогда чек лучше не фискализировать вовсе, чем
+    // отправить в ОФД сумму, заниженную в тысячи раз.
+    if (status === undefined) {
+      try {
+        const currencies = await loadCurrencies(client)
+        const verdict = verifyReceiptCurrency(rd, currencies)
+        if (!verdict.ok) {
+          status = 'currency_mismatch' as const
+          console.error(`[poller] чек ${rd.name ?? rd.id} не фискализируется: ${verdict.reason}`)
+        }
+      } catch (err) {
+        // Справочник недоступен — НЕ блокируем. Касса не должна вставать
+        // из-за недоступности справочника: это остановило бы торговлю ради
+        // защиты от события, которое ещё не наступило.
+        console.warn('[poller] валюту проверить не удалось:', err)
+      }
+    }
     await upsertMsReceipt({
       ms_id: rd.id,
       ms_name: rd.name ?? null,

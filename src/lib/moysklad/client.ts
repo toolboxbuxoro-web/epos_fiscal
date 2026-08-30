@@ -178,6 +178,21 @@ export class MoyskladClient {
   }
 
   /** Получить активные торговые точки. */
+  /**
+   * Справочник валют аккаунта.
+   *
+   * Нужен, чтобы понять, В ЧЁМ выражена сумма чека. МойСклад отдаёт валюту
+   * документа ссылкой, а сама сумма приходит в минорных единицах БАЗОВОЙ
+   * валюты аккаунта. Пока база — сум, это тийины, и всё сходится. Если база
+   * станет долларом, те же поля начнут означать центы, и чек на 500 000 сум
+   * уедет в ОФД как ~4000 тийинов. Проверка валюты — единственный способ
+   * заметить это до отправки, а не после.
+   */
+  async listCurrencies(): Promise<MsCurrency[]> {
+    const res = await this.request<MsListResponse<MsCurrency>>('/entity/currency?limit=100')
+    return res.rows
+  }
+
   async listRetailStores(): Promise<MsRetailStore[]> {
     const res = await this.request<MsListResponse<MsRetailStore>>(
       '/entity/retailstore?limit=100',

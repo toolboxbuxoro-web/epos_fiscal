@@ -318,3 +318,16 @@ export function formatMsMoment(epochSec: number): string {
   const SS = String(d.getUTCSeconds()).padStart(2, '0')
   return `${yyyy}-${mm}-${dd} ${HH}:${MM}:${SS}.000`
 }
+
+
+/** Валюта аккаунта. `isDefault` помечает базовую — ту, в минорных единицах
+ *  которой МойСклад отдаёт суммы документов. */
+export interface MsCurrency {
+  id: string
+  name: string
+  isoCode?: string
+  /** Признак базовой валюты аккаунта. В API поле называется `default`. */
+  default?: boolean
+  rate?: number
+  archived?: boolean
+}
