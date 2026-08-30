@@ -91,3 +91,20 @@ describe('isCardNotConnectedError', () => {
     expect(isCardNotConnectedError('card payment declined', '')).toBe(false)
   })
 })
+
+describe('смена закрыта: ответ FiscalDriveService', () => {
+  it('ловит реальный ответ FDS «9023 - ZREPORT_IS_ALREADY_CLOSED»', () => {
+    // Ровно тот текст, что пришёл на кассе Хазрати Имом. Собственный регексп
+    // пути FDS его не ловил — ждал «not ... open», а пришло «is already closed».
+    const msg =
+      'FiscalDriveService HTTP 500: {"Reason":"9023 - ZREPORT_IS_ALREADY_CLOSED",' +
+      '"Type":"*applet0400.SWError"}'
+    expect(isShiftClosedError(msg, '')).toBe(true)
+  })
+
+  it('прочая ошибка FDS смену не приплетает', () => {
+    expect(
+      isShiftClosedError('FiscalDriveService HTTP 500: {"Reason":"9010 - CARD_ERROR"}', ''),
+    ).toBe(false)
+  })
+})

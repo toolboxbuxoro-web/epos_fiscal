@@ -12,6 +12,15 @@ import { parseMsMoment, type MsRetailDemand } from './types'
 import { loadCurrencies, verifyReceiptCurrency } from './currency-guard'
 
 /** Сколько часов истории тянуть при первом запуске. */
+/**
+ * Сколько опросов подряд должны провалиться, чтобы поднять тревогу.
+ *
+ * При интервале опроса в 30 секунд это около пяти минут непрерывного
+ * молчания МойСклад — столько чеки на кассу уже не приходят, и это стоит
+ * увидеть.
+ */
+const POLLER_ERROR_THRESHOLD = 10
+
 const INITIAL_LOOKBACK_HOURS = 6
 
 /** Ключ настройки, где храним курсор поллинга. */
@@ -160,7 +169,18 @@ export class MoyskladPoller {
             ? err.message
             : String(err)
       this.consecutiveErrors += 1
-      const logFn = this.consecutiveErrors === 1 ? log.error : log.warn
+      // Уровень зависит от ДЛИТЕЛЬНОСТИ сбоя, а не от его первого появления.
+      //
+      // Раньше было наоборот: error на первой же ошибке, дальше warn. МойСклад
+      // регулярно отвечает 502, и каждый одиночный сбой уезжал в телеметрию
+      // как ошибка — за неделю 37 записей, среди которых тонули настоящие
+      // поломки. Затяжной отказ при этом, наоборот, оставался в warn и снаружи
+      // виден не был: warn хранится только локально.
+      //
+      // Теперь одиночные сбои тихие, а непрерывная серия один раз поднимается
+      // до error — именно она означает, что касса перестала получать чеки.
+      const logFn =
+        this.consecutiveErrors === POLLER_ERROR_THRESHOLD ? log.error : log.warn
       await logFn('poller', 'Ошибка опроса МойСклад', {
         error: this.status.lastError,
         status: err instanceof MoyskladError ? err.status : undefined,

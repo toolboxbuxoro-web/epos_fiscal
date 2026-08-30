@@ -12,9 +12,19 @@ export interface UpdateInfo {
  * Проверить наличие обновления (без скачивания).
  * Возвращает Update объект если доступно, иначе null.
  */
+/**
+ * Сколько проверок подряд сорвалось. Сбрасывается при первой удачной.
+ *
+ * Порог намеренно маленький: проверка идёт раз в два часа, поэтому три
+ * неудачи подряд — это уже около полусуток без связи с GitHub.
+ */
+const UPDATE_FAIL_THRESHOLD = 3
+let updateCheckFailures = 0
+
 export async function checkForUpdate(): Promise<Update | null> {
   try {
     const update = await check()
+    updateCheckFailures = 0
     if (update) {
       await log.info(
         'updater',
@@ -30,9 +40,29 @@ export async function checkForUpdate(): Promise<Update | null> {
     }
     return update
   } catch (e) {
-    await log.error('updater', 'Ошибка проверки обновлений', {
-      error: e instanceof Error ? e.message : String(e),
-    })
+    // Уровень зависит от того, сорвалась проверка разово или не проходит
+    // давно.
+    //
+    // Раньше здесь всегда был error, и каждая неудачная попытка достучаться
+    // до GitHub уезжала в телеметрию: за неделю 35 записей, все с одним и тем
+    // же «error sending request». Канал магазина моргает, это норма — но за
+    // таким шумом не видно настоящих поломок. А после перехода на проверку
+    // раз в два часа записей стало только больше.
+    //
+    // Одиночные срывы теперь тихие. Если же обновления не проверяются подряд
+    // (см. порог) — это уже не сеть моргнула, а магазин перестал получать
+    // новые версии, и об этом нужно знать: именно так три кассы неделю сидели
+    // на 0.11.25, пока фиксы лежали в релизах.
+    updateCheckFailures += 1
+    const persistent = updateCheckFailures === UPDATE_FAIL_THRESHOLD
+    await (persistent ? log.error : log.warn)(
+      'updater',
+      persistent
+        ? `Обновления не проверяются ${updateCheckFailures} попыток подряд — ` +
+            'магазин не получает новые версии'
+        : 'Не удалось проверить обновления (попробуем позже)',
+      { error: e instanceof Error ? e.message : String(e), consecutive: updateCheckFailures },
+    )
     throw e
   }
 }

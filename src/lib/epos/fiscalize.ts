@@ -1152,9 +1152,15 @@ async function fiscalizeFiscalDrive(
       factoryId,
       txid,
     })
-    // Специфичный детект «смена не открыта» для FDS — ошибка содержит
-    // слово ZREPORT или shift или аналог. Пробрасываем ShiftNotOpenError.
-    if (/zreport.*not.*open|open.*zreport|shift.*not|смена/i.test(msg)) {
+    // Смена не открыта — через ОБЩУЮ проверку, а не через собственное
+    // выражение.
+    //
+    // Здесь стоял свой регексп `/zreport.*not.*open|shift.*not|смена/`, и он
+    // не ловил реальный ответ FDS «9023 - ZREPORT_IS_ALREADY_CLOSED»: после
+    // ZREPORT он ждал «not ... open», а пришло «is already closed». Кассир
+    // Хазрати Имом вместо понятного «откройте смену» получал простыню с
+    // Go-стеком. `isShiftClosedError` знает обе формулировки — и EPOS, и FDS.
+    if (isShiftClosedError(msg, '')) {
       throw new ShiftNotOpenError()
     }
     throw e
