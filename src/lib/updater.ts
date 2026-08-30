@@ -21,9 +21,40 @@ export interface UpdateInfo {
 const UPDATE_FAIL_THRESHOLD = 3
 let updateCheckFailures = 0
 
+/**
+ * Повторы внутри ОДНОЙ проверки.
+ *
+ * До GitHub с магазинного канала запрос доходит не всегда: в логах за два
+ * месяца 56 срывов «error sending request», причём у Хонабода 27. На версиях
+ * без фоновой проверки обновление ищется только при запуске — и одна такая
+ * осечка означала, что за всю сессию магазин не увидит новую версию. Так три
+ * кассы и просидели неделю на 0.11.25, пока фиксы лежали в релизах.
+ *
+ * Пара повторов с паузой превращает моргнувший канал в обычную успешную
+ * проверку.
+ */
+const CHECK_ATTEMPTS = 3
+const CHECK_BACKOFF_MS = [2_000, 6_000]
+
+/** Дотянуться до latest.json, пережив моргание канала. */
+async function checkWithRetry(): Promise<Update | null> {
+  let lastErr: unknown
+  for (let attempt = 0; attempt < CHECK_ATTEMPTS; attempt++) {
+    try {
+      return await check()
+    } catch (e) {
+      lastErr = e
+      const pause = CHECK_BACKOFF_MS[attempt]
+      if (pause === undefined) break
+      await new Promise((r) => setTimeout(r, pause))
+    }
+  }
+  throw lastErr
+}
+
 export async function checkForUpdate(): Promise<Update | null> {
   try {
-    const update = await check()
+    const update = await checkWithRetry()
     updateCheckFailures = 0
     if (update) {
       await log.info(
@@ -122,7 +153,17 @@ export const backgroundCheckOnStartup = autoApplyOnStartup
  */
 const UPDATE_CHECK_INTERVAL_MS = 2 * 60 * 60 * 1000
 
-let updateTimer: ReturnType<typeof setInterval> | null = null
+/**
+ * Пауза после неудачной проверки.
+ *
+ * Ждать полных два часа из-за одного моргнувшего канала — значит оставить
+ * магазин без обновления на полдня. После успеха возвращаемся к обычному
+ * интервалу.
+ */
+const UPDATE_RETRY_INTERVAL_MS = 10 * 60 * 1000
+
+let updateTimer: ReturnType<typeof setTimeout> | null = null
+let started = false
 let pending: UpdateInfo | null = null
 const updateListeners = new Set<(u: UpdateInfo | null) => void>()
 
@@ -137,15 +178,27 @@ export function subscribePendingUpdate(fn: (u: UpdateInfo | null) => void): () =
   return () => updateListeners.delete(fn)
 }
 
-async function checkTick(): Promise<void> {
+/** Одна проверка. Возвращает `false`, если достучаться не удалось. */
+async function checkTick(): Promise<boolean> {
   try {
     const update = await checkForUpdate()
-    if (!update) return
-    pending = { version: update.version, notes: update.body, date: update.date }
-    for (const fn of updateListeners) fn(pending)
+    if (update) {
+      pending = { version: update.version, notes: update.body, date: update.date }
+      for (const fn of updateListeners) fn(pending)
+    }
+    return true
   } catch {
-    // уже залогировано в checkForUpdate; сеть могла моргнуть — попробуем позже
+    // Уже залогировано в checkForUpdate с нужным уровнем.
+    return false
   }
+}
+
+/** Запланировать следующую проверку: раньше — если предыдущая не прошла. */
+function scheduleNext(ok: boolean): void {
+  if (!started) return
+  updateTimer = setTimeout(() => {
+    void checkTick().then(scheduleNext)
+  }, ok ? UPDATE_CHECK_INTERVAL_MS : UPDATE_RETRY_INTERVAL_MS)
 }
 
 /**
@@ -158,13 +211,14 @@ async function checkTick(): Promise<void> {
  * остальное.
  */
 export function ensureUpdateCheckStarted(): void {
-  if (updateTimer) return
-  void checkTick()
-  updateTimer = setInterval(() => void checkTick(), UPDATE_CHECK_INTERVAL_MS)
+  if (started) return
+  started = true
+  void checkTick().then(scheduleNext)
 }
 
 export function stopUpdateCheck(): void {
-  if (updateTimer) clearInterval(updateTimer)
+  started = false
+  if (updateTimer) clearTimeout(updateTimer)
   updateTimer = null
   pending = null
 }
