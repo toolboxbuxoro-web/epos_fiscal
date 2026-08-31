@@ -42,6 +42,15 @@ export const DEFAULT_MAX_DISCOUNT_PER_ITEM_SUM = 2000
  */
 export const DEFAULT_VAT_PERCENT = 12
 
+/**
+ * Потолок штук одного товара в строке чека.
+ *
+ * Без него подбор выедал дешёвые приходы лавиной: доходило до 560 штук
+ * анкера в одном чеке, и склад за месяц остался без недорогих позиций,
+ * которыми набираются мелкие суммы.
+ */
+export const DEFAULT_MAX_QTY_PER_LINE = 20
+
 /** Имя характеристики МС для связки модификации с приходом. */
 export const DEFAULT_LINK_CHARACTERISTIC = 'Бухгалтерское наименование'
 
@@ -72,6 +81,11 @@ export async function loadMatcherOptionsFromSettings(): Promise<MatcherOptions> 
   const linkCharacteristicName =
     linkCharRaw && linkCharRaw.trim() ? linkCharRaw.trim() : DEFAULT_LINK_CHARACTERISTIC
 
+  // Ноль или мусор в настройке означал бы «ни одной штуки в строке» и
+  // остановил бы подбор целиком — трактуем как «без ограничения».
+  const rawQty = await intSetting(SettingKey.MaxQtyPerLine, DEFAULT_MAX_QTY_PER_LINE)
+  const maxQtyPerLine = rawQty > 0 ? rawQty : Number.POSITIVE_INFINITY
+
   const modeRaw = await getSetting(SettingKey.MatcherMode)
   const matcherMode =
     modeRaw === 'classic' || modeRaw === 'holistic' || modeRaw === 'off' ? modeRaw : 'auto'
@@ -85,5 +99,6 @@ export async function loadMatcherOptionsFromSettings(): Promise<MatcherOptions> 
     linkCharacteristicName,
     defaultVatPercent,
     matcherMode,
+    maxQtyPerLine,
   }
 }

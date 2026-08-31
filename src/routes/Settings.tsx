@@ -67,6 +67,7 @@ interface FormState {
   // Скидка для точной суммы (распределяется чтобы Jami = чек МС)
   discountForExactSum: 'true' | 'false'
   maxDiscountPerItemSum: string
+  maxQtyPerLine: string
   // Тестовый режим — фискализация без реальной отправки в Communicator
   testMode: 'true' | 'false'
   // Фискальный бэкенд
@@ -107,6 +108,7 @@ const empty: FormState = {
   defaultVatPercent: '12',
   discountForExactSum: 'true',
   maxDiscountPerItemSum: '2000',
+  maxQtyPerLine: '20',
   testMode: 'false',
   fiscalBackend: 'epos',
   fiscalDriveBaseUrl: 'http://localhost:3449',
@@ -221,6 +223,7 @@ export default function Settings() {
       discountForExactSum: (all[SettingKey.DiscountForExactSum] ?? 'true') as
         | 'true'
         | 'false',
+      maxQtyPerLine: all[SettingKey.MaxQtyPerLine] ?? '20',
       maxDiscountPerItemSum:
         all[SettingKey.MaxDiscountPerItemSum] ?? '2000',
       testMode: (all[SettingKey.TestMode] ?? 'false') as 'true' | 'false',
@@ -383,6 +386,7 @@ export default function Settings() {
         [SettingKey.DefaultVatPercent]: form.defaultVatPercent,
         [SettingKey.DiscountForExactSum]: form.discountForExactSum,
         [SettingKey.MaxDiscountPerItemSum]: form.maxDiscountPerItemSum,
+        [SettingKey.MaxQtyPerLine]: form.maxQtyPerLine,
         [SettingKey.TestMode]: form.testMode,
         [SettingKey.FiscalBackend]: form.fiscalBackend,
         [SettingKey.FiscalDriveBaseUrl]: form.fiscalDriveBaseUrl.replace(/\/$/, ''),
@@ -1079,6 +1083,23 @@ export default function Settings() {
             оригинальной. Если включить — программа применит скидку на
             позиции чтобы итог совпал 1-в-1. Скидка не опускает цену
             ниже себестоимости с НДС (приход × 1.12).
+          </div>
+        </Field>
+
+        <Field label="Максимум штук одного товара в строке">
+          <Input
+            type="number"
+            min={0}
+            value={form.maxQtyPerLine}
+            onChange={(e) => setField('maxQtyPerLine', e.target.value)}
+          />
+          <div className="mt-1 text-xs text-ink-muted">
+            Сколько максимум штук одного товара подбор кладёт в одну строку.
+            По умолчанию <strong>20</strong>. Без ограничения дешёвые приходы
+            выедаются лавиной — доходило до 560 штук в чеке, и склад оставался
+            без недорогих позиций, которыми набираются мелкие суммы.
+            Ограничение мягкое: если чек иначе не собрать, подбор возьмёт
+            больше и предупредит. <strong>0</strong> — без ограничения.
           </div>
         </Field>
 

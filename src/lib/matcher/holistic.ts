@@ -116,10 +116,46 @@ export function findBelowFloorLine(
  * Чистая функция: не мутирует pool, не пишет в БД, не вызывает сеть.
  * Логирование — только log.info/warn для трассировки.
  */
+/**
+ * Потолок штук одного товара в строке по умолчанию.
+ *
+ * Взят по реальным данным: строки крупнее задевают около 12% чеков, а сотни
+ * штук в одной строке выглядят неправдоподобно и для проверяющего, и для
+ * склада.
+ */
+const DEFAULT_MAX_QTY_PER_LINE = 20
+
+/**
+ * Целостный подбор на сумму чека.
+ *
+ * Сначала пробуем с ограничением на количество штук в строке, а если план не
+ * сошёлся — повторяем без него. Ограничение здесь именно ПРЕДПОЧТЕНИЕ:
+ * неправдоподобный чек хуже красивого, но непробитый чек хуже обоих. Кассир не
+ * должен упереться в отказ из-за нашей заботы о правдоподобии.
+ */
 export function planHolistic(
   target: Tiyin,
   pool: MatcherPool,
   opts: MatcherOptions = {},
+): HolisticOutcome {
+  const cap = opts.maxQtyPerLine ?? DEFAULT_MAX_QTY_PER_LINE
+  const capped = planHolisticWithCap(target, pool, opts, cap)
+  if (capped.ok || !Number.isFinite(cap)) return capped
+
+  const relaxed = planHolisticWithCap(target, pool, opts, Number.POSITIVE_INFINITY)
+  if (!relaxed.ok) return capped // причина отказа понятнее из основной попытки
+  relaxed.plan.notes.push(
+    `Ограничение ${cap} шт на строку снято — иначе чек на эту сумму не собирался. ` +
+      `Проверьте склад: не хватает недорогих позиций для точного набора.`,
+  )
+  return relaxed
+}
+
+function planHolisticWithCap(
+  target: Tiyin,
+  pool: MatcherPool,
+  opts: MatcherOptions,
+  maxQtyPerLine: number,
 ): HolisticOutcome {
   if (target <= 0) {
     return { ok: false, reason: 'TARGET_TOO_SMALL', detail: 'target ≤ 0' }
@@ -144,7 +180,13 @@ export function planHolistic(
     .filter((p) => p.sellingPrice > 0 && Math.floor(p.item.available / 1000) >= 1)
     .map((p) => ({
       poolItem: p,
-      remainingAvailable: Math.floor(p.item.available / 1000), // в штуках
+      // Потолок применяем ЗДЕСЬ — и жадная фаза, и точная сборка, и добор
+      // берут количество из одного этого поля, поэтому одного ограничения
+      // хватает на все три.
+      remainingAvailable: Math.min(
+        Math.floor(p.item.available / 1000),
+        maxQtyPerLine,
+      ), // в штуках
       pickedQty: 0,
     }))
 
