@@ -1,10 +1,15 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Banknote, CreditCard, ListPlus, Send, Wand2 } from 'lucide-react'
+import { Banknote, CreditCard, ListPlus, Send, Split, Wand2 } from 'lucide-react'
 import { loadMatcherPool, planHolistic } from '@/lib/matcher'
 import { loadMatcherOptionsFromSettings } from '@/lib/matcher/options-from-settings'
 import type { HolisticPlan, MatcherOptions } from '@/lib/matcher/types'
-import { buildFreeMatchResult, buildSyntheticMsReceipt } from '@/lib/free-receipt'
+import {
+  buildFreeMatchResult,
+  buildSyntheticMsReceipt,
+  resolvePayment,
+  type FreePayKind,
+} from '@/lib/free-receipt'
 import { syncFromServer } from '@/lib/inventory'
 import {
   fiscalize,
@@ -20,8 +25,6 @@ import { Badge, Button, Card, PageHeader, toast } from '@/components/ui'
 import { Input } from '@/components/ui/Input'
 import { cn } from '@/lib/cn'
 import { ManualReceiptModal } from './Receipt/ManualReceiptModal'
-
-type PayKind = 'cash' | 'card'
 
 /**
  * Чек по сумме — фискализация без документа в МойСклад.
@@ -39,7 +42,9 @@ export default function FreeReceipt() {
   const navigate = useNavigate()
 
   const [sumInput, setSumInput] = useState('')
-  const [payKind, setPayKind] = useState<PayKind>('cash')
+  const [payKind, setPayKind] = useState<FreePayKind>('cash')
+  /** Наличная часть при смешанной оплате, в сумах (карта — остаток). */
+  const [cashPartInput, setCashPartInput] = useState('')
   const [cardKind, setCardKind] = useState<'fiz' | 'corp'>('fiz')
   const [opts, setOpts] = useState<MatcherOptions>({})
   const [plan, setPlan] = useState<HolisticPlan | null>(null)
@@ -108,11 +113,6 @@ export default function FreeReceipt() {
     setFiscalizing(true)
     setError(null)
     try {
-      const payment =
-        payKind === 'cash'
-          ? { cashTiyin: plan.totalTiyin, cardTiyin: 0 }
-          : { cashTiyin: 0, cardTiyin: plan.totalTiyin }
-
       const receipt = buildSyntheticMsReceipt({
         sumTiyin: plan.totalTiyin,
         payment,
@@ -123,12 +123,14 @@ export default function FreeReceipt() {
       await log.info('fiscalize', `Чек по сумме: ${tiyinToSumDisplay(plan.totalTiyin)}`, {
         lines: plan.lines.length,
         payKind,
+        cash: payment.cashTiyin,
+        card: payment.cardTiyin,
       })
 
       const result = await fiscalize(buildFreeMatchResult(receipt, plan), {
         receivedCash: payment.cashTiyin,
         receivedCard: payment.cardTiyin,
-        cardKind: payKind === 'card' ? cardKind : undefined,
+        cardKind: cardInvolved ? cardKind : undefined,
       })
 
       toast.success(
@@ -165,6 +167,22 @@ export default function FreeReceipt() {
 
   const planTotal = plan?.totalTiyin ?? 0
   const diff = planTotal - targetTiyin
+
+  const cashPartTiyin = Math.round(
+    (Number.parseFloat(cashPartInput.replace(',', '.')) || 0) * 100,
+  )
+  const payment = resolvePayment(payKind, planTotal, cashPartTiyin)
+  // Показ и смысл разведены намеренно.
+  //
+  // Селектор показываем сразу при выборе «Карта» или «Смешанная» — иначе он
+  // появлялся бы только после сборки плана (до неё итог равен нулю, а значит и
+  // карточная часть тоже), и кассир решил бы, что тип карты выбрать негде.
+  //
+  // А В ОФД тип уходит только когда карточная часть реально есть: при
+  // смешанной оплате кассир может ввести всю сумму наличными, и тогда никакой
+  // карты в чеке нет.
+  const showCardKind = payKind === 'card' || payKind === 'mixed'
+  const cardInvolved = payment.cardTiyin > 0
 
   return (
     <div className="space-y-4">
@@ -216,10 +234,51 @@ export default function FreeReceipt() {
                 icon={<CreditCard size={16} />}
                 label="Карта"
               />
+              <PayButton
+                active={payKind === 'mixed'}
+                onClick={() => setPayKind('mixed')}
+                icon={<Split size={16} />}
+                label="Смешанная"
+              />
             </div>
           </div>
 
-          {payKind === 'card' && (
+          {payKind === 'mixed' && (
+            <div>
+              <label className="mb-1.5 block text-body font-medium">
+                Наличными
+                <span className="ml-1 font-normal text-ink-muted">
+                  — остальное спишется на карту
+                </span>
+              </label>
+              <div className="flex flex-wrap items-center gap-2">
+                <Input
+                  value={cashPartInput}
+                  onChange={(e) => setCashPartInput(e.target.value.replace(/[^\d.,]/g, ''))}
+                  placeholder="0"
+                  inputMode="decimal"
+                  className="max-w-[180px] text-right"
+                />
+                <span className="text-ink-muted">сум</span>
+                {plan && (
+                  <span className="text-body text-ink-muted">
+                    → картой {tiyinToSumDisplay(payment.cardTiyin)}
+                  </span>
+                )}
+              </div>
+              {plan && cashPartTiyin > planTotal && (
+                // Не блокируем: сумма чека могла уменьшиться при пересборе
+                // плана, и переписывать введённое за кассира — хуже, чем
+                // показать, что именно уйдёт в ОФД.
+                <div className="mt-1.5 text-caption text-warning">
+                  Больше итога чека — наличными уйдёт{' '}
+                  {tiyinToSumDisplay(payment.cashTiyin)}, картой 0.
+                </div>
+              )}
+            </div>
+          )}
+
+          {showCardKind && (
             <div>
               <label className="mb-1.5 block text-body font-medium">
                 Тип карты
@@ -318,13 +377,23 @@ export default function FreeReceipt() {
             </table>
           </Card.Body>
           <Card.Footer>
-            <Button
-              onClick={doFiscalize}
-              loading={fiscalizing}
-              icon={<Send size={16} />}
-            >
-              {testMode ? 'Напечатать (тест)' : 'Фискализировать'}
-            </Button>
+            <div className="flex flex-wrap items-center gap-3">
+              <Button
+                onClick={doFiscalize}
+                loading={fiscalizing}
+                icon={<Send size={16} />}
+              >
+                {testMode ? 'Напечатать (тест)' : 'Фискализировать'}
+              </Button>
+              {/* Что именно уйдёт в ОФД — видно до нажатия, а не после. */}
+              <span className="text-body text-ink-muted">
+                {payment.cashTiyin > 0 && `наличными ${tiyinToSumDisplay(payment.cashTiyin)}`}
+                {payment.cashTiyin > 0 && payment.cardTiyin > 0 && ' · '}
+                {payment.cardTiyin > 0 &&
+                  `картой ${tiyinToSumDisplay(payment.cardTiyin)}` +
+                    (cardKind === 'corp' ? ' (Корпоратив)' : ' (Шахсий)')}
+              </span>
+            </div>
           </Card.Footer>
         </Card>
       )}

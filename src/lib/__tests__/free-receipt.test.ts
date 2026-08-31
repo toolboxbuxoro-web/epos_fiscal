@@ -4,6 +4,7 @@ import {
   buildSyntheticMsReceipt,
   isFreeReceipt,
   FREE_RECEIPT_PREFIX,
+  resolvePayment,
 } from '../free-receipt'
 import { extractPositions } from '../matcher/extract'
 import type { HolisticPlan } from '../matcher/types'
@@ -84,5 +85,77 @@ describe('обёртка плана в результат подбора', () =>
 
   it('автофискализация запрещена — сумму ввёл человек, нужно подтверждение', () => {
     expect(buildFreeMatchResult(receipt(1_300_000), plan).canAutoFiscalize).toBe(false)
+  })
+})
+
+describe('раскладка оплаты', () => {
+  const TOTAL = 1_300_000
+
+  it('наличными — всё в наличные', () => {
+    expect(resolvePayment('cash', TOTAL, 0)).toEqual({ cashTiyin: TOTAL, cardTiyin: 0 })
+  })
+
+  it('картой — всё на карту', () => {
+    expect(resolvePayment('card', TOTAL, 0)).toEqual({ cashTiyin: 0, cardTiyin: TOTAL })
+  })
+
+  it('смешанная — карта берёт остаток', () => {
+    expect(resolvePayment('mixed', TOTAL, 500_000)).toEqual({
+      cashTiyin: 500_000,
+      cardTiyin: 800_000,
+    })
+  })
+
+  it('сумма частей ВСЕГДА равна итогу — иначе Communicator откажет', () => {
+    for (const cash of [0, 1, 7, 499_999, 650_000, TOTAL - 1, TOTAL]) {
+      const p = resolvePayment('mixed', TOTAL, cash)
+      expect(p.cashTiyin + p.cardTiyin).toBe(TOTAL)
+    }
+  })
+
+  it('наличная часть больше итога — карта не уходит в минус', () => {
+    // Бывает после пересборки плана: сумма уменьшилась, а введённое осталось.
+    expect(resolvePayment('mixed', TOTAL, 9_000_000)).toEqual({
+      cashTiyin: TOTAL,
+      cardTiyin: 0,
+    })
+  })
+
+  it('отрицательный ввод не ломает раскладку', () => {
+    expect(resolvePayment('mixed', TOTAL, -5000)).toEqual({
+      cashTiyin: 0,
+      cardTiyin: TOTAL,
+    })
+  })
+
+  it('вся сумма наличными в смешанном режиме — карточной части нет', () => {
+    // Тип карты в этом случае в ОФД не уходит: карты в чеке нет.
+    expect(resolvePayment('mixed', TOTAL, TOTAL).cardTiyin).toBe(0)
+  })
+
+  it('нулевой итог не даёт отрицательных частей', () => {
+    expect(resolvePayment('mixed', 0, 100)).toEqual({ cashTiyin: 0, cardTiyin: 0 })
+    expect(resolvePayment('cash', 0, 0)).toEqual({ cashTiyin: 0, cardTiyin: 0 })
+  })
+
+  it('дробный ввод округляется, инвариант держится', () => {
+    const p = resolvePayment('mixed', TOTAL, 333_333.7)
+    expect(p.cashTiyin + p.cardTiyin).toBe(TOTAL)
+    expect(Number.isInteger(p.cashTiyin)).toBe(true)
+  })
+})
+
+describe('синтетический чек со смешанной оплатой', () => {
+  it('раскладка попадает в чек — по ней считается сплит и колонка «Оплата»', () => {
+    const p = resolvePayment('mixed', 1_300_000, 500_000)
+    const rd = buildSyntheticMsReceipt({
+      sumTiyin: 1_300_000,
+      payment: p,
+      nowMs: NOW,
+      uid: 'mix1',
+    })
+    expect(rd.cashSum).toBe(500_000)
+    expect(rd.noCashSum).toBe(800_000)
+    expect((rd.cashSum ?? 0) + (rd.noCashSum ?? 0)).toBe(rd.sum)
   })
 })

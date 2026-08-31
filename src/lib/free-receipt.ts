@@ -43,6 +43,36 @@ export interface FreeReceiptPayment {
   cardTiyin: number
 }
 
+/** Как покупатель расплатился. */
+export type FreePayKind = 'cash' | 'card' | 'mixed'
+
+/**
+ * Разложить сумму чека на наличные и карту.
+ *
+ * Инвариант, который здесь удерживается: **cash + card всегда равно итогу
+ * чека**. Communicator сверяет полученную сумму с суммой позиций и на
+ * расхождение отвечает отказом, поэтому раскладку нельзя оставлять на
+ * свободный ввод двух полей — стоит кассиру ошибиться на сум, и чек не
+ * пробьётся.
+ *
+ * Поэтому в смешанном режиме кассир вводит только наличную часть, а карта
+ * считается как остаток. Введённое зажимается в границы [0, итог]: при
+ * пересборе плана сумма меняется, и раньше введённая наличная часть может
+ * оказаться больше нового итога.
+ */
+export function resolvePayment(
+  kind: FreePayKind,
+  totalTiyin: number,
+  cashPartTiyin: number,
+): FreeReceiptPayment {
+  const total = Math.max(0, Math.round(totalTiyin))
+  if (kind === 'cash') return { cashTiyin: total, cardTiyin: 0 }
+  if (kind === 'card') return { cashTiyin: 0, cardTiyin: total }
+
+  const cash = Math.min(Math.max(0, Math.round(cashPartTiyin)), total)
+  return { cashTiyin: cash, cardTiyin: total - cash }
+}
+
 /**
  * Собрать синтетический чек МС на заданную сумму.
  *
