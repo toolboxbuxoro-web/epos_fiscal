@@ -95,7 +95,17 @@ export function escapeLike(s: string): string {
  * Собрать WHERE + параметры из фильтров. Пустой `sql` (нет фильтров) —
  * запрос идёт прямо по индексу `idx_fiscal_receipts_fiscalized`.
  */
-export function buildWhere(f: HistoryFilters): {
+export function buildWhere(
+  f: HistoryFilters,
+  /**
+   * Префикс таблицы (`'f.'`), когда запрос идёт с JOIN.
+   *
+   * Нужен, чтобы не переписывать готовый SQL регуляркой: сегодня имена колонок
+   * с `ms_receipts` не сталкиваются, но добавь туда кто-нибудь `fiscalized_at`
+   * — и Историю сломает молча, на проде.
+   */
+  prefix = '',
+): {
   sql: string
   params: unknown[]
 } {
@@ -103,15 +113,15 @@ export function buildWhere(f: HistoryFilters): {
   const params: unknown[] = []
   for (const token of tokenizeQuery(f.query)) {
     params.push(`%${escapeLike(token)}%`)
-    clauses.push(`search_text LIKE $${params.length} ESCAPE '\\'`)
+    clauses.push(`${prefix}search_text LIKE $${params.length} ESCAPE '\\'`)
   }
   if (f.dateFrom != null) {
     params.push(f.dateFrom)
-    clauses.push(`fiscalized_at >= $${params.length}`)
+    clauses.push(`${prefix}fiscalized_at >= $${params.length}`)
   }
   if (f.dateTo != null) {
     params.push(f.dateTo)
-    clauses.push(`fiscalized_at <= $${params.length}`)
+    clauses.push(`${prefix}fiscalized_at <= $${params.length}`)
   }
   return {
     sql: clauses.length ? `WHERE ${clauses.join(' AND ')}` : '',

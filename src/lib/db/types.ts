@@ -339,6 +339,16 @@ export interface MatchItemRow {
 export interface FiscalReceiptRow {
   id: number
   ms_receipt_id: number
+  /**
+   * Идентификатор чека-источника в МойСклад. Приходит только в выдаче Истории
+   * (LEFT JOIN на ms_receipts).
+   *
+   * У чеков, пробитых по сумме без МС, начинается с `free-` — по нему История
+   * и отличает ручной чек от обычного. См. `isFreeReceipt`.
+   */
+  ms_source_id?: string | null
+  /** Имя чека-источника: номер чека МС либо «Без МС 04.09 13:40». */
+  ms_source_name?: string | null
   match_id: number | null
   terminal_id: string
   receipt_seq: string

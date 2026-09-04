@@ -85,10 +85,20 @@ export async function searchFiscalReceipts(
   offset = 0,
 ): Promise<FiscalReceiptRow[]> {
   const db = await getDb()
-  const { sql, params } = buildWhere(filters)
+  const { sql, params } = buildWhere(filters, 'f.')
+  // Подтягиваем чек-источник: в Истории не было ни одной колонки, по которой
+  // отличишь чек из МойСклад от пробитого вручную по сумме. Оба выглядели
+  // одинаково — время, терминал, номер, признак, — и «истории ручных чеков»
+  // для кассира просто не существовало, хотя строки в таблице были.
+  //
+  // LEFT JOIN, а не INNER: чек не должен пропасть из Истории, даже если запись
+  // чека МС почему-то отсутствует.
   return db.select<FiscalReceiptRow[]>(
-    `SELECT * FROM fiscal_receipts ${sql}
-      ORDER BY fiscalized_at DESC, id DESC
+    `SELECT f.*, m.ms_id AS ms_source_id, m.ms_name AS ms_source_name
+       FROM fiscal_receipts f
+       LEFT JOIN ms_receipts m ON m.id = f.ms_receipt_id
+       ${sql}
+      ORDER BY f.fiscalized_at DESC, f.id DESC
       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
     [...params, limit, offset],
   )

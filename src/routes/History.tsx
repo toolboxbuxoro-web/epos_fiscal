@@ -21,7 +21,9 @@ import {
   type ReceiptData,
 } from '@/lib/printer'
 import { parseRequestJsonReceipt } from '@/lib/epos/request-json'
+import { isFreeReceipt } from '@/lib/free-receipt'
 import { Button } from '@/components/ui/Button'
+import { Badge } from '@/components/ui/Badge'
 
 /** Сколько чеков на одной странице Истории. */
 const PAGE_SIZE = 50
@@ -386,6 +388,7 @@ export default function History() {
           <thead className="bg-canvas">
             <tr>
               <Th>Время</Th>
+              <Th>Чек</Th>
               <Th>Терминал</Th>
               <Th>№ чека</Th>
               <Th>Фискальный признак</Th>
@@ -399,13 +402,13 @@ export default function History() {
           <tbody className="divide-y divide-border">
             {loading && rows.length === 0 ? (
               <tr>
-                <td className="px-3 py-8 text-center text-sm text-ink-muted" colSpan={9}>
+                <td className="px-3 py-8 text-center text-sm text-ink-muted" colSpan={10}>
                   Загрузка…
                 </td>
               </tr>
             ) : rows.length === 0 ? (
               <tr>
-                <td className="px-3 py-8 text-center text-sm text-ink-muted" colSpan={9}>
+                <td className="px-3 py-8 text-center text-sm text-ink-muted" colSpan={10}>
                   {hasFilters ? (
                     <div className="space-y-2">
                       <div>По этому запросу ничего не найдено.</div>
@@ -430,6 +433,21 @@ export default function History() {
                 return (
                 <tr key={r.id} className="hover:bg-canvas">
                   <Td>{formatDateTime(parseFiscalDateTime(r.fiscal_datetime) || r.fiscalized_at)}</Td>
+                  <Td>
+                    {/*
+                      Откуда чек. Раньше колонки не было вовсе, и чек из
+                      МойСклад выглядел точно так же, как пробитый вручную по
+                      сумме: время, терминал, номер, признак. Найти свои ручные
+                      чеки в Истории было нельзя.
+                    */}
+                    {isFreeReceipt(r.ms_source_id) ? (
+                      <Badge variant="info">По сумме</Badge>
+                    ) : (
+                      <span className="text-xs text-ink-muted">
+                        {r.ms_source_name || 'МойСклад'}
+                      </span>
+                    )}
+                  </Td>
                   <Td className="font-mono text-xs">{r.terminal_id}</Td>
                   <Td className="font-mono text-xs">{r.receipt_seq}</Td>
                   <Td className="font-mono text-xs">{r.fiscal_sign}</Td>

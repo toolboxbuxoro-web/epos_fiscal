@@ -167,3 +167,33 @@ describe('buildWhere', () => {
     expect(params).toHaveLength(5)
   })
 })
+
+describe('префикс таблицы для запроса с JOIN', () => {
+  it('без префикса SQL прежний — счётчик ходит без JOIN', () => {
+    const { sql } = buildWhere({ query: 'насос', dateFrom: null, dateTo: null })
+    expect(sql).toContain('search_text LIKE')
+    expect(sql).not.toContain('f.search_text')
+  })
+
+  it('с префиксом колонки квалифицированы', () => {
+    // История подтягивает чек-источник LEFT JOIN'ом: без квалификации
+    // одноимённая колонка в ms_receipts сделала бы запрос неоднозначным.
+    const { sql } = buildWhere(
+      { query: 'насос', dateFrom: 100, dateTo: 200 },
+      'f.',
+    )
+    expect(sql).toContain('f.search_text LIKE')
+    expect(sql).toContain('f.fiscalized_at >=')
+    expect(sql).toContain('f.fiscalized_at <=')
+  })
+
+  it('параметры от префикса не меняются', () => {
+    const a = buildWhere({ query: 'насос', dateFrom: 5, dateTo: null })
+    const b = buildWhere({ query: 'насос', dateFrom: 5, dateTo: null }, 'f.')
+    expect(b.params).toEqual(a.params)
+  })
+
+  it('пустой фильтр остаётся пустым и с префиксом', () => {
+    expect(buildWhere({ query: '', dateFrom: null, dateTo: null }, 'f.').sql).toBe('')
+  })
+})
