@@ -730,19 +730,86 @@ fn append_qr_code(buf: &mut Vec<u8>, data: &str) {
 mod qr_tests {
     use super::*;
 
+    const EXPECTED_INIT: &[u8] = &[
+        0x1B, 0x40, // ESC @ — initialize
+        0x1C, 0x2E, // FS . — cancel Kanji/Chinese mode
+        0x1B, 0x74, 17, // ESC t 17 — CP866
+    ];
+
     #[test]
     fn escpos_init_disables_cjk_before_selecting_cp866() {
         let mut buf = Vec::new();
         init_escpos(&mut buf);
 
-        assert_eq!(
-            buf,
-            [
-                0x1B, 0x40, // ESC @ — initialize
-                0x1C, 0x2E, // FS . — cancel Kanji/Chinese mode
-                0x1B, 0x74, 17, // ESC t 17 — CP866
-            ],
-        );
+        assert_eq!(buf, EXPECTED_INIT);
+    }
+
+    #[test]
+    fn sale_receipt_starts_in_single_byte_cp866_mode() {
+        let data = ReceiptData {
+            is_copy: false,
+            is_test: true,
+            is_refund: false,
+            original_receipt_ref: String::new(),
+            company: CompanyInfo {
+                name: "ТЕСТ".into(),
+                address: String::new(),
+                phone: String::new(),
+                inn: String::new(),
+            },
+            receipt_seq: "TEST".into(),
+            date_str: "16.09.2026 14:00".into(),
+            items: Vec::new(),
+            total_str: "0.00".into(),
+            total_vat_str: "0.00".into(),
+            cash_str: "0.00".into(),
+            card_str: "0.00".into(),
+            karta_turi: String::new(),
+            cashier: "Кассир".into(),
+            terminal_id: "TEST".into(),
+            fiscal_sign: "0".into(),
+            virtual_kassa: "20260916140000".into(),
+            qr_url: "https://example.com".into(),
+        };
+
+        assert!(build_receipt(&data).starts_with(EXPECTED_INIT));
+    }
+
+    #[test]
+    fn z_report_starts_in_single_byte_cp866_mode() {
+        let data = ZReportPrintData {
+            is_close: false,
+            company: CompanyInfo {
+                name: "ТЕСТ".into(),
+                address: String::new(),
+                phone: String::new(),
+                inn: String::new(),
+            },
+            city: String::new(),
+            report_number: 1,
+            terminal_id: "TEST".into(),
+            open_time: "2026-09-16 14:00:00".into(),
+            close_time: String::new(),
+            total_count: 0,
+            sale_count: 0,
+            refund_count: 0,
+            first_seq: String::new(),
+            last_seq: String::new(),
+            sale_cash_str: "0.00".into(),
+            sale_card_str: "0.00".into(),
+            sale_sum_str: "0.00".into(),
+            sale_vat_str: "0.00".into(),
+            refund_cash_str: "0.00".into(),
+            refund_card_str: "0.00".into(),
+            refund_sum_str: "0.00".into(),
+            refund_vat_str: "0.00".into(),
+            total_cash_str: "0.00".into(),
+            total_card_str: "0.00".into(),
+            total_sum_str: "0.00".into(),
+            total_vat_str: "0.00".into(),
+        };
+
+        assert!(build_z_report(&data).starts_with(EXPECTED_INIT));
     }
 
     /// Разобрать буфер на полосы GS v 0. Возвращает (width_bytes, суммарная
