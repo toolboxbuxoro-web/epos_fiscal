@@ -260,18 +260,25 @@ fn cyr(s: &str) -> Vec<u8> {
     cow.into_owned()
 }
 
+/// Сбросить принтер в однобайтовый режим и выбрать кириллическую таблицу.
+///
+/// Некоторые китайские ESC/POS-принтеры запоминают двухбайтовый CJK-режим
+/// между заданиями. Одного `ESC @` для выхода из него недостаточно: тогда
+/// принтер склеивает каждые два CP866-байта в один китайский иероглиф.
+/// `FS .` явно отменяет Kanji/Chinese character mode, после чего `ESC t 17`
+/// выбирает PC866 для русской кириллицы.
+fn init_escpos(buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&[0x1B, 0x40]); // ESC @ — initialize
+    buf.extend_from_slice(&[0x1C, 0x2E]); // FS . — cancel Kanji/Chinese mode
+    buf.extend_from_slice(&[0x1B, 0x74, 17]); // ESC t 17 — CP866 (PC866)
+}
+
 /// Собрать ESC/POS байты для полного чека.
 fn build_receipt(d: &ReceiptData) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::with_capacity(2048);
 
-    // 1. Init принтер.
-    buf.extend_from_slice(&[0x1B, 0x40]); // ESC @
-
-    // 2. Установить кодовую страницу PC866 (DOS Cyrillic) — code 17 у Xprinter.
-    //    Это исторический стандарт для русской термопечати, поддерживается
-    //    всеми Xprinter / Star / Epson с поддержкой кириллицы. WCP1251 (code 46
-    //    у некоторых моделей) — не работает на нашем XP-80, давал иероглифы.
-    buf.extend_from_slice(&[0x1B, 0x74, 17]);
+    // 1–2. Сбросить сохранённый CJK-режим и включить CP866.
+    init_escpos(&mut buf);
 
     // 3. ── Шапка ────────────────────────────────────────────
     center(&mut buf);
@@ -439,9 +446,8 @@ fn build_receipt(d: &ReceiptData) -> Vec<u8> {
 fn build_z_report(d: &ZReportPrintData) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::with_capacity(2048);
 
-    // 1. Init + кодовая страница.
-    buf.extend_from_slice(&[0x1B, 0x40]);     // ESC @ — init
-    buf.extend_from_slice(&[0x1B, 0x74, 17]); // ESC t 17 — CP866 (PC866)
+    // 1. Init + явный выход из CJK-режима + кодовая страница.
+    init_escpos(&mut buf);
 
     let title = if d.is_close { "Z-hisobot raqami:" } else { "X-hisobot raqami:" };
 
@@ -723,6 +729,21 @@ fn append_qr_code(buf: &mut Vec<u8>, data: &str) {
 #[cfg(test)]
 mod qr_tests {
     use super::*;
+
+    #[test]
+    fn escpos_init_disables_cjk_before_selecting_cp866() {
+        let mut buf = Vec::new();
+        init_escpos(&mut buf);
+
+        assert_eq!(
+            buf,
+            [
+                0x1B, 0x40, // ESC @ — initialize
+                0x1C, 0x2E, // FS . — cancel Kanji/Chinese mode
+                0x1B, 0x74, 17, // ESC t 17 — CP866
+            ],
+        );
+    }
 
     /// Разобрать буфер на полосы GS v 0. Возвращает (width_bytes, суммарная
     /// высота в точках, все растровые данные подряд, кол-во полос).
