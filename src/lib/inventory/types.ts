@@ -200,9 +200,30 @@ export interface ShopMeResponse {
     login: string | null
     /** base64 от "login:password" — готов для МС Authorization header. */
     basic_credentials: string | null
+    /** От розницы; розницы больше нет. Остаётся ради старого сервера. */
     retailstore_id: string | null
     retailstore_name: string | null
     employee_id: string | null
     employee_name: string | null
+    /**
+     * Что пробивает касса: отгрузки с этого склада в этом статусе, и как
+     * считать поступления на расчётные счета. Выбирает сама касса в
+     * Настройках, сервер хранит, чтобы после переустановки не выбирать
+     * заново. У старого сервера этих полей нет.
+     */
+    store_id?: string | null
+    store_name?: string | null
+    demand_state_id?: string | null
+    demand_state_name?: string | null
+    payment_accounts?: Record<string, { type: 'cash' | 'card' | 'exclude'; label?: string }>
   }
+}
+
+/** Что касса сообщает серверу о своём выборе (PATCH /shop/me/moysklad). */
+export interface ShopDemandConfig {
+  store_id?: string | null
+  store_name?: string | null
+  demand_state_id?: string | null
+  demand_state_name?: string | null
+  payment_accounts?: Record<string, { type: 'cash' | 'card' | 'exclude'; label?: string }>
 }

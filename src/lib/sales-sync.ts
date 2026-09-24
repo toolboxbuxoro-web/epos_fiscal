@@ -50,7 +50,7 @@ import { log } from '@/lib/log'
 import { APP_VERSION } from '@/lib/app-version'
 import { parseRequestJsonReceipt, type NormalizedReceiptItem } from '@/lib/epos/request-json'
 import { extractPositions } from '@/lib/matcher'
-import type { MsRetailDemand } from '@/lib/moysklad/types'
+import type { MsSaleDocument } from '@/lib/moysklad/types'
 
 /** Интервал между попытками flush'а — 60 сек. */
 const FLUSH_INTERVAL_MS = 60_000
@@ -327,7 +327,7 @@ export function buildSaleItems(
 export function buildMsItems(rawJson: string | null | undefined): SalesSyncMsItemPayload[] {
   if (!rawJson) return []
   try {
-    const rd = JSON.parse(rawJson) as MsRetailDemand
+    const rd = JSON.parse(rawJson) as MsSaleDocument
     return extractPositions(rd).map((p) => ({
       name: p.name,
       qty_milli: p.quantity,

@@ -8,10 +8,9 @@ import {
 } from '@/lib/db'
 import { log } from '@/lib/log'
 import { MoyskladClient, MoyskladError } from './client'
-import { parseMsMoment, type MsRetailDemand } from './types'
+import { parseMsMoment, type MsDemand } from './types'
 import { loadCurrencies, verifyReceiptCurrency } from './currency-guard'
 
-/** Сколько часов истории тянуть при первом запуске. */
 /**
  * Сколько опросов подряд должны провалиться, чтобы поднять тревогу.
  *
@@ -21,10 +20,23 @@ import { loadCurrencies, verifyReceiptCurrency } from './currency-guard'
  */
 const POLLER_ERROR_THRESHOLD = 10
 
-const INITIAL_LOOKBACK_HOURS = 6
+/**
+ * Сколько часов истории тянуть при первом запуске и после смены склада или
+ * статуса. Сутки: отгрузку, переведённую в нужный статус утром, касса,
+ * включённая вечером, должна увидеть. Лишнего это не подтянет — фильтр по
+ * статусу пропускает только то, что пора пробивать.
+ */
+const INITIAL_LOOKBACK_HOURS = 24
 
-/** Ключ настройки, где храним курсор поллинга. */
-const LAST_SYNC_KEY = 'moysklad.last_sync_epoch_sec' as const
+/**
+ * Курсор опроса отгрузок. Отдельный от старого розничного
+ * (`moysklad.last_sync_epoch_sec`): розничный стоит на моменте последнего
+ * чека розницы, и отгрузки, изменённые раньше него, по нему не пришли бы.
+ *
+ * Сбрасывается при смене склада или статуса в Настройках — новый фильтр
+ * должен заново пройти по последним суткам.
+ */
+export const DEMAND_SYNC_KEY = 'moysklad.demand_last_sync_epoch_sec' as const
 
 export interface PollerStatus {
   running: boolean
@@ -118,7 +130,17 @@ export class MoyskladPoller {
         return
       }
 
-      const lastSyncStr = await getSetting(LAST_SYNC_KEY as never)
+      // Без склада и статуса опрос не идёт: не знаем, чьи отгрузки и какие
+      // из них пора пробивать. Касса покажет это в очереди и в Настройках.
+      const storeId = await getSetting(SettingKey.MoyskladStoreId)
+      const stateId = await getSetting(SettingKey.MoyskladDemandStateId)
+      if (!storeId || !stateId) {
+        this.status.lastError = 'Выберите склад и статус отгрузок в Настройках'
+        this.notify()
+        return
+      }
+
+      const lastSyncStr = await getSetting(DEMAND_SYNC_KEY as never)
       const lastSync = lastSyncStr
         ? Number.parseInt(lastSyncStr, 10)
         : now() - INITIAL_LOOKBACK_HOURS * 3600
@@ -126,15 +148,7 @@ export class MoyskladPoller {
       const client = new MoyskladClient(
         basic ? { basic } : { token: token! },
       )
-      // Фильтруем по выбранной точке продаж — иначе в multi-shop сценарии
-      // программа в магазине №1 увидела бы чеки магазина №2 и попыталась
-      // фискализировать их через свою USB-карту.
-      const retailStoreId = await getSetting(SettingKey.MoyskladRetailStoreId)
-      const items = await client.listRecentRetailDemands(
-        lastSync,
-        retailStoreId || null,
-        200,
-      )
+      const items = await client.listRecentDemands(lastSync, storeId, stateId, 100)
 
       for (const item of items) {
         await this.persist(item, client)
@@ -147,14 +161,14 @@ export class MoyskladPoller {
           const t = parseMsMoment(it.updated)
           return t > acc ? t : acc
         }, lastSync)
-        await setSetting(LAST_SYNC_KEY as never, String(latest + 1))
+        await setSetting(DEMAND_SYNC_KEY as never, String(latest + 1))
         await log.info(
           'poller',
-          `Получено ${items.length} новых/изменённых чеков из МойСклад`,
+          `Получено ${items.length} новых/изменённых отгрузок из МойСклад`,
           { count: items.length, names: items.map((i) => i.name).slice(0, 10) },
         )
       } else {
-        await log.debug('poller', 'Опрос завершён, новых чеков нет')
+        await log.debug('poller', 'Опрос завершён, новых отгрузок нет')
       }
 
       this.status.lastSuccessAt = now()
@@ -191,7 +205,7 @@ export class MoyskladPoller {
     }
   }
 
-  private async persist(rd: MsRetailDemand, client: MoyskladClient): Promise<void> {
+  private async persist(rd: MsDemand, client: MoyskladClient): Promise<void> {
     // Чек на 0 сум (вся покупка за бонусные баллы / 100% скидка) —
     // ОФД физически не примет товар на 0 сум. Сразу помечаем такой
     // чек как not_required чтобы он не висел в списке pending и не

@@ -22,7 +22,6 @@ import {
   subscribePollerStatus,
 } from '@/lib/poller-runtime'
 import type { PollerStatus } from '@/lib/moysklad/poller'
-import { useShiftStatus } from '@/lib/moysklad'
 import { formatDateTime, tiyinToSumDisplay } from '@/lib/format'
 import {
   Badge,
@@ -35,22 +34,6 @@ import {
   type Column,
 } from '@/components/ui'
 import { cn } from '@/lib/cn'
-
-/**
- * Достать UUID активной смены из MsRetailDemand.raw_json.
- * Парсим лениво и кэшируем — так дешевле чем JSON1 в SQLite.
- */
-function getShiftIdFromRawJson(raw: string): string | null {
-  try {
-    const parsed = JSON.parse(raw) as { retailShift?: { meta?: { href?: string } } }
-    const href = parsed?.retailShift?.meta?.href
-    if (typeof href !== 'string') return null
-    const idx = href.lastIndexOf('/')
-    return idx >= 0 ? href.slice(idx + 1) : null
-  } catch {
-    return null
-  }
-}
 
 // «Подобраны» (matched) убран: статус нигде не выставляется — поллер
 // пишет 'pending', после фискализации сразу 'fiscalized'. Вкладка всегда
@@ -77,58 +60,53 @@ const STATUS_TO_BADGE: Record<
   currency_mismatch: { label: 'Чужая валюта', status: 'warning' },
 }
 
-type Scope = 'shift' | 'all'
-
 /** Сколько чеков на странице в режиме «Все чеки». */
 const ALL_PAGE_SIZE = 50
 
-/** Тип оплаты чека — определяется по cashSum/noCashSum/qrSum из raw_json МС. */
-type PayKind = 'cash' | 'card' | 'qr' | 'mixed' | null
-
 /**
- * Определить способ оплаты из raw_json МС-чека.
+ * Что показать в колонке «Оплата».
  *
- * МС возвращает три поля: cashSum (наличные), noCashSum (банк.карта),
- * qrSum (QR — Click/Payme/Uzcard QR). Логика та же что в Receipt.tsx::paymentKind.
- *   - есть нал И есть безнал → 'mixed' (смешанная)
- *   - только qr → 'qr'
- *   - только карта → 'card'
- *   - только нал → 'cash'
- *   - всё по нулям / битый json → null
+ * У отгрузки разбивки «наличные / карта» нет — она появляется, только когда
+ * экран чека дотянет связанные платежи. Здесь хватает `payedSum`: кассиру
+ * в очереди важно другое — оплачена ли отгрузка вообще. Неоплаченную
+ * пробить не получится, и лучше увидеть это до того, как её открыть.
+ *
+ * Старые розничные чеки остаются в базе: для них, как раньше, наличные,
+ * карта, QR или смешанная.
  */
-function getPaymentKind(rawJson: string): PayKind {
+function getPaymentLabel(rawJson: string): { label: string; tone: 'ok' | 'warn' | 'muted' } | null {
   try {
-    const rd = JSON.parse(rawJson) as {
+    const doc = JSON.parse(rawJson) as {
+      meta?: { type?: string }
+      sum?: number
+      payedSum?: number
       cashSum?: number
       noCashSum?: number
       qrSum?: number
     }
-    const cash = rd.cashSum ?? 0
-    const card = rd.noCashSum ?? 0
-    const qr = rd.qrSum ?? 0
-    const hasCard = card > 0 || qr > 0
-    if (cash > 0 && hasCard) return 'mixed'
-    if (qr > 0) return 'qr'
-    if (card > 0) return 'card'
-    if (cash > 0) return 'cash'
-    return null
+    if (doc.meta?.type === 'retaildemand') {
+      const cash = doc.cashSum ?? 0
+      const card = doc.noCashSum ?? 0
+      const qr = doc.qrSum ?? 0
+      if (cash > 0 && (card > 0 || qr > 0)) return { label: 'Смешанная', tone: 'warn' }
+      if (qr > 0) return { label: 'QR', tone: 'muted' }
+      if (card > 0) return { label: 'Карта', tone: 'muted' }
+      if (cash > 0) return { label: 'Наличные', tone: 'muted' }
+      return null
+    }
+    const sum = doc.sum ?? 0
+    const paid = doc.payedSum ?? 0
+    if (sum > 0 && paid >= sum) return { label: 'Оплачена', tone: 'ok' }
+    if (paid > 0) return { label: 'Частично', tone: 'warn' }
+    return { label: 'Не оплачена', tone: 'warn' }
   } catch {
     return null
   }
 }
 
-const PAY_LABEL: Record<'cash' | 'card' | 'qr' | 'mixed', string> = {
-  cash: 'Наличные',
-  card: 'Карта',
-  qr: 'QR',
-  mixed: 'Смешанная',
-}
-
 export default function Dashboard() {
   const navigate = useNavigate()
   const [filter, setFilter] = useState<MsReceiptStatus | 'all'>('pending')
-  const [scope, setScope] = useState<Scope>('shift')
-  const shift = useShiftStatus()
   const [items, setItems] = useState<MsReceiptRow[]>([])
   const [counts, setCounts] = useState<Record<MsReceiptStatus, number>>({
     pending: 0,
@@ -143,7 +121,7 @@ export default function Dashboard() {
   const [pollerStatus, setPollerStatus] = useState<PollerStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  /** Страница (0-based) для режима «Все чеки». В режиме смены не используется. */
+  /** Страница (0-based). */
   const [page, setPage] = useState(0)
 
   useEffect(() => {
@@ -162,39 +140,25 @@ export default function Dashboard() {
       void load()
     }, 5000)
     return () => clearInterval(t)
-    // scope/filter/page в deps:
-    //   - «Текущая смена» — load() грузит широкое окно чеков для in-memory
-    //     подсчёта по смене (page игнорируется)
-    //   - «Все чеки» — постраничный SQL-запрос (offset = page × PAGE_SIZE)
-    //     + глобальный аггрегат счётчиков
-  }, [filter, scope, page])
+    // Постраничный SQL-запрос (offset = page × PAGE_SIZE) + аггрегат счётчиков.
+  }, [filter, page])
 
   async function load() {
     setLoading(true)
     try {
-      if (scope === 'all') {
-        // Глобально: ПОСТРАНИЧНЫЙ список + SQL-аггрегат счётчиков.
-        const [rows, byStatus] = await Promise.all([
-          listMsReceipts({
-            status: filter === 'all' ? undefined : filter,
-            limit: ALL_PAGE_SIZE,
-            offset: page * ALL_PAGE_SIZE,
-          }),
-          countMsReceiptsByStatus(),
-        ])
-        setItems(rows)
-        setCounts(byStatus)
-      } else {
-        // По смене: грузим окно последних чеков (одна смена заведомо < 1000),
-        // дальше фильтрация по shiftId + по статусу и подсчёт бейджей идут
-        // in-memory (см. shiftItems / visibleItems / displayCounts). Это
-        // нужно потому что shiftId лежит внутри raw_json (JSON), и SQL им
-        // фильтровать нельзя.
-        const rows = await listMsReceipts({ limit: 1000 })
-        setItems(rows)
-        // counts (глобальный) в shift-scope не используется — displayCounts
-        // считает из shiftItems. Но обновим чтобы не висело старое значение.
-      }
+      // Постраничный список + SQL-аггрегат счётчиков. Розничной смены
+      // МойСклад, по которой раньше фильтровалась очередь, у отгрузок нет —
+      // очередь это отгрузки в статусе «пробить», их и показываем.
+      const [rows, byStatus] = await Promise.all([
+        listMsReceipts({
+          status: filter === 'all' ? undefined : filter,
+          limit: ALL_PAGE_SIZE,
+          offset: page * ALL_PAGE_SIZE,
+        }),
+        countMsReceiptsByStatus(),
+      ])
+      setItems(rows)
+      setCounts(byStatus)
       setError(null)
     } catch (e) {
       setError(formatErrorForUser(e))
@@ -203,45 +167,8 @@ export default function Dashboard() {
     }
   }
 
-  // Чеки ТЕКУЩЕЙ смены (все статусы) — фильтр по retailShift.id из raw_json.
-  // Поллер тащит все чеки в БД (для истории), UI по умолчанию показывает смену.
-  // В scope='all' пусто — там работаем напрямую с items.
-  const shiftItems = useMemo(() => {
-    if (scope !== 'shift') return []
-    if (!shift.shiftId) return []
-    return items.filter(
-      (it) => getShiftIdFromRawJson(it.raw_json) === shift.shiftId,
-    )
-  }, [items, scope, shift.shiftId])
-
-  // Что показывать в таблице:
-  //   scope='all'   — items уже отфильтрованы по статусу в load()
-  //   scope='shift' — shiftItems + ручной фильтр по выбранному статусу
-  const visibleItems = useMemo(() => {
-    if (scope === 'all') return items
-    if (filter === 'all') return shiftItems
-    return shiftItems.filter((it) => it.status === filter)
-  }, [items, shiftItems, scope, filter])
-
-  // Счётчики на бейджах — теперь УВАЖАЮТ scope:
-  //   scope='all'   — глобальный SQL-аггрегат (counts из load())
-  //   scope='shift' — пересчёт по чекам текущей смены (shiftItems)
-  // Раньше бейджи всегда показывали глобал → «Готовы 49» при пустой смене.
-  const displayCounts = useMemo<Record<MsReceiptStatus, number>>(() => {
-    if (scope === 'all') return counts
-    const c: Record<MsReceiptStatus, number> = {
-      pending: 0,
-      matched: 0,
-      fiscalized: 0,
-      failed: 0,
-      manual: 0,
-      skipped: 0,
-      not_required: 0,
-      currency_mismatch: 0,
-    }
-    for (const r of shiftItems) c[r.status]++
-    return c
-  }, [scope, counts, shiftItems])
+  const visibleItems = items
+  const displayCounts = counts
 
   // ── Пагинация режима «Все чеки» ───────────────────────────────────
   // Всего записей под текущий фильтр: для конкретного статуса — counts[X],
@@ -313,14 +240,19 @@ export default function Dashboard() {
       label: 'Оплата',
       width: '130px',
       cell: (r) => {
-        const k = getPaymentKind(r.raw_json)
-        if (!k) return <span className="text-ink-subtle">—</span>
-        // Смешанная — выделяем (кассиру важно: там может быть Click/Payme).
+        const p = getPaymentLabel(r.raw_json)
+        if (!p) return <span className="text-ink-subtle">—</span>
         return (
           <span
-            className={k === 'mixed' ? 'text-warning font-medium' : 'text-ink-muted'}
+            className={
+              p.tone === 'warn'
+                ? 'text-warning font-medium'
+                : p.tone === 'ok'
+                  ? 'text-success'
+                  : 'text-ink-muted'
+            }
           >
-            {PAY_LABEL[k]}
+            {p.label}
           </span>
         )
       },
@@ -364,41 +296,8 @@ export default function Dashboard() {
         }
       />
 
-      {/* Top row: scope selector + poller indicator */}
-      <div className="flex flex-wrap items-center justify-between gap-4">
-        <div className="flex flex-wrap items-center gap-1.5">
-          <ScopeButton
-            active={scope === 'shift'}
-            onClick={() => {
-              setScope('shift')
-              setPage(0)
-            }}
-          >
-            Текущая смена
-            {shift.shiftId && shift.openedAt && (
-              <span className="ml-1.5 text-ink-subtle">
-                {shift.openedAt.toLocaleTimeString('ru-RU', {
-                  hour: '2-digit',
-                  minute: '2-digit',
-                })}
-              </span>
-            )}
-          </ScopeButton>
-          <ScopeButton
-            active={scope === 'all'}
-            onClick={() => {
-              setScope('all')
-              setPage(0)
-            }}
-          >
-            Все чеки
-          </ScopeButton>
-          {scope === 'shift' && !shift.shiftId && shift.ready && (
-            <span className="ml-2 text-caption text-warning">
-              Смена не открыта в МойСклад
-            </span>
-          )}
-        </div>
+      {/* Состояние опроса МойСклад */}
+      <div className="flex flex-wrap items-center justify-end gap-4">
         <PollerIndicator status={pollerStatus} />
       </div>
 
@@ -449,18 +348,8 @@ export default function Dashboard() {
         {visibleItems.length === 0 && !loading ? (
           <EmptyState
             icon={<ReceiptIcon size={36} />}
-            title={
-              scope === 'shift'
-                ? shift.shiftId
-                  ? 'В этой смене пока нет чеков'
-                  : 'Откройте смену в МойСклад'
-                : 'Нет чеков'
-            }
-            description={
-              scope === 'shift' && !shift.shiftId
-                ? 'Чеки появятся здесь сразу после того как кассир откроет смену в МС.'
-                : 'Чеки автоматически появятся когда МС-касса пробьёт первый.'
-            }
+            title="Нет отгрузок"
+            description="Отгрузки со склада кассы появятся здесь, как только их переведут в статус, выбранный в Настройках."
           />
         ) : (
           <DataTable
@@ -473,9 +362,8 @@ export default function Dashboard() {
         )}
       </Card>
 
-      {/* Пагинация — только в режиме «Все чеки». В режиме смены весь
-          набор смены уже на экране (load грузит окно), страницы не нужны. */}
-      {scope === 'all' && allTotal > 0 && (
+      {/* Пагинация */}
+      {allTotal > 0 && (
         <div className="flex items-center justify-between gap-3 flex-wrap">
           <div className="text-caption text-ink-muted">
             {allRangeFrom}–{allRangeTo} из {allTotal}
@@ -506,31 +394,6 @@ export default function Dashboard() {
         </div>
       )}
     </div>
-  )
-}
-
-function ScopeButton({
-  active,
-  onClick,
-  children,
-}: {
-  active: boolean
-  onClick: () => void
-  children: React.ReactNode
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={cn(
-        'rounded-md px-3 py-1.5 text-caption transition-colors',
-        active
-          ? 'bg-primary text-ink-inverse'
-          : 'text-ink-muted hover:bg-surface-hover hover:text-ink',
-      )}
-    >
-      {children}
-    </button>
   )
 }
 

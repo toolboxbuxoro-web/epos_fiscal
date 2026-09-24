@@ -33,6 +33,7 @@ import { SettingKey } from '@/lib/db/types'
 import { log } from '@/lib/log'
 import { InventoryServerClient } from './server-client'
 import type { RemoteInvItem } from './types'
+import { DEMAND_SYNC_KEY } from '@/lib/moysklad/poller'
 
 /**
  * Прочитать конфиг из настроек. Если нет url/api_key — возвращает null
@@ -342,18 +343,38 @@ export async function syncShopConfig(): Promise<{
     return { applied: false, reason: 'shop_not_configured_in_admin' }
   }
 
-  const updates: Partial<Record<SettingKey, string>> = {
+  const updates: Partial<Record<string, string>> = {
     [SettingKey.MoyskladCredentials]: me.moysklad.basic_credentials,
   }
   if (me.moysklad.login) updates[SettingKey.MoyskladLogin] = me.moysklad.login
-  if (me.moysklad.retailstore_id)
-    updates[SettingKey.MoyskladRetailStoreId] = me.moysklad.retailstore_id
-  if (me.moysklad.retailstore_name)
-    updates[SettingKey.MoyskladRetailStoreName] = me.moysklad.retailstore_name
   if (me.moysklad.employee_id)
     updates[SettingKey.MoyskladEmployeeId] = me.moysklad.employee_id
   if (me.moysklad.employee_name)
     updates[SettingKey.MoyskladEmployeeName] = me.moysklad.employee_name
+
+  // Склад, статус и счета выбирает сама касса и отправляет на сервер.
+  // Отсюда только заполняем пробелы: касса после обновления или
+  // переустановки получает выбор, сделанный раньше. Уже выбранное локально
+  // не перетираем — если отправка на сервер не прошла (не было связи),
+  // старое значение с сервера откатило бы свежий выбор кассира.
+  const [localStore, localState, localAccounts] = await Promise.all([
+    getSetting(SettingKey.MoyskladStoreId),
+    getSetting(SettingKey.MoyskladDemandStateId),
+    getSetting(SettingKey.MoyskladPaymentAccounts),
+  ])
+  if (!localStore && !localState && me.moysklad.store_id && me.moysklad.demand_state_id) {
+    updates[SettingKey.MoyskladStoreId] = me.moysklad.store_id
+    updates[SettingKey.MoyskladStoreName] = me.moysklad.store_name ?? ''
+    updates[SettingKey.MoyskladDemandStateId] = me.moysklad.demand_state_id
+    updates[SettingKey.MoyskladDemandStateName] = me.moysklad.demand_state_name ?? ''
+    // Новый фильтр опроса — пусть пройдёт по последним суткам.
+    updates[DEMAND_SYNC_KEY] = ''
+  }
+  const serverAccounts = me.moysklad.payment_accounts ?? {}
+  const localAccountsEmpty = !localAccounts || localAccounts === '{}'
+  if (localAccountsEmpty && Object.keys(serverAccounts).length > 0) {
+    updates[SettingKey.MoyskladPaymentAccounts] = JSON.stringify(serverAccounts)
+  }
 
   const db = await getDb()
   const ts = now()
@@ -368,7 +389,7 @@ export async function syncShopConfig(): Promise<{
 
   await log.info(
     'inventory.sync',
-    `Shop config synced from admin: shop=${me.shop.slug}, ms_login=${me.moysklad.login ?? '?'}, store=${me.moysklad.retailstore_name ?? '?'}`,
+    `Shop config synced from admin: shop=${me.shop.slug}, ms_login=${me.moysklad.login ?? '?'}, store=${me.moysklad.store_name ?? '—'}, state=${me.moysklad.demand_state_name ?? '—'}`,
   )
   return { applied: true }
 }

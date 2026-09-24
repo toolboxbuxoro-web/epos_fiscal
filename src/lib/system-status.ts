@@ -3,7 +3,7 @@
  *
  * Подписывается на:
  *   - poller-runtime (МойСклад)
- *   - shift-runtime (открытая смена)
+ *   - настройки отгрузок (выбраны ли склад и статус)
  *   - inventory SSE-status (если remote вкл)
  *   - последние ERROR-логи (за 5 минут)
  *
@@ -11,7 +11,6 @@
  *
  * Хук обновляется когда:
  *   - poller тикает (через subscribePollerStatus)
- *   - shift-runtime тикает (через listeners)
  *   - SSE меняет состояние (через poll-getter раз в 5с)
  *   - logs меняются (raw poll каждые 30с)
  *
@@ -24,7 +23,6 @@ import { getInventorySseStatus } from '@/lib/inventory'
 import { getSetting, SettingKey } from '@/lib/db'
 import { subscribePollerStatus } from '@/lib/poller-runtime'
 import type { PollerStatus } from '@/lib/moysklad/poller'
-import { getShiftStatus, type ShiftStatus } from '@/lib/moysklad'
 
 export type IssueSeverity = 'warning' | 'error'
 
@@ -32,7 +30,7 @@ export interface SystemIssue {
   /** Стабильный ID — для key и dedup. */
   id: string
   severity: IssueSeverity
-  source: 'moysklad' | 'inventory' | 'shift' | 'logs' | 'fiscalize' | 'printer'
+  source: 'moysklad' | 'inventory' | 'logs' | 'fiscalize' | 'printer'
   title: string
   detail?: string
   /** Куда вести при клике — путь внутри SPA или anchor. */
@@ -75,15 +73,31 @@ async function collectIssues(): Promise<SystemIssue[]> {
 /** Проверки которые есть только во время рендера (через хуки). */
 function buildIssuesFromState(opts: {
   poller: PollerStatus | null
-  shift: ShiftStatus
+  /** Выбраны ли склад и статус отгрузок. null — ещё не прочитали. */
+  demandConfigured: boolean | null
   sseStatus: 'connected' | 'disconnected' | 'connecting' | 'idle'
   remoteEnabled: boolean
   testMode: boolean
 }): SystemIssue[] {
   const issues: SystemIssue[] = []
 
+  // ── Настройка отгрузок ────────────────────────────────────────────
+  // Пока склад и статус не выбраны, опрос стоит. Это не сбой связи, а
+  // недоделанная настройка — показываем отдельно и с понятным действием,
+  // а не как «ошибку опроса».
+  if (opts.demandConfigured === false) {
+    issues.push({
+      id: 'moysklad.demand-config',
+      severity: 'error',
+      source: 'moysklad',
+      title: 'Не выбраны склад и статус отгрузок',
+      detail: 'Касса не видит отгрузки, пока их не выбрать',
+      action: { label: 'Открыть Настройки', href: '/settings' },
+    })
+  }
+
   // ── Poller ────────────────────────────────────────────────────────
-  if (opts.poller) {
+  if (opts.poller && opts.demandConfigured !== false) {
     if (opts.poller.lastError) {
       issues.push({
         id: 'moysklad.poller-error',
@@ -102,26 +116,6 @@ function buildIssuesFromState(opts: {
         action: { label: 'Открыть Кассу', href: '/' },
       })
     }
-  }
-
-  // ── Shift ─────────────────────────────────────────────────────────
-  if (opts.shift.ready && !opts.shift.shiftId) {
-    issues.push({
-      id: 'shift.closed',
-      severity: 'warning',
-      source: 'shift',
-      title: 'Смена закрыта в МойСклад',
-      detail: 'Откройте смену в МС-кассе чтобы пробивать чеки',
-    })
-  }
-  if (opts.shift.lastError) {
-    issues.push({
-      id: 'shift.error',
-      severity: 'warning',
-      source: 'shift',
-      title: 'Не удалось получить статус смены',
-      detail: opts.shift.lastError.slice(0, 120),
-    })
   }
 
   // ── Inventory SSE ─────────────────────────────────────────────────
@@ -168,7 +162,7 @@ function buildIssuesFromState(opts: {
  */
 export function useSystemStatus(): SystemStatusSummary {
   const [poller, setPoller] = useState<PollerStatus | null>(null)
-  const [shift, setShift] = useState<ShiftStatus>(getShiftStatus())
+  const [demandConfigured, setDemandConfigured] = useState<boolean | null>(null)
   const [sseStatus, setSseStatus] = useState<
     'connected' | 'disconnected' | 'connecting' | 'idle'
   >('idle')
@@ -182,22 +176,19 @@ export function useSystemStatus(): SystemStatusSummary {
     return () => unsub()
   }, [])
 
-  // Shift — опрашиваем cached state раз в 2 секунды (дёшево)
-  useEffect(() => {
-    const t = setInterval(() => setShift(getShiftStatus()), 2000)
-    return () => clearInterval(t)
-  }, [])
-
-  // SSE + settings (testMode, remoteEnabled) — раз в 3 секунды
+  // SSE + settings (testMode, remoteEnabled, склад и статус) — раз в 3 секунды
   useEffect(() => {
     let cancelled = false
     const refresh = async () => {
-      const [tm, re] = await Promise.all([
+      const [tm, re, storeId, stateId] = await Promise.all([
         getSetting(SettingKey.TestMode),
         getSetting(SettingKey.InventoryRemoteEnabled),
+        getSetting(SettingKey.MoyskladStoreId),
+        getSetting(SettingKey.MoyskladDemandStateId),
       ])
       if (cancelled) return
       setTestMode(tm === 'true')
+      setDemandConfigured(!!storeId && !!stateId)
       setRemoteEnabled(re === 'true')
       setSseStatus(getInventorySseStatus())
     }
@@ -226,7 +217,7 @@ export function useSystemStatus(): SystemStatusSummary {
 
   const stateIssues = buildIssuesFromState({
     poller,
-    shift,
+    demandConfigured,
     sseStatus,
     remoteEnabled,
     testMode,

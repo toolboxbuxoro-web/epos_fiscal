@@ -2,21 +2,28 @@ import { useEffect, useState } from 'react'
 import { formatErrorForUser } from '@/lib/error-message'
 import { getAllSettings, setSetting, setSettings, SettingKey } from '@/lib/db'
 import {
-  makeBasicCredentials,
+  DEMAND_SYNC_KEY,
   MoyskladClient,
   MoyskladError,
+  parseAccountMapping,
+  type AccountMapping,
   type MsEmployee,
-  type MsRetailStore,
+  type MsOrganizationAccount,
+  type MsState,
+  type MsStore,
+  type PaymentKind,
 } from '@/lib/moysklad'
 import { JsonRpcEposClient, FiscalDriveClient } from '@/lib/epos'
 import { applyUpdate, checkForUpdate } from '@/lib/updater'
 import { log } from '@/lib/log'
 import {
+  getInventoryClient,
   getInventorySseStatus,
   InventoryServerClient,
   syncFromServer,
   syncShopConfig,
 } from '@/lib/inventory'
+import { pollMoyskladNow } from '@/lib/poller-runtime'
 import { AdminUnlockModal } from '@/components/AdminUnlockModal'
 import { lockDevMode, useRuntimeDevUnlocked } from '@/lib/dev-mode'
 import { ShieldCheck, Lock as LockIcon, Unlock } from 'lucide-react'
@@ -32,13 +39,15 @@ import { toast } from '@/components/ui'
 import { MIN_MARKUP_PERCENT } from '@/lib/matcher/strategies'
 
 interface FormState {
-  // МойСклад логин
+  // МойСклад: логин и доступ приходят с сервера при входе по коду
   moyskladLogin: string
-  moyskladPassword: string
-  // МойСклад данные после логина (Basic credentials в base64)
+  // Basic credentials в base64
   moyskladCredentials: string
-  moyskladRetailStoreId: string
-  moyskladRetailStoreName: string
+  // Что пробивает касса: отгрузки с этого склада в этом статусе
+  moyskladStoreId: string
+  moyskladStoreName: string
+  moyskladDemandStateId: string
+  moyskladDemandStateName: string
   moyskladEmployeeId: string
   moyskladEmployeeName: string
   // Опрос
@@ -83,10 +92,11 @@ interface FormState {
 
 const empty: FormState = {
   moyskladLogin: '',
-  moyskladPassword: '',
   moyskladCredentials: '',
-  moyskladRetailStoreId: '',
-  moyskladRetailStoreName: '',
+  moyskladStoreId: '',
+  moyskladStoreName: '',
+  moyskladDemandStateId: '',
+  moyskladDemandStateName: '',
   moyskladEmployeeId: '',
   moyskladEmployeeName: '',
   moyskladPollInterval: '30',
@@ -119,14 +129,23 @@ const empty: FormState = {
   telemetryEnabled: 'true',
 }
 
+/** Подпись счёта для людей: банк, номер и юрлицо. Хранится в привязке. */
+function accountLabel(acc: MsOrganizationAccount & { organizationName: string }): string {
+  return [acc.bankName, acc.accountNumber, acc.organizationName].filter(Boolean).join(' · ')
+}
+
 export default function Settings() {
   const [form, setForm] = useState<FormState>(empty)
   const [busy, setBusy] = useState(false)
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [authError, setAuthError] = useState<string | null>(null)
-  const [authBusy, setAuthBusy] = useState(false)
-  const [stores, setStores] = useState<MsRetailStore[]>([])
+  const [stores, setStores] = useState<MsStore[]>([])
+  const [demandStates, setDemandStates] = useState<MsState[]>([])
+  const [orgAccounts, setOrgAccounts] = useState<Array<MsOrganizationAccount & { organizationName: string }>>([])
+  const [accountMapping, setAccountMapping] = useState<AccountMapping>({})
+  /** Что вышло с отправкой выбора на сервер — показать рядом с полями. */
+  const [demandSyncMsg, setDemandSyncMsg] = useState<string | null>(null)
   const [employees, setEmployees] = useState<MsEmployee[]>([])
   const [eposTest, setEposTest] = useState<string>('')
   const [updateMsg, setUpdateMsg] = useState<string>('')
@@ -195,8 +214,10 @@ export default function Settings() {
       ...f,
       moyskladLogin: all[SettingKey.MoyskladLogin] ?? '',
       moyskladCredentials: all[SettingKey.MoyskladCredentials] ?? '',
-      moyskladRetailStoreId: all[SettingKey.MoyskladRetailStoreId] ?? '',
-      moyskladRetailStoreName: all[SettingKey.MoyskladRetailStoreName] ?? '',
+      moyskladStoreId: all[SettingKey.MoyskladStoreId] ?? '',
+      moyskladStoreName: all[SettingKey.MoyskladStoreName] ?? '',
+      moyskladDemandStateId: all[SettingKey.MoyskladDemandStateId] ?? '',
+      moyskladDemandStateName: all[SettingKey.MoyskladDemandStateName] ?? '',
       moyskladEmployeeId: all[SettingKey.MoyskladEmployeeId] ?? '',
       moyskladEmployeeName: all[SettingKey.MoyskladEmployeeName] ?? '',
       moyskladPollInterval: all[SettingKey.MoyskladPollIntervalSec] ?? '30',
@@ -239,6 +260,7 @@ export default function Settings() {
         | 'true'
         | 'false',
     }))
+    setAccountMapping(parseAccountMapping(all[SettingKey.MoyskladPaymentAccounts]))
     // если уже есть credentials — подгрузим списки
     const creds = all[SettingKey.MoyskladCredentials]
     if (creds) {
@@ -254,84 +276,87 @@ export default function Settings() {
   async function loadDirectories(basic: string) {
     try {
       const client = new MoyskladClient({ basic })
-      const [s, e] = await Promise.all([
-        client.listRetailStores(),
+      const [st, dst, acc, e] = await Promise.all([
+        client.listStores(),
+        client.listDemandStates(),
+        client.listOrganizationAccounts(),
         client.listEmployees(),
       ])
-      setStores(s)
+      setStores(st)
+      setDemandStates(dst)
+      setOrgAccounts(acc)
       setEmployees(e)
     } catch (err) {
       if (err instanceof MoyskladError && err.status === 401) {
-        setAuthError('Сессия недействительна, войдите снова')
+        setAuthError('Доступ к МойСклад недействителен — подключите кассу заново по коду')
       }
     }
   }
 
-  async function signIn() {
-    setAuthBusy(true)
-    setAuthError(null)
+  /**
+   * Отправить выбор кассы на сервер. Локально он уже сохранён и работает;
+   * сервер нужен, чтобы после переустановки касса получила его обратно, а
+   * админ видел настройку. Нет связи — не страшно, но сказать об этом надо.
+   */
+  async function pushDemandConfig(patch: Parameters<InventoryServerClient['updateShopDemandConfig']>[0]) {
     try {
-      const basic = makeBasicCredentials(form.moyskladLogin, form.moyskladPassword)
-      // Проверяем credentials через GET /context/employee — если 401,
-      // выкинет MoyskladError с понятным сообщением.
-      const client = new MoyskladClient({ basic })
-      await client.getMe()
-      // Сохраняем — пароль уже зашит в base64-строку,
-      // отдельно plaintext-пароль не храним.
-      await setSettings({
-        [SettingKey.MoyskladCredentials]: basic,
-        [SettingKey.MoyskladLogin]: form.moyskladLogin,
-      })
-      setForm((f) => ({
-        ...f,
-        moyskladCredentials: basic,
-        moyskladPassword: '',
-      }))
-      await loadDirectories(basic)
+      const client = await getInventoryClient()
+      if (!client) return
+      await client.updateShopDemandConfig(patch)
+      setDemandSyncMsg(null)
     } catch (e) {
-      const msg =
-        e instanceof MoyskladError && e.status === 401
-          ? 'Неверный логин или пароль'
-          : e instanceof Error
-            ? e.message
-            : String(e)
-      setAuthError(msg)
-    } finally {
-      setAuthBusy(false)
+      const msg = e instanceof Error ? e.message : String(e)
+      setDemandSyncMsg(`Сохранено на кассе, но не на сервере: ${msg}`)
+      void log.warn('inventory.sync', 'Выбор склада/статуса/счетов не ушёл на сервер', { error: msg })
     }
   }
 
-  async function signOut() {
-    await setSettings({
-      [SettingKey.MoyskladCredentials]: '',
-      [SettingKey.MoyskladToken]: '',
-      [SettingKey.MoyskladLogin]: '',
-      [SettingKey.MoyskladRetailStoreId]: '',
-      [SettingKey.MoyskladRetailStoreName]: '',
-      [SettingKey.MoyskladEmployeeId]: '',
-      [SettingKey.MoyskladEmployeeName]: '',
-    })
-    setForm((f) => ({
-      ...f,
-      moyskladCredentials: '',
-      moyskladLogin: '',
-      moyskladRetailStoreId: '',
-      moyskladRetailStoreName: '',
-      moyskladEmployeeId: '',
-      moyskladEmployeeName: '',
-    }))
-    setStores([])
-    setEmployees([])
+  /**
+   * Склад или статус сменились: сбрасываем курсор опроса, чтобы новый
+   * фильтр прошёл по последним суткам, и сразу опрашиваем МойСклад —
+   * кассир увидит очередь, не дожидаясь следующего тика.
+   */
+  async function applyDemandFilter(updates: Record<string, string>) {
+    await setSettings({ ...updates, [DEMAND_SYNC_KEY as never]: '' })
+    void pollMoyskladNow().catch(() => {})
   }
 
   async function pickStore(id: string) {
-    const s = stores.find((x) => x.id === id)
-    setField('moyskladRetailStoreId', id)
-    setField('moyskladRetailStoreName', s?.name ?? '')
-    await setSettings({
-      [SettingKey.MoyskladRetailStoreId]: id,
-      [SettingKey.MoyskladRetailStoreName]: s?.name ?? '',
+    const st = stores.find((x) => x.id === id)
+    setField('moyskladStoreId', id)
+    setField('moyskladStoreName', st?.name ?? '')
+    await applyDemandFilter({
+      [SettingKey.MoyskladStoreId]: id,
+      [SettingKey.MoyskladStoreName]: st?.name ?? '',
     })
+    await pushDemandConfig({ store_id: id || null, store_name: st?.name ?? null })
+  }
+
+  async function pickDemandState(id: string) {
+    const st = demandStates.find((x) => x.id === id)
+    setField('moyskladDemandStateId', id)
+    setField('moyskladDemandStateName', st?.name ?? '')
+    await applyDemandFilter({
+      [SettingKey.MoyskladDemandStateId]: id,
+      [SettingKey.MoyskladDemandStateName]: st?.name ?? '',
+    })
+    await pushDemandConfig({ demand_state_id: id || null, demand_state_name: st?.name ?? null })
+  }
+
+  /** Привязать расчётный счёт к типу оплаты. Пустое значение — снять привязку. */
+  async function setAccountType(accountId: string, type: PaymentKind | '') {
+    const acc = orgAccounts.find((a) => a.id === accountId)
+    const next: AccountMapping = { ...accountMapping }
+    const key = accountId.toLowerCase()
+    if (type) {
+      const label = acc ? accountLabel(acc) : undefined
+      next[key] = label ? { type, label } : { type }
+    } else {
+      delete next[key]
+    }
+    setAccountMapping(next)
+    await setSetting(SettingKey.MoyskladPaymentAccounts, JSON.stringify(next))
+    await pushDemandConfig({ payment_accounts: next })
   }
 
   async function pickEmployee(id: string) {
@@ -702,110 +727,81 @@ export default function Settings() {
       </Section>
 
       <Section title="МойСклад">
-        {true && (
-          <div className="col-span-1 md:col-span-2 rounded-md bg-canvas border border-border p-3 text-xs text-ink-muted">
-            🔒 Настройки управляются админом mytoolbox (поля только для чтения).
-            Чтобы изменить — попроси админа обновить привязку магазина к МС-аккаунту,
-            затем нажми <strong>«Перечитать настройки от админа»</strong> в секции выше.
-          </div>
-        )}
+        <div className="col-span-1 md:col-span-2 rounded-md bg-canvas border border-border p-3 text-xs text-ink-muted">
+          Доступ к МойСклад и кассира задаёт администратор, касса получает их при входе по коду.
+          Склад, статус и счета оплаты выбираются здесь: касса пробивает только отгрузки с этого
+          склада в этом статусе, а тип оплаты берёт из входящих платежей по привязке счетов.
+        </div>
         {!isAuthenticated ? (
-          <>
-            <Field label="Email или логин">
-              <Input
-                value={form.moyskladLogin}
-                onChange={(e) => setField('moyskladLogin', e.target.value)}
-                placeholder="user@example.com"
-                autoComplete="username"
-                disabled={true}
-              />
-            </Field>
-            <Field label="Пароль">
-              <Input
-                type="password"
-                value={form.moyskladPassword}
-                onChange={(e) => setField('moyskladPassword', e.target.value)}
-                placeholder="••••••••"
-                autoComplete="current-password"
-                disabled={true}
-              />
-            </Field>
-            <div className="col-span-1 md:col-span-2 flex items-center gap-3">
-              <Button
-                variant="primary"
-                disabled={
-                  authBusy ||
-                  !form.moyskladLogin ||
-                  !form.moyskladPassword ||
-                  true
-                }
-                onClick={signIn}
-              >
-                {authBusy ? 'Вход…' : 'Войти в МойСклад'}
-              </Button>
-              {authError && (
-                <span className="text-sm text-danger">{authError}</span>
-              )}
-            </div>
-          </>
+          <div className="col-span-1 md:col-span-2 rounded-md bg-warning-soft p-3 text-sm text-warning">
+            Касса не подключена к МойСклад. Выйдите и войдите заново по коду подключения из админки.
+          </div>
         ) : (
           <>
             <div className="col-span-1 md:col-span-2 flex items-center justify-between rounded-md bg-success-soft p-3 text-sm">
               <div>
-                <span className="text-success">Залогинен как</span>{' '}
+                <span className="text-success">Подключено к МойСклад как</span>{' '}
                 <span className="font-medium">{form.moyskladLogin || 'пользователь'}</span>
               </div>
-              {false && (
-                <Button variant="ghost" size="sm" onClick={signOut}>
-                  Выйти
-                </Button>
-              )}
+              {authError && <span className="text-sm text-danger">{authError}</span>}
             </div>
 
-            <Field label="Точка продаж">
-              <Select
-                value={form.moyskladRetailStoreId}
-                onChange={(e) => void pickStore(e.target.value)}
-                disabled={true}
-              >
-                <option value="">— выберите —</option>
-                {stores.map((s) => (
-                  <option key={s.id} value={s.id}>
-                    {s.name}
+            <Field label="Склад, с которого пробивать отгрузки">
+              <Select value={form.moyskladStoreId} onChange={(e) => void pickStore(e.target.value)}>
+                <option value="">— выберите склад —</option>
+                {stores.map((st) => (
+                  <option key={st.id} value={st.id}>
+                    {st.name}
                   </option>
                 ))}
-                {/* Если remote — точка может быть установлена админом без подгрузки списка stores. */}
-                {true &&
-                  form.moyskladRetailStoreId &&
-                  !stores.some((s) => s.id === form.moyskladRetailStoreId) && (
-                    <option value={form.moyskladRetailStoreId}>
-                      {form.moyskladRetailStoreName || form.moyskladRetailStoreId}
+                {/* Склад выбран, но список ещё не подгрузился или склад в архиве. */}
+                {form.moyskladStoreId && !stores.some((st) => st.id === form.moyskladStoreId) && (
+                  <option value={form.moyskladStoreId}>
+                    {form.moyskladStoreName || form.moyskladStoreId}
+                  </option>
+                )}
+              </Select>
+            </Field>
+            <Field label="Статус отгрузки, в котором её пора пробивать">
+              <Select
+                value={form.moyskladDemandStateId}
+                onChange={(e) => void pickDemandState(e.target.value)}
+              >
+                <option value="">— выберите статус —</option>
+                {demandStates.map((st) => (
+                  <option key={st.id} value={st.id}>
+                    {st.name}
+                  </option>
+                ))}
+                {form.moyskladDemandStateId &&
+                  !demandStates.some((st) => st.id === form.moyskladDemandStateId) && (
+                    <option value={form.moyskladDemandStateId}>
+                      {form.moyskladDemandStateName || form.moyskladDemandStateId}
                     </option>
                   )}
               </Select>
             </Field>
+            {(!form.moyskladStoreId || !form.moyskladDemandStateId) && (
+              <div className="col-span-1 md:col-span-2 rounded-md bg-warning-soft p-3 text-xs text-warning">
+                Пока склад и статус не выбраны, касса не видит отгрузки и ничего не пробивает.
+              </div>
+            )}
+
             <Field label="Кассир (ФИО для чека)">
-              <Select
-                value={form.moyskladEmployeeId}
-                onChange={(e) => void pickEmployee(e.target.value)}
-                disabled={true}
-              >
-                <option value="">— выберите —</option>
+              <Select value={form.moyskladEmployeeId} onChange={(e) => void pickEmployee(e.target.value)} disabled={true}>
+                <option value="">— задаёт администратор —</option>
                 {employees.map((e) => (
                   <option key={e.id} value={e.id}>
                     {e.shortFio ?? e.fullName ?? e.name}
                   </option>
                 ))}
-                {true &&
-                  form.moyskladEmployeeId &&
-                  !employees.some((e) => e.id === form.moyskladEmployeeId) && (
-                    <option value={form.moyskladEmployeeId}>
-                      {form.moyskladEmployeeName || form.moyskladEmployeeId}
-                    </option>
-                  )}
+                {form.moyskladEmployeeId && !employees.some((e) => e.id === form.moyskladEmployeeId) && (
+                  <option value={form.moyskladEmployeeId}>
+                    {form.moyskladEmployeeName || form.moyskladEmployeeId}
+                  </option>
+                )}
               </Select>
             </Field>
-
             <Field label="Интервал опроса, сек">
               <Input
                 type="number"
@@ -817,6 +813,47 @@ export default function Settings() {
                 }}
               />
             </Field>
+
+            {/* Счета оплаты. У отгрузки нет разбивки «наличные / карта»: тип
+                оплаты входящего платежа определяется по расчётному счёту, на
+                который пришли деньги. Счёт без привязки блокирует чек —
+                угадывать нельзя, в ОФД уйдёт неверный тип оплаты. */}
+            <div className="col-span-1 md:col-span-2 space-y-2">
+              <div className="text-sm font-medium text-ink">Счета оплаты</div>
+              <div className="text-xs text-ink-muted">
+                Как считать поступления на каждый расчётный счёт. Приходный кассовый ордер всегда
+                наличные. «Мимо ОФД» — Click, Payme и всё, что в фискальный чек не входит.
+              </div>
+              {orgAccounts.length === 0 ? (
+                <div className="text-xs text-ink-subtle">
+                  Счета юрлиц не загрузились. Проверьте связь с МойСклад и откройте Настройки снова.
+                </div>
+              ) : (
+                <div className="divide-y divide-border rounded-md border border-border">
+                  {orgAccounts.map((acc) => (
+                    <div key={acc.id} className="flex flex-wrap items-center justify-between gap-3 px-3 py-2">
+                      <div className="text-sm">
+                        <div className="text-ink">
+                          {acc.bankName || 'Банк не указан'} · <span className="font-mono">{acc.accountNumber}</span>
+                        </div>
+                        <div className="text-xs text-ink-muted">{acc.organizationName}</div>
+                      </div>
+                      <Select
+                        className="w-56"
+                        value={accountMapping[acc.id.toLowerCase()]?.type ?? ''}
+                        onChange={(e) => void setAccountType(acc.id, e.target.value as PaymentKind | '')}
+                      >
+                        <option value="">— не привязан —</option>
+                        <option value="card">Карта</option>
+                        <option value="cash">Наличные</option>
+                        <option value="exclude">Мимо ОФД (Click, Payme)</option>
+                      </Select>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {demandSyncMsg && <div className="text-xs text-warning">{demandSyncMsg}</div>}
+            </div>
           </>
         )}
       </Section>

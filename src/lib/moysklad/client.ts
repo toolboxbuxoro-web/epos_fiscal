@@ -1,12 +1,17 @@
 import { fetch } from '@tauri-apps/plugin-http'
 import {
   formatMsMoment,
+  type MsDemand,
   type MsEmployee,
   type MsListResponse,
   type MsCurrency,
+  type MsOrganization,
+  type MsOrganizationAccount,
+  type MsPaymentDocument,
   type MsRetailDemand,
-  type MsRetailShift,
-  type MsRetailStore,
+  type MsSaleDocument,
+  type MsState,
+  type MsStore,
   type MsVariant,
 } from './types'
 
@@ -97,60 +102,119 @@ export class MoyskladClient {
     return body as T
   }
 
-  // ── retaildemand ────────────────────────────────────────────
+  // ── Отгрузки ────────────────────────────────────────────────
 
   /**
-   * Получить розничные продажи, обновлённые с указанного момента.
-   * Идеально для поллинга: передаём lastSync, получаем только новые/изменённые.
+   * Отгрузки со склада кассы в выбранном статусе, изменённые после момента.
+   * Для опроса: передаём курсор, получаем только новые и изменённые.
+   *
+   * Статус — это и есть сигнал «пробить»: отгрузка попадает в очередь, когда
+   * её переводят в нужный статус (смена статуса двигает `updated`, поэтому
+   * курсор её не пропустит). Склад отсекает чужие магазины: иначе касса
+   * попыталась бы пробить отгрузку другого магазина через свою USB-карту.
    *
    * @param updatedFrom — epoch секунды
-   * @param retailStoreId — UUID точки продаж. Если задан, поллер видит только
-   *   чеки этой точки (важно для multi-shop: каждый магазин ставит свой
-   *   retailStoreId, чтобы не пытаться фискализировать чужие чеки через
-   *   свою USB-карту).
-   * @param limit — максимум **100** за запрос (см. ограничение МС API ниже).
+   * @param limit — максимум **100** за запрос.
    *
-   * ⚠️ МС API: expand разрешён только при `limit ≤ 100`. Если передать
-   * больше — expand молча проигнорируется, и `positions.assortment` придёт
-   * как `meta-reference` (без inline-данных: name/attributes/characteristics).
-   * Тогда matcher не получит ни ИКПУ, ни «Бухгалтерское наименование», и
-   * каждая позиция fallback'нется на price-bucket с худшей точностью.
-   * Поэтому жёстко клампим в 100. Если когда-то накопится >100 чеков (после
-   * простоя/сбоя) — poller итерирует через `updatedFrom` за несколько
-   * проходов, по 100 за раз.
+   * ⚠️ МС API: expand работает только при `limit ≤ 100`. Больше — expand
+   * молча игнорируется, позиции придут ссылками без названий и ИКПУ, и
+   * подбор скатится на худшую стратегию. Поэтому жёстко клампим в 100:
+   * если накопилось больше (после простоя), опрос догонит за несколько
+   * проходов по курсору.
    */
-  async listRecentRetailDemands(
+  async listRecentDemands(
     updatedFrom: number,
-    retailStoreId?: string | null,
+    storeId: string,
+    stateId: string,
     limit = 100,
-  ): Promise<MsRetailDemand[]> {
+  ): Promise<MsDemand[]> {
     const params = new URLSearchParams()
     // Фильтры МойСклад API объединяются через `;` в одном параметре `filter`.
-    const filters = [`updated>${formatMsMoment(updatedFrom)}`]
-    if (retailStoreId) {
-      filters.push(
-        `retailStore=https://api.moysklad.ru/api/remap/1.2/entity/retailstore/${retailStoreId}`,
-      )
-    }
-    params.set('filter', filters.join(';'))
+    params.set(
+      'filter',
+      [
+        `updated>${formatMsMoment(updatedFrom)}`,
+        `store=${BASE_URL}/entity/store/${storeId}`,
+        `state=${BASE_URL}/entity/demand/metadata/states/${stateId}`,
+      ].join(';'),
+    )
     params.set('order', 'updated,asc')
-    // ВАЖНО: клампим в 100 чтобы expand работал. См. comment выше.
     params.set('limit', String(Math.min(limit, 100)))
     params.set('expand', 'positions.assortment')
 
-    const res = await this.request<MsListResponse<MsRetailDemand>>(
-      `/entity/retaildemand?${params.toString()}`,
-    )
+    const res = await this.request<MsListResponse<MsDemand>>(`/entity/demand?${params.toString()}`)
     return res.rows
   }
 
-  /** Получить одну розничную продажу по UUID. */
+  /** Одна отгрузка по UUID с позициями. */
+  async getDemand(id: string, expand = 'positions.assortment'): Promise<MsDemand> {
+    const params = new URLSearchParams()
+    if (expand) params.set('expand', expand)
+    return this.request<MsDemand>(`/entity/demand/${id}?${params.toString()}`)
+  }
+
+  /**
+   * Розничная продажа по UUID. Розницы больше нет, но старые чеки в базе
+   * кассы — розничные, и позиции у них дотягиваются этим запросом.
+   */
   async getRetailDemand(id: string, expand = 'positions.assortment'): Promise<MsRetailDemand> {
     const params = new URLSearchParams()
     if (expand) params.set('expand', expand)
-    return this.request<MsRetailDemand>(
-      `/entity/retaildemand/${id}?${params.toString()}`,
+    return this.request<MsRetailDemand>(`/entity/retaildemand/${id}?${params.toString()}`)
+  }
+
+  /**
+   * Дотянуть документ продажи с позициями, каким бы он ни был: отгрузка
+   * или старая розничная продажа. Тип берём из `meta.type` сохранённого
+   * документа.
+   */
+  async getSaleDocument(doc: Pick<MsSaleDocument, 'id' | 'meta'>): Promise<MsSaleDocument> {
+    return doc.meta?.type === 'retaildemand' ? this.getRetailDemand(doc.id) : this.getDemand(doc.id)
+  }
+
+  /**
+   * Платежи, связанные с отгрузкой: приходные ордера и входящие платежи.
+   *
+   * В отгрузке лежат только ссылки, поэтому каждый платёж дотягиваем
+   * отдельно — обычно их один-два. Нужны они целиком: сумма, отнесённая
+   * именно к этой отгрузке, и расчётный счёт, по которому понятно, карта
+   * это или наличные.
+   */
+  async listDemandPayments(demand: Pick<MsDemand, 'payments'>): Promise<MsPaymentDocument[]> {
+    const refs = demand.payments ?? []
+    return Promise.all(refs.map((ref) => this.request<MsPaymentDocument>(ref.meta.href)))
+  }
+
+  // ── Справочники для настройки кассы ─────────────────────────
+
+  /** Склады аккаунта, без архивных. */
+  async listStores(): Promise<MsStore[]> {
+    const res = await this.request<MsListResponse<MsStore>>('/entity/store?limit=1000')
+    return res.rows.filter((s) => s.archived !== true)
+  }
+
+  /** Статусы отгрузок, как их завели в МойСклад. */
+  async listDemandStates(): Promise<MsState[]> {
+    const res = await this.request<{ states?: MsState[] }>('/entity/demand/metadata')
+    return res.states ?? []
+  }
+
+  /**
+   * Расчётные счета всех юрлиц аккаунта — чтобы привязать каждый к типу
+   * оплаты. Название юрлица прикладываем: у разных юрлиц бывают счета в
+   * одном банке, и без него их не различить.
+   */
+  async listOrganizationAccounts(): Promise<Array<MsOrganizationAccount & { organizationName: string }>> {
+    const res = await this.request<MsListResponse<MsOrganization>>(
+      '/entity/organization?expand=accounts&limit=100',
     )
+    const out: Array<MsOrganizationAccount & { organizationName: string }> = []
+    for (const org of res.rows) {
+      if (org.archived === true) continue
+      const accounts = org.accounts && 'rows' in org.accounts ? org.accounts.rows : []
+      for (const acc of accounts) out.push({ ...acc, organizationName: org.name })
+    }
+    return out
   }
 
   /**
@@ -178,7 +242,6 @@ export class MoyskladClient {
     return this.request<MsEmployee>('/context/employee')
   }
 
-  /** Получить активные торговые точки. */
   /**
    * Справочник валют аккаунта.
    *
@@ -194,71 +257,11 @@ export class MoyskladClient {
     return res.rows
   }
 
-  async listRetailStores(): Promise<MsRetailStore[]> {
-    const res = await this.request<MsListResponse<MsRetailStore>>(
-      '/entity/retailstore?limit=100',
-    )
-    return res.rows.filter((s) => s.archived !== true)
-  }
-
   /** Получить активных сотрудников (кассиров). */
   async listEmployees(): Promise<MsEmployee[]> {
     const res = await this.request<MsListResponse<MsEmployee>>(
       '/entity/employee?limit=200',
     )
     return res.rows.filter((e) => e.archived !== true)
-  }
-
-  /**
-   * Получить АКТИВНУЮ розничную смену указанной точки продаж.
-   *
-   *   filter=retailStore=<href>;closeDate=null
-   *
-   * Возвращает первую найденную (если их вдруг несколько — берём самую свежую).
-   * null = нет открытой смены сейчас.
-   */
-  async getActiveShift(retailStoreId: string): Promise<MsRetailShift | null> {
-    const params = new URLSearchParams()
-    params.set(
-      'filter',
-      [
-        `retailStore=https://api.moysklad.ru/api/remap/1.2/entity/retailstore/${retailStoreId}`,
-        'closeDate=', // closeDate IS NULL — синтаксис МС
-      ].join(';'),
-    )
-    params.set('order', 'created,desc')
-    params.set('limit', '1')
-    const res = await this.request<MsListResponse<MsRetailShift>>(
-      `/entity/retailshift?${params.toString()}`,
-    )
-    return res.rows[0] ?? null
-  }
-
-  /**
-   * Получить розничные продажи КОНКРЕТНОЙ смены.
-   *
-   * Используется при включённом «фильтре по смене»: вместо `updated>cursor`
-   * подтягиваем чеки точно этой retailShift. Эффективно для дашборда смены.
-   *
-   * ⚠️ Лимит ≤100 (см. `listRecentRetailDemands` про expand-лимит МС API).
-   * Если в смене >100 чеков — нужно paginate'ить через `offset`.
-   */
-  async listShiftReceipts(
-    retailShiftId: string,
-    limit = 100,
-  ): Promise<MsRetailDemand[]> {
-    const params = new URLSearchParams()
-    params.set(
-      'filter',
-      `retailShift=https://api.moysklad.ru/api/remap/1.2/entity/retailshift/${retailShiftId}`,
-    )
-    params.set('order', 'moment,desc')
-    params.set('limit', String(Math.min(limit, 100)))
-    params.set('expand', 'positions.assortment')
-
-    const res = await this.request<MsListResponse<MsRetailDemand>>(
-      `/entity/retaildemand?${params.toString()}`,
-    )
-    return res.rows
   }
 }

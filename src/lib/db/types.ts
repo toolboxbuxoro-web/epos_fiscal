@@ -31,10 +31,34 @@ export const SettingKey = {
   MoyskladCredentials: 'moysklad.credentials',
   /** Email/логин текущего залогиненного пользователя МойСклад (для UI). */
   MoyskladLogin: 'moysklad.login',
-  /** ID выбранной точки продаж МойСклад. */
+  /**
+   * ID точки продаж МойСклад — от розницы. Розницы больше нет, касса
+   * пробивает отгрузки; ключ остаётся, чтобы выход из программы и старые
+   * записи не спотыкались о неизвестную настройку.
+   */
   MoyskladRetailStoreId: 'moysklad.retailstore_id',
-  /** Имя выбранной точки продаж (для UI). */
+  /** Имя точки продаж — от розницы, см. выше. */
   MoyskladRetailStoreName: 'moysklad.retailstore_name',
+  /**
+   * Склад, с которого касса пробивает отгрузки. Без него опрос не идёт:
+   * иначе касса увидела бы отгрузки чужих магазинов и попыталась пробить
+   * их через свою USB-карту.
+   */
+  MoyskladStoreId: 'moysklad.store_id',
+  MoyskladStoreName: 'moysklad.store_name',
+  /**
+   * Статус отгрузки, в котором её пора пробивать. Касса видит только
+   * отгрузки в этом статусе — это и есть сигнал «можно фискализировать».
+   */
+  MoyskladDemandStateId: 'moysklad.demand_state_id',
+  MoyskladDemandStateName: 'moysklad.demand_state_name',
+  /**
+   * Привязка расчётных счетов к типу оплаты, JSON:
+   * `{ "<id счёта>": { "type": "cash" | "card" | "exclude", "label": "…" } }`.
+   * По ней входящий платёж по отгрузке превращается в наличные, карту или
+   * «мимо ОФД» (Click, Payme). См. `moysklad/demand-payment.ts`.
+   */
+  MoyskladPaymentAccounts: 'moysklad.payment_accounts',
   /** ID выбранного кассира. */
   MoyskladEmployeeId: 'moysklad.employee_id',
   /** ФИО кассира (печатается в `staffName` чека EPOS). */

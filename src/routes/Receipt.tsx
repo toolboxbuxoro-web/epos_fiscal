@@ -46,7 +46,14 @@ import {
   enrichWithVariants,
   getCachedVariants,
   inlinePositions,
-  type MsRetailDemand,
+  isRetailDocument,
+  parseAccountMapping,
+  paymentFromDemand,
+  paymentFromRetail,
+  paymentUnavailable,
+  type DocumentPayment,
+  type MsDemand,
+  type MsSaleDocument,
 } from '@/lib/moysklad'
 import { log } from '@/lib/log'
 import { formatErrorForUser } from '@/lib/error-message'
@@ -65,6 +72,32 @@ import {
   tiyinToSumDisplayPrecise,
 } from '@/lib/format'
 import { cn } from '@/lib/cn'
+
+/**
+ * Оплата документа для экрана чека.
+ *
+ * Старая розничная продажа несёт разбивку в себе. Для отгрузки дотягиваем
+ * связанные платежи и раскладываем их по привязке счетов из настроек. Если
+ * МойСклад не ответил — не падаем: экран откроется, а пробивать не даст,
+ * пока платежи не получены (угадывать тип оплаты нельзя).
+ */
+async function loadDocumentPayment(
+  doc: MsSaleDocument,
+  msClient: MoyskladClient | null,
+): Promise<DocumentPayment> {
+  if (isRetailDocument(doc)) return paymentFromRetail(doc)
+  if (!msClient) return paymentUnavailable(doc, 'Нет доступа к МойСклад — подключите кассу заново')
+  try {
+    const [docs, mappingRaw, stateId] = await Promise.all([
+      msClient.listDemandPayments(doc as MsDemand),
+      getSetting(SettingKey.MoyskladPaymentAccounts),
+      getSetting(SettingKey.MoyskladDemandStateId),
+    ])
+    return paymentFromDemand(doc as MsDemand, docs, parseAccountMapping(mappingRaw), stateId || null)
+  } catch (e) {
+    return paymentUnavailable(doc, formatErrorForUser(e))
+  }
+}
 
 export default function Receipt() {
   const { id } = useParams<{ id: string }>()
@@ -129,28 +162,28 @@ export default function Receipt() {
    */
   const [cardKindModal, setCardKindModal] = useState(false)
   /**
-   * Сумма (тийины) которую кассир пометил как Click/Payme — НЕ фискализируется.
+   * Сколько из документа НЕ пробивается (тийины): Click, Payme и
+   * неоплаченный остаток отгрузки.
    *
-   * Эффективный фискальный target = rd.sum − excludeTiyin. Поле редактируется
-   * в мини-карточке над сравнительными колонками; при изменении matcher
-   * перезапускается (debounced 400ms) и пересобирает план на новую сумму.
+   * Раньше кассир вводил сумму Click/Payme руками. Теперь она берётся из
+   * платежей отгрузки: поступления на счета, привязанные как «мимо ОФД»,
+   * сюда и попадают. Сумма чека = rd.sum − excludeTiyin.
    *
-   * Default = 0 — поведение идентично текущему (фискализируется вся ms_sum).
-   * Если excludeTiyin = rd.sum (или больше) — фискализировать нечего, кнопка
-   * «Фискализировать» меняется на «Отметить как не фискальный».
+   * Если excludeTiyin = rd.sum — пробивать нечего (всё через Click/Payme),
+   * кнопка «Фискализировать» меняется на «Отметить как не фискальный».
    */
   const [excludeTiyin, setExcludeTiyin] = useState(0)
   /**
-   * Текстовый ввод поля «Сумма через Click/Payme» (в сумах, для UX).
-   * Хранится отдельно от excludeTiyin чтобы пользователь мог печатать
-   * частично («10», «100», «1000») без преждевременного парсинга.
+   * Оплата документа: наличные, карта, мимо ОФД и причина, по которой
+   * пробивать нельзя (нет платежей, счёт без привязки, сменился статус).
+   * Считается при открытии чека по свежим данным из МойСклад.
    */
-  const [excludeInputStr, setExcludeInputStr] = useState('')
+  const [docPayment, setDocPayment] = useState<DocumentPayment | null>(null)
 
-  const rd: MsRetailDemand | null = useMemo(() => {
+  const rd: MsSaleDocument | null = useMemo(() => {
     if (!receipt) return null
     try {
-      return JSON.parse(receipt.raw_json) as MsRetailDemand
+      return JSON.parse(receipt.raw_json) as MsSaleDocument
     } catch {
       return null
     }
@@ -227,23 +260,18 @@ export default function Receipt() {
   }, [rd, match, matcherOpts.targetSumOverrideTiyin, excludeTiyin])
 
   /**
-   * Тип оплаты из МойСклад — для бейджа над заголовком.
-   * См. подробное описание правил в коммитах прошлых релизов.
+   * Тип оплаты чека — для бейджа и для модалки «Karta turi». Считается по
+   * тому, что реально пробиваем (portion), а не по всем платежам: Click и
+   * Payme в чек не входят и на тип оплаты не влияют.
    */
-  const paymentKind = useMemo<
-    null | 'cash' | 'card' | 'qr' | 'mixed'
-  >(() => {
-    if (!rd) return null
-    const cash = rd.cashSum ?? 0
-    const card = rd.noCashSum ?? 0
-    const qr = rd.qrSum ?? 0
-    const hasCard = card > 0 || qr > 0
-    if (cash > 0 && hasCard) return 'mixed'
-    if (qr > 0) return 'qr'
-    if (card > 0) return 'card'
-    if (cash > 0) return 'cash'
+  const paymentKind = useMemo<null | 'cash' | 'card' | 'mixed'>(() => {
+    if (!docPayment || docPayment.blocker) return null
+    const { cashTiyin, cardTiyin } = docPayment.portion
+    if (cashTiyin > 0 && cardTiyin > 0) return 'mixed'
+    if (cardTiyin > 0) return 'card'
+    if (cashTiyin > 0) return 'cash'
     return null
-  }, [rd])
+  }, [docPayment])
 
   useEffect(() => {
     excludedServerIdsRef.current = []
@@ -252,32 +280,6 @@ export default function Receipt() {
     setStaleErrorPersistent(false)
     void load({ excludeServerItemIds: [] })
   }, [id])
-
-  /**
-   * Debounced rebuild при изменении excludeTiyin.
-   *
-   * Когда кассир редактирует поле «Сумма через Click/Payme» — ждём 400ms
-   * после последнего нажатия и перезапускаем `load()`. matcher пересоберёт
-   * план с новым `effectiveTarget = rd.sum − excludeTiyin`.
-   *
-   * Skip первый рендер (когда excludeTiyin=0 — это default, чек только что
-   * загрузился через основной useEffect выше). Skip пока match не загружен.
-   */
-  useEffect(() => {
-    if (!match) return
-    // Защита: не пересобирать если excludeTiyin не меняется (например при
-    // первом монтировании когда default=0 совпадает с тем что было). Сравним
-    // с тем что matcher уже использовал.
-    const lastOverride = matcherOpts.targetSumOverrideTiyin
-    const expected = (rd?.sum ?? 0) - excludeTiyin
-    if (lastOverride === expected) return
-    const t = setTimeout(() => {
-      void load()
-    }, 400)
-    return () => clearTimeout(t)
-    // load() сам подхватит свежий excludeTiyin через замыкание.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [excludeTiyin])
 
   function rememberExcludedServerIds(ids: number[]): number[] {
     if (ids.length === 0) return excludedServerIdsRef.current
@@ -306,11 +308,16 @@ export default function Receipt() {
         setAlreadyFiscalized(null)
       }
 
-      let parsed = JSON.parse(r.raw_json) as MsRetailDemand
+      let parsed = JSON.parse(r.raw_json) as MsSaleDocument
 
-      // МС в list-запросе не отдаёт inline positions. Если их нет —
-      // одиночный GET с expand, обновляем raw_json в БД.
-      // Также используем тот же client для enrichWithVariants ниже.
+      // Документ дотягиваем из МойСклад заново, обновляя raw_json в БД:
+      //   - отгрузку — всегда: платежи к ней часто привязывают уже после
+      //     того, как опрос её забрал, и статус могли сменить;
+      //   - старую розничную продажу — только если нет позиций (list-запрос
+      //     МС не отдаёт их inline).
+      // Пробитый чек не трогаем: «оригинал» на экране и в возврате должен
+      // остаться тем, что было на момент фискализации.
+      // Тот же client нужен ниже для enrichWithVariants и платежей.
       const basic = await getSetting(SettingKey.MoyskladCredentials)
       const token = basic ? null : await getSetting(SettingKey.MoyskladToken)
       const msClient =
@@ -318,9 +325,11 @@ export default function Receipt() {
           ? new MoyskladClient(basic ? { basic } : { token: token! })
           : null
 
-      if (!inlinePositions(parsed) && msClient) {
+      const isFiscalized = !!existingFiscal || r.status === 'fiscalized'
+      const needsRefresh = !isFiscalized && (!isRetailDocument(parsed) || !inlinePositions(parsed))
+      if (needsRefresh && msClient) {
         try {
-          const full = await msClient.getRetailDemand(parsed.id)
+          const full = await msClient.getSaleDocument(parsed)
           const newRawJson = JSON.stringify(full)
           const db = await getDb()
           await db.execute(
@@ -330,7 +339,7 @@ export default function Receipt() {
           parsed = full
           setReceipt({ ...r, raw_json: newRawJson })
         } catch (fetchErr) {
-          console.warn('Не удалось дозагрузить позиции чека:', fetchErr)
+          console.warn('Не удалось обновить документ из МойСклад:', fetchErr)
         }
       }
 
@@ -420,10 +429,13 @@ export default function Receipt() {
         return 'auto'
       })()
 
-      // Click/Payme: если кассир пометил часть оплаты как электронную —
-      // matcher работает с уменьшенной таргет-суммой. Передаём через override,
-      // не мутируя parsed.sum (его читает ещё Refund.tsx, history и т.д.).
-      const effectiveTarget = Math.max(0, parsed.sum - excludeTiyin)
+      // Оплата: у отгрузки — из связанных платежей и привязки счетов, у
+      // старой розничной продажи — из самого чека.
+      const payment = await loadDocumentPayment(parsed, msClient)
+      // Подбор идёт на сумму чека: то, что заплатили наличными и картой.
+      // Click, Payme и неоплаченный остаток в чек не входят. Сам документ
+      // не трогаем — parsed.sum читают ещё история и возврат.
+      const exclude = payment.excludedTiyin
       const activeExcludedServerIds =
         overrides?.excludeServerItemIds ?? excludedServerIdsRef.current
 
@@ -440,15 +452,17 @@ export default function Receipt() {
           activeExcludedServerIds.length > 0
             ? activeExcludedServerIds
             : undefined,
-        // Если excludeTiyin > 0 — matcher собирает план на rd.sum − exclude.
-        // Если excludeTiyin = 0 — override не передаём (matcher работает по rd.sum
-        // как всегда). Это сохраняет старое поведение для чеков без Click/Payme.
-        targetSumOverrideTiyin:
-          excludeTiyin > 0 && effectiveTarget >= 0 ? effectiveTarget : undefined,
+        // Пробиваем не всё — подбор на сумму чека. Всё оплачено наличными и
+        // картой — override не нужен, matcher работает по rd.sum.
+        targetSumOverrideTiyin: exclude > 0 ? payment.portion.targetTiyin : undefined,
       }
       const result = await buildMatch(parsed, opts)
       setMatch(result)
       setMatcherOpts(opts)
+      // Оплату и исключённую сумму ставим вместе с подбором: иначе на один
+      // кадр экран увидел бы новую сумму чека при старом плане.
+      setDocPayment(payment)
+      setExcludeTiyin(exclude)
       // Пул для модалки ручной сборки больше не кэшируем тут — модалка
       // сама грузит свежий снимок при открытии (см. HIGH #6 review).
       const test = (await getSetting(SettingKey.TestMode)) === 'true'
@@ -475,7 +489,7 @@ export default function Receipt() {
       await setMsReceiptStatus(receipt.id, 'not_required')
       void log.info(
         'fiscalize',
-        `Чек ${receipt.ms_name} помечен как не фискальный (Click/Payme)`,
+        `Чек ${receipt.ms_name} помечен как не фискальный: вся оплата мимо ОФД`,
         { msReceiptId: receipt.id, msSum: rd.sum, excludeTiyin },
       )
       toast.success('Чек помечен как не фискальный (Click/Payme)', {
@@ -528,11 +542,11 @@ export default function Receipt() {
    *
    * `paymentKind` уже посчитан выше через useMemo:
    *   'cash'  → нет карты, модалка не нужна
-   *   'card' / 'qr' / 'mixed' → карта есть, спрашиваем тип
-   *   null    → fallback (rd.sum=0 и т.п.) — модалку не показываем
+   *   'card' / 'mixed' → карта есть, спрашиваем тип
+   *   null    → оплата не определена — кнопка и так неактивна
    */
   function onFiscalizeClick(): void {
-    if (paymentKind === 'card' || paymentKind === 'qr' || paymentKind === 'mixed') {
+    if (paymentKind === 'card' || paymentKind === 'mixed') {
       setCardKindModal(true)
       return
     }
@@ -541,6 +555,12 @@ export default function Receipt() {
 
   async function doFiscalize(cardKind?: 'fiz' | 'corp'): Promise<void> {
     if (!match || !receipt) return
+    // Кнопка при проблеме с оплатой уже неактивна; здесь — страховка на
+    // случай, если оплату пересчитали между кликом и модалкой типа карты.
+    if (!docPayment || docPayment.blocker) {
+      setError('Оплата отгрузки не определена — пробить чек нельзя. Нажмите «Проверить снова».')
+      return
+    }
     setFiscalizing(true)
     setError(null)
     setShiftNotOpen(false)
@@ -548,9 +568,14 @@ export default function Receipt() {
       const result = await fiscalize(match, {
         msReceiptId: receipt.id,
         cardKind,
-        // Click/Payme exclude — пробрасываем в fiscalize чтобы:
-        // 1. determinePaymentFromMs вычел из noCashSum/qrSum
-        // 2. сохранилось в fiscal_receipts.excluded_payment_tiyin для аудита
+        // Доли наличных и карты — из платежей. Сумму чека fiscalize берёт из
+        // подбора и делит в той же пропорции, чтобы оплаты сошлись с позициями.
+        payment: {
+          cashTiyin: docPayment.portion.cashTiyin,
+          cardTiyin: docPayment.portion.cardTiyin,
+        },
+        // Что не пробито (Click/Payme, неоплаченный остаток) — в
+        // fiscal_receipts.excluded_payment_tiyin, для отчёта.
         excludePaymentTiyin: excludeTiyin > 0 ? excludeTiyin : undefined,
       })
       if (testMode) {
@@ -785,6 +810,8 @@ export default function Receipt() {
                   itemsWithoutIkpu.length > 0 ||
                   hasUnmatched ||
                   excludeDirty ||
+                  !docPayment ||
+                  !!docPayment.blocker ||
                   !!alreadyFiscalized
                 }
                 onClick={onFiscalizeClick}
@@ -792,8 +819,10 @@ export default function Receipt() {
                 title={
                   alreadyFiscalized
                     ? 'Чек уже фискализирован — повторная фискализация запрещена'
+                    : docPayment?.blocker
+                      ? 'Оплата отгрузки не определена — см. карточку «Оплата» ниже'
                     : excludeDirty
-                      ? 'Пересобираю план под новую сумму Click/Payme — подождите секунду'
+                      ? 'Пересобираю план под сумму оплаты — подождите секунду'
                       : hasUnmatched
                         ? 'Есть неподобранные позиции — подберите их вручную'
                         : itemsWithoutIkpu.length > 0
@@ -813,13 +842,13 @@ export default function Receipt() {
       />
 
       {/* Payment badge — отдельной строкой */}
-      {paymentKind && (
+      {paymentKind && docPayment && (
         <div>
           <PaymentBadge
             kind={paymentKind}
-            cashSum={rd.cashSum ?? 0}
-            cardSum={rd.noCashSum ?? 0}
-            qrSum={rd.qrSum ?? 0}
+            cashSum={docPayment.portion.cashTiyin}
+            cardSum={docPayment.portion.cardTiyin}
+            qrSum={0}
           />
         </div>
       )}
@@ -981,109 +1010,18 @@ export default function Receipt() {
         </Card>
       )}
 
-      {/* Click/Payme exclude — мини-карточка. При вводе суммы matcher
-          пересобирает план на rd.sum - exclude (debounced 400ms).
-          В ОФД ничего не отправляется, на ленте упоминаний Click/Payme нет.
-          Только фискализируется уменьшенная сумма + сохраняется
-          excluded_payment_tiyin в БД для аудита.
-
-          Показывается ТОЛЬКО когда в чеке есть карточная/QR/смешанная оплата.
-          Click/Payme — электронный платёж, он всегда в безналичной части МС
-          (noCashSum/qrSum). Для чеков чисто наличкой исключать нечего —
-          поле было бы лишним. paymentKind считается выше через useMemo. */}
-      {(paymentKind === 'card' ||
-        paymentKind === 'qr' ||
-        paymentKind === 'mixed') && (
-      <Card>
-        <Card.Body className="space-y-3">
-          <div className="flex items-center justify-between gap-3 flex-wrap">
-            <div>
-              <div className="text-body font-medium text-ink">
-                Сумма через Click / Payme
-              </div>
-              <div className="mt-0.5 text-caption text-ink-muted">
-                Введите сумму электронной оплаты которая НЕ фискализируется.
-                Фискальный чек будет на оставшуюся сумму{' '}
-                <span className="font-mono">
-                  ({tiyinToSumDisplay(rd.sum)} сум) − введённая
-                </span>
-                .
-              </div>
-            </div>
-            <div className="flex items-center gap-2">
-              <input
-                type="text"
-                inputMode="numeric"
-                placeholder="0"
-                className="w-40 rounded-md border border-border bg-canvas px-3 py-2 text-right font-mono text-body text-ink focus:border-primary focus:outline-none"
-                value={excludeInputStr}
-                onChange={(e) => {
-                  // Принимаем цифры, пробелы, запятую. Парсим в целые сум.
-                  const raw = e.target.value
-                  setExcludeInputStr(raw)
-                  const cleaned = raw.replace(/[^\d]/g, '')
-                  const sumValue = cleaned === '' ? 0 : Number.parseInt(cleaned, 10) || 0
-                  // Ограничиваем 0 ≤ value ≤ rd.sum (в тийинах ×100)
-                  const tiyinValue = Math.max(
-                    0,
-                    Math.min(sumValue * 100, rd.sum),
-                  )
-                  setExcludeTiyin(tiyinValue)
-                }}
-                aria-label="Сумма через Click/Payme (не фискализируется)"
-              />
-              <span className="text-body text-ink-muted">сум</span>
-              {excludeTiyin > 0 && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => {
-                    setExcludeInputStr('')
-                    setExcludeTiyin(0)
-                  }}
-                  title="Сбросить — фискализировать всю сумму"
-                >
-                  Сбросить
-                </Button>
-              )}
-            </div>
-          </div>
-          {excludeTiyin > 0 && (
-            <div className="rounded-md bg-warning-soft p-3 text-caption text-ink space-y-1">
-              <div>
-                <strong className="text-warning">Внимание:</strong> МС-чек на{' '}
-                <span className="font-mono">
-                  {tiyinToSumDisplay(rd.sum)} сум
-                </span>
-                , фискализируется только{' '}
-                <span className="font-mono font-semibold">
-                  {tiyinToSumDisplay(Math.max(0, rd.sum - excludeTiyin))} сум
-                </span>{' '}
-                (исключено{' '}
-                <span className="font-mono">
-                  {tiyinToSumDisplay(excludeTiyin)} сум
-                </span>{' '}
-                как Click/Payme).
-              </div>
-              {excludeTiyin >= rd.sum && (
-                <div className="text-warning font-medium">
-                  Вся сумма электронная — фискальный чек не выдаётся. Нажмите
-                  «Отметить как не фискальный».
-                </div>
-              )}
-              {/* Sanity-check: exclude больше чем безналичная часть МС. Не блок,
-                  только информация — кассир знает что делает. */}
-              {excludeTiyin > (rd.noCashSum ?? 0) + (rd.qrSum ?? 0) && (
-                <div className="text-ink-muted">
-                  Примечание: введённая сумма больше безналичной части по МС
-                  ({tiyinToSumDisplay((rd.noCashSum ?? 0) + (rd.qrSum ?? 0))}{' '}
-                  сум). Проверьте.
-                </div>
-              )}
-            </div>
-          )}
-        </Card.Body>
-      </Card>
+      {/* Оплата отгрузки: наличные, карта, мимо ОФД и неоплаченный остаток —
+          из связанных платежей. Если пробивать нельзя, здесь же причина и
+          что сделать. Раньше на этом месте было ручное поле «Сумма через
+          Click/Payme»; теперь Click и Payme видны по счёту платежа. */}
+      {docPayment && docPayment.source === 'demand' && !alreadyFiscalized && (
+        <DemandPaymentCard
+          payment={docPayment}
+          documentSumTiyin={rd.sum}
+          busy={busy}
+          onRetry={() => void load()}
+          onOpenSettings={() => nav('/settings')}
+        />
       )}
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
@@ -1306,8 +1244,8 @@ export default function Receipt() {
           в блоке «To'lov Turi», см. printer.rs::build_receipt. */}
       {cardKindModal && (
         <CardKindModal
-          cashTiyin={rd.cashSum ?? 0}
-          cardTiyin={(rd.noCashSum ?? 0) + (rd.qrSum ?? 0)}
+          cashTiyin={docPayment?.portion.cashTiyin ?? 0}
+          cardTiyin={docPayment?.portion.cardTiyin ?? 0}
           onCancel={() => setCardKindModal(false)}
           onPick={(kind) => {
             setCardKindModal(false)
@@ -1684,6 +1622,142 @@ function Side({ title, sumTiyin, sumDiff, children }: SideProps) {
         </Card.HeaderAction>
       </Card.Header>
       {children}
+    </Card>
+  )
+}
+
+/**
+ * Оплата отгрузки: откуда деньги и можно ли пробивать.
+ *
+ * Если пробивать нельзя — причина и что сделать. Кассир чаще всего может
+ * исправить это сам: привязать платёж в МойСклад или счёт в Настройках, а
+ * потом нажать «Проверить снова». Поэтому текст — про действие, а не про
+ * внутренности.
+ */
+function DemandPaymentCard({
+  payment,
+  documentSumTiyin,
+  busy,
+  onRetry,
+  onOpenSettings,
+}: {
+  payment: DocumentPayment
+  documentSumTiyin: number
+  busy: boolean
+  onRetry: () => void
+  onOpenSettings: () => void
+}) {
+  const { breakdown, portion, unpaidTiyin, blocker } = payment
+  const sum = (t: number) => `${tiyinToSumDisplay(t)} сум`
+
+  if (blocker) {
+    const text = (() => {
+      switch (blocker.kind) {
+        case 'no_payments':
+          return {
+            title: 'Нет оплаты',
+            body:
+              'К отгрузке не привязан ни один проведённый платёж. Привяжите в МойСклад приходный ордер ' +
+              'или входящий платёж и нажмите «Проверить снова».',
+          }
+        case 'unmapped':
+          return {
+            title: 'Платёж на счёт без привязки',
+            body:
+              'Деньги пришли на расчётный счёт, про который касса не знает, наличные это или карта. ' +
+              'Привяжите счёт к типу оплаты в Настройках → «Счета оплаты».',
+          }
+        case 'state_changed':
+          return {
+            title: 'Отгрузку вывели из статуса «пробить»',
+            body:
+              'Пока она ждала в очереди, в МойСклад сменили статус — пробивать её нельзя. Если это ошибка, ' +
+              'верните статус и нажмите «Проверить снова».',
+          }
+        case 'underpaid':
+          return {
+            title: 'Отгрузка оплачена не полностью',
+            body:
+              `Оплачено ${sum(blocker.paidTiyin)} из ${sum(blocker.sumTiyin)}. Пробить часть нельзя: ` +
+              'отгрузка станет пробитой, и доплату потом не пробить. Когда оплата будет полной, ' +
+              'нажмите «Проверить снова».',
+          }
+        case 'payments_unavailable':
+          return {
+            title: 'Не удалось получить платежи из МойСклад',
+            body: `${blocker.message}. Проверьте связь и нажмите «Проверить снова».`,
+          }
+      }
+    })()
+    return (
+      <Card className="border-warning/30 bg-warning-soft">
+        <Card.Body className="flex items-start gap-3">
+          <TriangleAlert size={18} className="text-warning shrink-0 mt-0.5" />
+          <div className="flex-1 space-y-2">
+            <div className="text-body font-medium text-warning">{text.title}</div>
+            <div className="text-caption text-ink">{text.body}</div>
+            {blocker.kind === 'unmapped' && (
+              <ul className="space-y-0.5 text-caption text-ink">
+                {blocker.payments.map((p) => (
+                  <li key={p.id} className="font-mono">
+                    {p.name ?? p.id} · {sum(p.amountTiyin)}
+                    {p.accountId ? ` · счёт …${p.accountId.slice(-6)}` : ' · без счёта'}
+                  </li>
+                ))}
+              </ul>
+            )}
+            <div className="flex gap-2 pt-1">
+              <Button variant="secondary" size="sm" onClick={onRetry} loading={busy}>
+                Проверить снова
+              </Button>
+              {blocker.kind === 'unmapped' && (
+                <Button variant="ghost" size="sm" onClick={onOpenSettings}>
+                  Открыть Настройки
+                </Button>
+              )}
+            </div>
+          </div>
+        </Card.Body>
+      </Card>
+    )
+  }
+
+  const allRows: Array<{ label: string; value: number; tone?: 'warn' | 'muted' }> = [
+    { label: 'Наличные', value: breakdown.cashTiyin },
+    { label: 'Карта', value: breakdown.cardTiyin },
+    { label: 'Мимо ОФД (Click, Payme)', value: breakdown.excludedTiyin, tone: 'muted' },
+    { label: 'Не оплачено', value: unpaidTiyin, tone: 'warn' },
+  ]
+  const rows = allRows.filter((r) => r.value > 0)
+  const partial = portion.targetTiyin < documentSumTiyin
+
+  return (
+    <Card>
+      <Card.Body className="space-y-2">
+        <div className="text-body font-medium text-ink">Оплата отгрузки</div>
+        <div className="flex flex-wrap gap-x-6 gap-y-1 text-caption">
+          {rows.map((r) => (
+            <div key={r.label}>
+              <span className="text-ink-muted">{r.label}: </span>
+              <span
+                className={cn(
+                  'font-mono tabular-nums',
+                  r.tone === 'warn' ? 'text-warning font-medium' : r.tone === 'muted' ? 'text-ink-muted' : 'text-ink',
+                )}
+              >
+                {sum(r.value)}
+              </span>
+            </div>
+          ))}
+        </div>
+        <div className="text-caption text-ink">
+          Чек будет на <span className="font-mono font-semibold">{sum(portion.targetTiyin)}</span>
+          {partial && (
+            <span className="text-ink-muted"> из {sum(documentSumTiyin)} по отгрузке</span>
+          )}
+          .
+        </div>
+      </Card.Body>
     </Card>
   )
 }

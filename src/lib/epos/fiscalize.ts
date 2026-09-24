@@ -67,8 +67,21 @@ export interface FiscalizeOptions {
   clientTin?: string
   clientPinfl?: string
   cardType?: 1 | 2
+  /**
+   * Явные суммы оплаты в тийинах — «Чек по сумме», где кассир вводит их сам.
+   * Если заданы, выигрывают у `payment`.
+   */
   receivedCash?: number
   receivedCard?: number
+  /**
+   * Сколько покупатель заплатил наличными и картой — для чека по отгрузке.
+   *
+   * Берётся из связанных платежей отгрузки (см. `moysklad/demand-payment.ts`).
+   * Здесь только доли: сумма чека — из подбора (после наценки, НДС и
+   * округления), и делится она между наличными и картой в той же
+   * пропорции. Так сумма позиций всегда равна сумме оплат.
+   */
+  payment?: { cashTiyin: number; cardTiyin: number }
   msReceiptId?: number
   /**
    * Тип банковской карты. Уходит В ОФД (в кабинете soliq это поле
@@ -87,15 +100,9 @@ export interface FiscalizeOptions {
    */
   cardKind?: 'fiz' | 'corp'
   /**
-   * Сумма (тийины) которую исключить из фискализации как Click/Payme.
-   *
-   * Когда магазин принимает Click/Payme — эти оплаты НЕ идут в ОФД.
-   * Кассир в Receipt.tsx вводит сумму, и фискальный чек строится на
-   * `ms_sum − excludePaymentTiyin`. Эта сумма вычитается из noCashSum/qrSum
-   * при распределении ReceivedCash/Card; cash не трогается.
-   *
-   * Сохраняется в `fiscal_receipts.excluded_payment_tiyin` для аудита.
-   * Default = 0 (фискализируем всё, как раньше).
+   * Сколько из документа НЕ пробито (тийины): Click, Payme и неоплаченный
+   * остаток отгрузки. На расчёт оплаты не влияет — только сохраняется в
+   * `fiscal_receipts.excluded_payment_tiyin` для отчёта «что ушло мимо ОФД».
    */
   excludePaymentTiyin?: number
 }
@@ -157,23 +164,25 @@ export async function fiscalize(
     0,
   )
 
-  // Тип оплаты — берём из МойСклад (cashSum / noCashSum / qrSum), сумму —
-  // из подбора (matchedTotal, после наценки+НДС+округления). Так чек
-  // в EPOS/ОФД сходится: сумма items = сумма оплат. Если кассир хочет
-  // переопределить (через FiscalizeOptions) — opts.receivedCash/Card
-  // выигрывают.
+  // Тип оплаты — из связанных платежей отгрузки (opts.payment), сумма — из
+  // подбора (matchedTotal, после наценки+НДС+округления). Так чек в EPOS/ОФД
+  // сходится: сумма позиций = сумма оплат. Явные суммы (opts.receivedCash /
+  // receivedCard, «Чек по сумме») выигрывают.
   //
-  // opts.excludePaymentTiyin (Click/Payme) — вычитается из noCashSum+qrSum
-  // ПЕРЕД пропорциональным split, иначе ReceivedCard был бы завышен
-  // относительно фактической фискальной части.
-  const excludePayment = Math.max(0, opts.excludePaymentTiyin ?? 0)
-  const auto = determinePaymentFromMs(build.receipt, matchedTotal, excludePayment)
+  // Без оплаты не пробиваем. Раньше пустая оплата молча превращалась в
+  // «всё наличными» — для розницы это было почти всегда верно, а у
+  // отгрузки без платежей так в ОФД ушёл бы выдуманный тип оплаты.
+  const hasExplicit = opts.receivedCash != null || opts.receivedCard != null
+  if (!hasExplicit && !opts.payment) {
+    throw new Error('Не указана оплата чека: к отгрузке не привязаны платежи')
+  }
+  const auto = opts.payment ? splitPayment(opts.payment, matchedTotal) : null
   // Финальная страховка: в фискальные бэкенды НИКОГДА не должно уйти
   // отрицательное значение — FiscalDrive ждёт беззнаковое и отвергает чек
   // целиком, а EPOS может принять молча и записать в ОФД неверную оплату.
   // Клампим и авто-расчёт, и явное переопределение из UI.
-  const receivedCash = Math.max(0, opts.receivedCash ?? auto.receivedCash)
-  const receivedCard = Math.max(0, opts.receivedCard ?? auto.receivedCard)
+  const receivedCash = Math.max(0, opts.receivedCash ?? auto?.receivedCash ?? 0)
+  const receivedCard = Math.max(0, opts.receivedCard ?? auto?.receivedCard ?? 0)
 
   // ── Тестовый режим (сухой прогон) ────────────────────────────
   // UI отрабатывает «как будто» фискализация прошла, но в Communicator
@@ -384,7 +393,7 @@ export async function fiscalize(
     // card_kind пишем только если оплата картой реально была. Для cash-only
     // чеков и тестового режима — null (строка «Karta turi» не печатается).
     card_kind: receivedCard > 0 ? (opts.cardKind ?? null) : null,
-    excluded_payment_tiyin: excludePayment,
+    excluded_payment_tiyin: Math.max(0, opts.excludePaymentTiyin ?? 0),
     // Попадают в search_text: кассир ищет чек по номеру и по названиям из
     // МойСклад («дрель»), а не по подменённым ИКПУ-именам, ушедшим в ОФД.
     ms_name: build.receipt.name ?? null,
@@ -855,70 +864,38 @@ async function releaseRemote(
 }
 
 /**
- * Определить тип оплаты по чеку МС.
+ * Разделить сумму чека между наличными и картой в той же пропорции, в какой
+ * платил покупатель.
  *
- * Логика:
- *   - Только `cashSum > 0` → всё в `ReceivedCash`
- *   - Только `noCashSum`/`qrSum` > 0 → всё в `ReceivedCard`
- *   - Смешанная (есть и нал, и безнал) → пропорция от matchedTotal:
- *       cashShare = cashSum / (cashSum + noCashSum + qrSum)
- *       receivedCash = round(matchedTotal × cashShare)
- *       receivedCard = matchedTotal - receivedCash  (остаток, чтобы суммы
- *                                                   совпадали тийин-в-тийин)
- *   - Все три = 0 (странный случай) → fallback на нал
+ * Сумма чека — из подбора (после наценки, НДС и округления), а не сумма
+ * платежей: иначе сумма позиций не совпала бы с суммой оплат, и
+ * Communicator/ОФД отвергли бы чек как несбалансированный.
  *
- * Сумму берём именно из подбора (после наценки+НДС+округления), а не
- * `rd.sum` — иначе сумма items не равна сумме оплат и Communicator/ОФД
- * могут отвергнуть чек как несбалансированный.
+ *   - только наличные → всё в `ReceivedCash`;
+ *   - только карта → всё в `ReceivedCard`;
+ *   - смешанная → пропорция, остаток округления уходит в карту, чтобы части
+ *     сошлись с суммой тийин в тийин.
  *
- * Пример (смешанная):
- *   МС: cashSum=10000, noCashSum=5000 (15000 = 10к нал + 5к карта)
- *   matchedTotal=1800000 (18к сум продажной цены)
- *   cashShare = 10000/15000 = 0.667
- *   receivedCash = round(1800000 × 0.667) = 1200600
- *   receivedCard = 1800000 - 1200600 = 599400
+ * Пример: платили 100 000 наличными и 50 000 картой, подбор на 180 000 →
+ * наличными 120 000, картой 60 000.
+ *
+ * Вызывающий гарантирует, что оплата есть (см. `paymentBlocker`). Если обе
+ * доли нулевые, возвращаем наличные — безопаснее, чем отрицательные числа,
+ * но до сюда такой случай доходить не должен.
  */
-export function determinePaymentFromMs(
-  rd: import('@/lib/moysklad/types').MsRetailDemand,
+export function splitPayment(
+  payment: { cashTiyin: number; cardTiyin: number },
   matchedTotal: number,
-  excludeFromNonCash: number = 0,
 ): { receivedCash: number; receivedCard: number } {
-  // ⚠️ Клампим ВХОД по нулю. МойСклад иногда отдаёт крошечные отрицательные
-  // суммы (артефакт округления/бонусов — на проде прилетал cashSum = −1 тийин).
-  // Без клампа пропорция ниже давала отрицательный ReceivedCash, а фискальные
-  // бэкенды ждут беззнаковое: FiscalDrive отвечал HTTP 400 «cannot unmarshal
-  // number -1 into Go struct field Receipt.ReceivedCash» и чек не пробивался.
-  const cash = Math.max(0, rd.cashSum ?? 0)
-  const rawCard = Math.max(0, (rd.noCashSum ?? 0) + (rd.qrSum ?? 0))
-  // excludeFromNonCash — это сумма Click/Payme которую кассир пометил как
-  // НЕ фискализируется (она была в noCashSum/qrSum МС). Вычитаем её ИЗ карты:
-  // оставшаяся часть rawCard − exclude фискализируется как ReceivedCard.
-  // Cash не трогаем — клиент действительно дал нал, эта часть фискальная.
-  // Если exclude > rawCard — кэп до rawCard (защита от отрицательной карты).
-  const effectiveCardSrc = Math.max(0, rawCard - Math.max(0, excludeFromNonCash))
-  const total = cash + effectiveCardSrc
-
-  // Все нули — fallback на нал.
-  if (total <= 0) {
-    return { receivedCash: matchedTotal, receivedCard: 0 }
-  }
-  // Только нал (после вычета exclude из карты — карты не осталось).
-  if (effectiveCardSrc === 0) {
-    return { receivedCash: matchedTotal, receivedCard: 0 }
-  }
-  // Только безнал (карта/QR), нала не было.
-  if (cash === 0) {
-    return { receivedCash: 0, receivedCard: matchedTotal }
-  }
-  // Смешанная — пропорционально по cash/card соотношению ПОСЛЕ exclude.
-  // Остаток уходит в карту чтобы тийины не потерялись при округлении.
-  // Клампим и ВЫХОД: доля не может выйти за [0, matchedTotal]. Остаток всегда
-  // уходит в карту, поэтому сумма частей строго равна matchedTotal — иначе
-  // чек не сойдётся с позициями.
-  const rawCash = Math.round((matchedTotal * cash) / total)
-  const receivedCash = Math.min(Math.max(0, rawCash), Math.max(0, matchedTotal))
-  const receivedCard = Math.max(0, matchedTotal) - receivedCash
-  return { receivedCash, receivedCard }
+  // МойСклад изредка отдаёт отрицательные копейки — фискальные бэкенды
+  // ждут беззнаковое, поэтому режем в ноль и вход, и выход.
+  const cash = Math.max(0, payment.cashTiyin || 0)
+  const card = Math.max(0, payment.cardTiyin || 0)
+  const total = Math.max(0, matchedTotal)
+  if (card === 0) return { receivedCash: total, receivedCard: 0 }
+  if (cash === 0) return { receivedCash: 0, receivedCard: total }
+  const receivedCash = Math.min(total, Math.max(0, Math.round((total * cash) / (cash + card))))
+  return { receivedCash, receivedCard: total - receivedCash }
 }
 
 /**

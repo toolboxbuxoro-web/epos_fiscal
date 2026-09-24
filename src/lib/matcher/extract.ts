@@ -3,7 +3,7 @@ import {
   inlinePositions,
   type MsAssortment,
   type MsAttribute,
-  type MsRetailDemand,
+  type MsSaleDocument,
   type MsRetailDemandPosition,
 } from '@/lib/moysklad/types'
 import type { NormalizedPosition } from './types'
@@ -104,7 +104,8 @@ function readLinkedBuhName(
 }
 
 /**
- * Преобразовать одну позицию retaildemand в нашу нормализованную форму.
+ * Преобразовать одну позицию документа продажи (отгрузки или старой
+ * розничной продажи) в нашу нормализованную форму.
  * Извлекает ИКПУ из атрибутов товара (требуется expand=positions.assortment)
  * и «Бухгалтерское наименование» из характеристик модификации (если есть).
  *
@@ -157,7 +158,7 @@ function isService(pos: MsRetailDemandPosition): boolean {
   return a?.meta?.type === 'service'
 }
 
-/** Извлечь все нормализованные позиции из retaildemand.
+/** Извлечь все нормализованные позиции из документа продажи.
  *
  * Фильтруются:
  *   - Услуги (service) — `assortment.meta.type === 'service'`. Они не товар.
@@ -170,7 +171,7 @@ function isService(pos: MsRetailDemandPosition): boolean {
  *   (для стратегии `linked-ms`). Передаётся из настроек магазина.
  */
 export function extractPositions(
-  rd: MsRetailDemand,
+  rd: MsSaleDocument,
   linkCharacteristicName?: string,
 ): NormalizedPosition[] {
   const positions = inlinePositions(rd)

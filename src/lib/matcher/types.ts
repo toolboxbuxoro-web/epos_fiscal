@@ -1,5 +1,5 @@
 import type { EsfItemRow, MatchStrategy, MilliQty, Tiyin } from '@/lib/db/types'
-import type { MsRetailDemand } from '@/lib/moysklad/types'
+import type { MsSaleDocument } from '@/lib/moysklad/types'
 
 /** Нормализованная позиция чека МойСклад в наших единицах. */
 export interface NormalizedPosition {
@@ -114,7 +114,7 @@ export interface PositionMatch {
 }
 
 export interface BuildMatchResult {
-  receipt: MsRetailDemand
+  receipt: MsSaleDocument
   positions: PositionMatch[]
   /** Сводка: какая стратегия преобладает. */
   overallStrategy: MatchStrategy

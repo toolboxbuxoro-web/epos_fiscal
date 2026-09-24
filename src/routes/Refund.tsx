@@ -40,7 +40,7 @@ import {
 } from '@/lib/epos'
 import { extractPositions } from '@/lib/matcher'
 import { parseRequestJsonReceipt } from '@/lib/epos/request-json'
-import type { MsRetailDemand } from '@/lib/moysklad'
+import type { MsSaleDocument } from '@/lib/moysklad'
 import {
   Badge,
   Button,
@@ -167,7 +167,7 @@ export default function Refund() {
           const msr = await getMsReceipt(fr.ms_receipt_id)
           if (msr) {
             setMsName(msr.ms_name ?? null)
-            const rd = JSON.parse(msr.raw_json) as MsRetailDemand
+            const rd = JSON.parse(msr.raw_json) as MsSaleDocument
             const pos = extractPositions(rd)
             setMsPositions(
               pos.map((p) => ({

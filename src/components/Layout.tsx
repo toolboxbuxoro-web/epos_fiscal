@@ -14,7 +14,6 @@ import { Button } from '@/components/ui'
 import { cn } from '@/lib/cn'
 import { signOut } from '@/lib/inventory'
 import { getSetting, SettingKey } from '@/lib/db'
-import { stopShiftRuntime } from '@/lib/moysklad'
 import { SystemStatusPanel } from './SystemStatusPanel'
 import { TestModeBanner, TestModeDot } from './TestModeBanner'
 import { UpdateBanner } from './UpdateBanner'
@@ -61,7 +60,7 @@ export default function Layout() {
   useEffect(() => {
     void (async () => {
       const [name, login, emp] = await Promise.all([
-        getSetting(SettingKey.MoyskladRetailStoreName),
+        getSetting(SettingKey.MoyskladStoreName),
         getSetting(SettingKey.MoyskladLogin),
         getSetting(SettingKey.MoyskladEmployeeName),
       ])
@@ -73,10 +72,9 @@ export default function Layout() {
 
   async function onLogout() {
     // confirm() в Tauri webview иногда зависает / не возвращает значение,
-    // поэтому делаем logout сразу. Если юзер промахнулся — просто залогинится
-    // обратно своим паролем за 5 секунд.
+    // поэтому делаем logout сразу. Если кассир промахнулся — войдёт обратно
+    // тем же кодом подключения.
     try {
-      stopShiftRuntime()
       await signOut()
     } catch (e) {
       console.error('signOut failed:', e)

@@ -20,6 +20,7 @@ import type {
   ReleaseResponse,
   ReserveRequest,
   ReserveResponse,
+  ShopDemandConfig,
   ShopMeResponse,
   UnconsumeRequest,
   UnconsumeResponse,
@@ -250,5 +251,17 @@ export class InventoryServerClient {
    */
   async getShopMe(): Promise<ShopMeResponse> {
     return this.request<ShopMeResponse>('/api/v1/inventory/shop/me')
+  }
+
+  /**
+   * Сохранить на сервере выбор кассы: склад, статус отгрузки, привязку
+   * счетов. Нужен, чтобы после переустановки и входа по коду касса получила
+   * его обратно, а админ видел, что где настроено.
+   */
+  async updateShopDemandConfig(config: ShopDemandConfig): Promise<void> {
+    await this.request('/api/v1/inventory/shop/me/moysklad', {
+      method: 'PATCH',
+      body: JSON.stringify(config),
+    })
   }
 }

@@ -294,7 +294,9 @@ export default function Zreport() {
       const data: ZReportPrintData = {
         is_close: close,
         company,
-        city: (await getSetting(SettingKey.MoyskladRetailStoreName)) ?? '',
+        // Раньше здесь было название розничной точки; теперь — склад,
+        // с которого касса пробивает отгрузки.
+        city: (await getSetting(SettingKey.MoyskladStoreName)) ?? '',
         report_number: info.Number,
         terminal_id: info.TerminalID,
         open_time: info.OpenTime,

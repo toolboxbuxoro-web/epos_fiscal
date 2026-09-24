@@ -1,9 +1,15 @@
 /**
- * Login flow для Tauri-магазина.
+ * Вход кассы по коду из админки.
  *
- * Кассир вводит МС email+password → POST /inventory/login → backend сверяет
- * и возвращает {api_key, shop, moysklad}. Tauri пишет всё в local Settings,
- * после чего AppGate пропускает к основному приложению.
+ * Кассир вводит короткий код → POST /inventory/connect → сервер возвращает
+ * ключ магазина, доступ к МойСклад и выбранные ранее склад, статус и счета.
+ * Касса пишет всё в local Settings, после чего AppGate пропускает к
+ * основному приложению.
+ *
+ * Раньше кассир входил логином и паролем МойСклад, а админ заранее вводил
+ * те же логин и пароль в админке. Два места и два человека: при смене
+ * пароля в МС ломались оба. Код выдаёт админ, пароль МС на кассе больше
+ * не нужен.
  *
  * Logout — очищает session-related Settings, AppGate возвращает на login.
  */
@@ -11,8 +17,12 @@
 import { fetch } from '@tauri-apps/plugin-http'
 import { getSetting, setSettings, SettingKey } from '@/lib/db'
 import { log } from '@/lib/log'
+import { DEMAND_SYNC_KEY } from '@/lib/moysklad/poller'
+import type { ShopMeResponse } from './types'
 
 export type LoginErrorCode =
+  | 'invalid_code'
+  | 'too_many_attempts'
   | 'shop_not_found'
   | 'invalid_password'
   | 'inactive_shop'
@@ -31,8 +41,8 @@ export interface LoginSuccess {
     organization_id: string
   }
   moysklad: {
-    login: string
-    retailstore_name: string | null
+    login: string | null
+    store_name: string | null
   }
 }
 
@@ -43,62 +53,94 @@ export interface LoginFailure {
 }
 
 const ERROR_MESSAGES: Record<LoginErrorCode, string> = {
+  invalid_code:
+    'Неверный код. Проверьте его или попросите администратора выдать новый в админке, вкладка «Магазины».',
+  too_many_attempts: 'Слишком много попыток. Подождите 15 минут и попробуйте снова.',
   shop_not_found:
     'Магазин с таким email не найден. Обратитесь к администратору, чтобы он создал ваш магазин в mytoolbox.',
   invalid_password: 'Неверный пароль.',
   inactive_shop: 'Магазин временно отключён. Обратитесь к администратору.',
   shop_not_configured:
-    'Администратор ещё не привязал ваш МС-аккаунт к магазину в mytoolbox.',
+    'Администратор ещё не привязал МойСклад к этому магазину в mytoolbox (кнопка «МС» во вкладке «Магазины»).',
   api_key_not_recoverable:
     'Внутренняя ошибка: API key магазина недоступен. Попроси админа перевыпустить ключ.',
-  bad_request: 'Не указаны email или пароль.',
+  bad_request: 'Не указан код подключения.',
   server_error: 'Сервер вернул ошибку. Попробуйте позже.',
   network_error:
     'Нет связи с сервером. Проверьте интернет и URL inventory server в настройках.',
 }
 
 /**
- * Аутентификация через mytoolbox-сервер.
- *
- * Требует чтобы InventoryServerUrl уже был установлен (вводится один раз
- * админом при инсталляции, или дефолтное значение из релиза).
- *
- * При успехе пишет в Settings:
- *   - InventoryRemoteEnabled = 'true'
- *   - InventoryShopApiKey, InventoryShopSlug
- *   - MoyskladCredentials, MoyskladLogin
- *   - MoyskladRetailStoreId/Name, MoyskladEmployeeId/Name
+ * Настройки МойСклад, которые сервер отдаёт кассе при входе и в /shop/me.
+ * Поля отгрузок приходят от сервера с этой версии; у старого сервера их нет —
+ * тогда просто остаются пустыми.
  */
-export async function signInWithMs({
-  email,
-  password,
-}: {
-  email: string
-  password: string
-}): Promise<LoginSuccess | LoginFailure> {
+type ServerMoysklad = ShopMeResponse['moysklad']
+
+/**
+ * Записать в настройки то, что сервер знает о магазине: доступ к МС, кассира
+ * и выбранные склад, статус и счета.
+ *
+ * Если склад или статус пришли другими, сбрасываем курсор опроса: новый
+ * фильтр должен заново пройти по последним суткам, иначе отгрузки,
+ * изменённые до старого курсора, так и не попадут в очередь.
+ */
+export async function applyServerMoysklad(ms: ServerMoysklad): Promise<void> {
+  const [prevStore, prevState] = await Promise.all([
+    getSetting(SettingKey.MoyskladStoreId),
+    getSetting(SettingKey.MoyskladDemandStateId),
+  ])
+  const storeId = ms.store_id ?? ''
+  const stateId = ms.demand_state_id ?? ''
+  const filterChanged = (prevStore ?? '') !== storeId || (prevState ?? '') !== stateId
+
+  await setSettings({
+    ...(ms.basic_credentials ? { [SettingKey.MoyskladCredentials]: ms.basic_credentials } : {}),
+    [SettingKey.MoyskladLogin]: ms.login ?? '',
+    [SettingKey.MoyskladEmployeeId]: ms.employee_id ?? '',
+    [SettingKey.MoyskladEmployeeName]: ms.employee_name ?? '',
+    [SettingKey.MoyskladStoreId]: storeId,
+    [SettingKey.MoyskladStoreName]: ms.store_name ?? '',
+    [SettingKey.MoyskladDemandStateId]: stateId,
+    [SettingKey.MoyskladDemandStateName]: ms.demand_state_name ?? '',
+    [SettingKey.MoyskladPaymentAccounts]: JSON.stringify(ms.payment_accounts ?? {}),
+    ...(filterChanged ? { [DEMAND_SYNC_KEY as never]: '' } : {}),
+  })
+}
+
+/**
+ * Войти по коду подключения из админки.
+ *
+ * Требует, чтобы InventoryServerUrl уже был установлен (дефолт из релиза).
+ * При успехе пишет в Settings ключ магазина, доступ к МС и выбранные склад,
+ * статус и счета.
+ */
+export async function signInWithCode(code: string): Promise<LoginSuccess | LoginFailure> {
   const serverUrl = await getSetting(SettingKey.InventoryServerUrl)
   if (!serverUrl) {
     return {
       ok: false,
       code: 'bad_request',
-      message:
-        'Не указан адрес сервера. Откройте Admin → Настройки → Inventory Server.',
+      message: 'Не указан адрес сервера. Откройте Настройки → Inventory Server.',
     }
+  }
+  if (!code.trim()) {
+    return { ok: false, code: 'bad_request', message: ERROR_MESSAGES.bad_request }
   }
 
   let response
   try {
-    response = await fetch(`${serverUrl.replace(/\/$/, '')}/api/v1/inventory/login`, {
+    response = await fetch(`${serverUrl.replace(/\/$/, '')}/api/v1/inventory/connect`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Accept: 'application/json',
       },
-      body: JSON.stringify({ email: email.trim(), password }),
+      body: JSON.stringify({ code: code.trim() }),
     })
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
-    await log.warn('inventory.sync', `login network error: ${msg}`)
+    await log.warn('inventory.sync', `connect network error: ${msg}`)
     return { ok: false, code: 'network_error', message: ERROR_MESSAGES.network_error }
   }
 
@@ -123,44 +165,28 @@ export async function signInWithMs({
     ok: boolean
     shop: LoginSuccess['shop']
     api_key: string
-    moysklad: {
-      login: string
-      basic_credentials: string
-      retailstore_id: string | null
-      retailstore_name: string | null
-      employee_id: string | null
-      employee_name: string | null
-    }
+    moysklad: ServerMoysklad
   }
-  if (!data?.ok || !data.api_key) {
+  if (!data?.ok || !data.api_key || !data.moysklad?.basic_credentials) {
     return { ok: false, code: 'server_error', message: 'Сервер вернул неверный формат' }
   }
 
-  // Пишем всё в Settings одной транзакцией (одна `setSettings`).
   await setSettings({
     [SettingKey.InventoryRemoteEnabled]: 'true',
     [SettingKey.InventoryShopApiKey]: data.api_key,
     [SettingKey.InventoryShopSlug]: data.shop.slug,
-    [SettingKey.MoyskladCredentials]: data.moysklad.basic_credentials,
-    [SettingKey.MoyskladLogin]: data.moysklad.login,
-    [SettingKey.MoyskladRetailStoreId]: data.moysklad.retailstore_id ?? '',
-    [SettingKey.MoyskladRetailStoreName]: data.moysklad.retailstore_name ?? '',
-    [SettingKey.MoyskladEmployeeId]: data.moysklad.employee_id ?? '',
-    [SettingKey.MoyskladEmployeeName]: data.moysklad.employee_name ?? '',
   })
+  await applyServerMoysklad(data.moysklad)
 
   await log.info(
     'inventory.sync',
-    `Logged in: shop=${data.shop.slug} (${data.shop.name}), ms=${data.moysklad.login}`,
+    `Касса подключена по коду: shop=${data.shop.slug} (${data.shop.name}), ms=${data.moysklad.login}`,
   )
 
   return {
     ok: true,
     shop: data.shop,
-    moysklad: {
-      login: data.moysklad.login,
-      retailstore_name: data.moysklad.retailstore_name,
-    },
+    moysklad: { login: data.moysklad.login, store_name: data.moysklad.store_name ?? null },
   }
 }
 
@@ -181,6 +207,14 @@ export async function signOut(): Promise<void> {
     [SettingKey.MoyskladRetailStoreName]: '',
     [SettingKey.MoyskladEmployeeId]: '',
     [SettingKey.MoyskladEmployeeName]: '',
+    // Склад, статус и счета — магазина, а не машины: после выхода за этой
+    // кассой может войти другой магазин. Курсор опроса — туда же.
+    [SettingKey.MoyskladStoreId]: '',
+    [SettingKey.MoyskladStoreName]: '',
+    [SettingKey.MoyskladDemandStateId]: '',
+    [SettingKey.MoyskladDemandStateName]: '',
+    [SettingKey.MoyskladPaymentAccounts]: '',
+    [DEMAND_SYNC_KEY as never]: '',
     // Inventory session — уроним на ноль чтобы AppGate видел Login
     [SettingKey.InventoryRemoteEnabled]: 'false',
     [SettingKey.InventoryShopApiKey]: '',

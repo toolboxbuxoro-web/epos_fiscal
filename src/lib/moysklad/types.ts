@@ -1,5 +1,5 @@
 // Типы МойСклад JSON API 1.2 (https://dev.moysklad.ru/doc/api/remap/1.2/).
-// Здесь только то, что нам нужно для работы с retaildemand и сопутствующими сущностями.
+// Здесь только то, что нужно кассе: отгрузки, их платежи и справочники.
 
 // ── Auth ─────────────────────────────────────────────────────────
 
@@ -19,6 +19,64 @@ export interface MsRetailStore {
   active?: boolean
   cashiers?: MsRef
   organization?: MsRef
+}
+
+/** Склад (`entity/store`). Касса пробивает отгрузки со своего склада. */
+export interface MsStore {
+  meta: MsMeta
+  id: string
+  name: string
+  archived?: boolean
+  address?: string
+}
+
+/** Статус документа (`entity/demand/metadata` → `states`). */
+export interface MsState {
+  meta: MsMeta
+  id: string
+  name: string
+  color?: number
+  /** Regular | Successful | Unsuccessful */
+  stateType?: string
+}
+
+/** Расчётный счёт юрлица (`entity/organization/{id}/accounts`). */
+export interface MsOrganizationAccount {
+  meta: MsMeta
+  id: string
+  accountNumber: string
+  bankName?: string
+  isDefault?: boolean
+}
+
+/** Юрлицо с раскрытыми счетами (`entity/organization?expand=accounts`). */
+export interface MsOrganization {
+  meta: MsMeta
+  id: string
+  name: string
+  archived?: boolean
+  accounts?: MsRef | { meta: MsMeta; rows: MsOrganizationAccount[] }
+}
+
+/**
+ * Платёж, связанный с отгрузкой: приходный ордер (`cashin`) или входящий
+ * платёж (`paymentin`).
+ *
+ * Один платёж может покрывать несколько документов, поэтому брать `sum`
+ * нельзя: сколько пришлось именно на эту отгрузку, написано в
+ * `operations[].linkedSum` напротив её ссылки.
+ */
+export interface MsPaymentDocument {
+  meta: MsMeta
+  id: string
+  name?: string
+  moment?: string
+  applicable?: boolean
+  /** Сумма платежа целиком, копейки. */
+  sum: number
+  /** Только у входящего платежа: счёт юрлица, на который пришли деньги. */
+  organizationAccount?: MsRef
+  operations?: Array<{ meta: MsMeta; linkedSum?: number }>
 }
 
 export interface MsEmployee {
@@ -81,23 +139,73 @@ export interface MsListResponse<T> {
   rows: T[]
 }
 
-// ── retaildemand ─────────────────────────────────────────────────
+// ── Документы продажи: отгрузка и розничная продажа ─────────────
 
-/** Розничная продажа (пробитый чек). */
-export interface MsRetailDemand {
+/**
+ * Документ продажи МойСклад — то, что касса фискализирует.
+ *
+ * Сейчас это Отгрузка (`demand`). Раньше была Розничная продажа
+ * (`retaildemand`): старые чеки в локальной базе и на сервере остаются в её
+ * формате, и история, возвраты и выгрузка продаж должны их читать. Позиции,
+ * сумма, валюта и контрагент у обоих документов устроены одинаково, поэтому
+ * подбор, возврат и синхронизация работают с этим общим типом и не знают,
+ * какой именно документ перед ними.
+ */
+export interface MsSaleDocument {
   meta: MsMeta
   id: string
-  accountId: string
-  syncId?: string
+  accountId?: string
   updated: string // "YYYY-MM-DD HH:MM:SS.SSS"
   name: string
   moment: string // "YYYY-MM-DD HH:MM:SS.SSS"
+  applicable?: boolean
+  rate?: { currency: MsRef; value?: number }
+  /** Сумма документа в копейках/тийинах (минимальной денежной единице). */
+  sum: number
+  vatSum?: number
+  vatEnabled?: boolean
+  vatIncluded?: boolean
+  organization?: MsRef
+  agent?: MsRef
+  store?: MsRef
+  /** Позиции. Доступны через expand=positions. */
+  positions: MsRef | { meta: MsMeta; rows: MsRetailDemandPosition[] }
+  attributes?: MsAttribute[]
+}
+
+/**
+ * Отгрузка (`entity/demand`) — по ней теперь пробивается чек.
+ *
+ * В отличие от розничной продажи у отгрузки нет разбивки «наличные / карта /
+ * QR». Оплата — это связанные документы: приходный ордер (`cashin`) и
+ * входящий платёж (`paymentin`). Тип оплаты входящего платежа определяется
+ * по расчётному счёту, на который пришли деньги (см. `demand-payment.ts`).
+ */
+export interface MsDemand extends MsSaleDocument {
+  store: MsRef
+  /** Статус отгрузки. Касса пробивает только отгрузки в выбранном статусе. */
+  state?: MsRef
+  /** Сумма входящих платежей по отгрузке (копейки) — справочно. */
+  payedSum?: number
+  /** Ссылки на связанные платежи: cashin и paymentin. */
+  payments?: MsRef[]
+  organizationAccount?: MsRef
+}
+
+/**
+ * Розничная продажа (пробитый чек).
+ *
+ * Розницы больше нет — касса пробивает отгрузки. Тип остаётся, потому что
+ * старые чеки в базе в этом формате: по ним печатают копии и оформляют
+ * возвраты.
+ */
+export interface MsRetailDemand extends MsSaleDocument {
+  accountId: string
+  syncId?: string
   applicable: boolean
   printed: boolean
   published: boolean
   rate: { currency: MsRef; value?: number }
-  /** Сумма документа в копейках/тийинах (минимальной денежной единице). */
-  sum: number
   vatSum: number
   vatEnabled: boolean
   vatIncluded: boolean
@@ -108,12 +216,9 @@ export interface MsRetailDemand {
   retailStore: MsRef
   organization: MsRef
   agent: MsRef
-  store?: MsRef
   group?: MsRef
   owner?: MsRef
   shared?: boolean
-  /** Позиции чека. Доступны через expand=positions. */
-  positions: MsRef | { meta: MsMeta; rows: MsRetailDemandPosition[] }
   fiscalPrintInfo?: {
     fiscalDocSign?: string
     fiscalDocNumber?: string
@@ -193,7 +298,7 @@ export interface MsVariant {
 
 /** Получить inline-позиции, если они expand-нуты. */
 export function inlinePositions(
-  rd: MsRetailDemand,
+  rd: MsSaleDocument,
 ): MsRetailDemandPosition[] | null {
   if (rd.positions && 'rows' in rd.positions) {
     return rd.positions.rows
@@ -234,7 +339,7 @@ export function inlineAssortment(
  *   (передаётся `client.listVariantsByProduct` чтобы не плодить deps)
  */
 export async function enrichWithVariants(
-  rd: MsRetailDemand,
+  rd: MsSaleDocument,
   fetchVariants: (productId: string) => Promise<MsVariant[]>,
 ): Promise<{ enrichedCount: number; productsChecked: number }> {
   const positions = inlinePositions(rd)

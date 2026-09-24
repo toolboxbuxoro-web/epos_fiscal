@@ -19,7 +19,7 @@
  * ПОКА БАЗА — СУМ, ЭТОТ МОДУЛЬ НИЧЕГО НЕ МЕНЯЕТ. Он только сверяет и молчит.
  */
 import type { MoyskladClient } from './client'
-import type { MsCurrency, MsRetailDemand } from './types'
+import type { MsCurrency, MsSaleDocument } from './types'
 
 /** Валюта, в которой касса умеет работать. Фискальный чек в Узбекистане обязан быть в сумах. */
 export const EXPECTED_CURRENCY = 'UZS'
@@ -80,7 +80,7 @@ export interface CurrencyVerdict {
  * Блокируем только когда точно знаем, что валюта чужая.
  */
 export function verifyReceiptCurrency(
-  rd: Pick<MsRetailDemand, 'rate'>,
+  rd: Pick<MsSaleDocument, 'rate'>,
   currencies: { base: string | null; byId: Map<string, string> },
 ): CurrencyVerdict {
   const { base, byId } = currencies

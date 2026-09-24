@@ -1,4 +1,4 @@
-import type { MsRetailDemand } from '@/lib/moysklad/types'
+import type { MsSaleDocument } from '@/lib/moysklad/types'
 import { extractPositions } from './extract'
 import {
   ceilToSum,
@@ -89,7 +89,7 @@ function lockChosenBatches(
  * Если ни одна не сработала — позиция остаётся без матча и попадёт в `warnings`.
  */
 export async function buildMatch(
-  receipt: MsRetailDemand,
+  receipt: MsSaleDocument,
   opts: MatcherOptions = {},
 ): Promise<BuildMatchResult> {
   // Имя характеристики модификации МС для связки с приходом — из настроек.
@@ -115,11 +115,14 @@ export async function buildMatch(
       ? opts.targetSumOverrideTiyin
       : receipt.sum
 
-  // ── Скидка на чек МС (бонусы / баллы / ручная скидка) ────────────
-  // В retaildemand `sum` — это что покупатель РЕАЛЬНО заплатил (после
-  // вычета бонусов/баллов). Сумма позиций может быть БОЛЬШЕ — например
-  // покупка на 1 000 000 сум, 100 000 закрыто баллами, к оплате 900 000.
-  // Фискализируем именно `effectiveTarget` (= receipt.sum минус Click/Payme).
+  // ── Сумма чека меньше суммы позиций ────────────────────────────
+  // Два источника:
+  //   - отгрузка: чек — это деньги, полученные наличными и картой; Click,
+  //     Payme и неоплаченный остаток в него не входят (targetSumOverride из
+  //     платежей, см. moysklad/document-payment.ts);
+  //   - старая розничная продажа: `sum` — что покупатель РЕАЛЬНО заплатил
+  //     после бонусов и баллов (покупка на 1 000 000, 100 000 баллами).
+  // Фискализируем именно `effectiveTarget`.
   // Если сумма позиций больше effectiveTarget — пропорционально уменьшаем
   // totalTiyin каждой позиции, чтобы matcher подбирал товары на правильную сумму.
   //
