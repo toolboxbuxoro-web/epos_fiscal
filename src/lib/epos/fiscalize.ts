@@ -54,10 +54,13 @@ import {
 import {
   FiscalDriveClient,
   FISCAL_DRIVE_DEFAULT_URL,
+  isFdsSendAllFirstError,
   mapFdsFiscalAnswer,
+  type FiscalDriveFiscalAnswer,
   type FiscalDriveItem,
   type FiscalDriveReceipt,
 } from './fiscal-drive-client'
+import { kickFdsSync, sendPendingToOfd, type PendingSendResult } from './fds-sync'
 import type { FiscalReceiptInfo } from './types'
 
 export interface FiscalizeOptions {
@@ -515,9 +518,35 @@ async function getCommunicatorVersionCached(eposUrl: string): Promise<string | n
  * Причина вне программы: USB-модуль теряет связь. Но кассиру про это
  * ничего не сообщалось — он видел английский техтекст и не понимал, что
  * достаточно нажать «Фискализировать» ещё раз.
+ *
+ * FiscalDriveService говорит о том же другими словами: смарт-карточный
+ * `SCARD_W_UNRESPONSIVE_CARD` / `SCARD_W_REMOVED_CARD` и «no card found».
+ * Без них кассир Хазрати Имом видел «Техническая ошибка …» и не получал
+ * автоматического повтора.
  */
 export function isCardNotConnectedError(message: string, data: string): boolean {
-  return /cannot\s+connect\s+card/i.test(`${message} ${data}`)
+  return /cannot\s+connect\s+card|SCARD_W_UNRESPONSIVE_CARD|SCARD_W_REMOVED_CARD|no\s+card\s+found/i.test(
+    `${message} ${data}`,
+  )
+}
+
+/**
+ * Фискальный модуль (FiscalDriveService) не регистрирует чек: в ОФД давно не
+ * уходили старые чеки. Касса уже попыталась их отправить и не смогла —
+ * обычно нет интернета. Чек в ОФД не ушёл, повтор безопасен.
+ */
+export class FiscalDriveSendFirstError extends Error {
+  readonly userFacing = true
+  constructor(detail?: string) {
+    super(
+      'Фискальный модуль не принимает чеки: в ОФД больше двух суток не уходили ' +
+        'старые чеки. Касса пыталась отправить их сама' +
+        (detail ? ` (${detail})` : '') +
+        ' — проверьте интернет и нажмите «Фискализировать» ещё раз. ' +
+        'Чек в ОФД не ушёл, дубля не будет.',
+    )
+    this.name = 'FiscalDriveSendFirstError'
+  }
 }
 
 /**
@@ -1040,6 +1069,72 @@ async function buildReceiptData(
 // ── Реализация для FiscalDriveService REST :3449 ────────────────────────────
 
 /**
+ * Повторить вызов FiscalDriveService один раз, если не отозвалась карта.
+ * Вызывающий отвечает за то, что повтор безопасен (GetTXID — чек только
+ * пишется в БД сервиса; RegisterTXID — идемпотентен по TXID).
+ */
+async function withCardRetry<T>(call: () => Promise<T>, step: string): Promise<T> {
+  try {
+    return await call()
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    if (!isCardNotConnectedError(msg, '')) throw e
+    await log.warn('fiscalize', `FiscalDrive ${step}: карта не отозвалась — повторяю через 1.5 сек`)
+    await new Promise((r) => setTimeout(r, 1500))
+    return call()
+  }
+}
+
+/**
+ * Зарегистрировать чек в ФМ, сняв блокировку 9031, если она есть.
+ *
+ * 9031 (`SEND_ALL_RECEIPTS_FIRST`): ФМ не примет чек, пока в ОФД не уйдут
+ * старые. Отправляем их и повторяем регистрацию того же TXID — это
+ * безопасно, ФМ вернёт результат первой регистрации, дубля не будет.
+ */
+export async function registerWithRecovery(
+  client: FiscalDriveClient,
+  factoryId: string,
+  txid: number,
+): Promise<FiscalDriveFiscalAnswer> {
+  try {
+    return await withCardRetry(() => client.registerReceiptTXID(factoryId, txid), 'RegisterTXID')
+  } catch (first) {
+    const firstMsg = first instanceof Error ? first.message : String(first)
+    if (!isFdsSendAllFirstError(firstMsg)) throw first
+
+    await log.warn('fiscalize', 'ФМ требует отправить старые чеки (9031) — отправляю и повторяю', {
+      factoryId,
+      txid,
+    })
+    let sent: PendingSendResult
+    try {
+      sent = await sendPendingToOfd(client, factoryId)
+    } catch (syncErr) {
+      const syncMsg = syncErr instanceof Error ? syncErr.message : String(syncErr)
+      await log.error('fiscalize', `Не удалось отправить накопленные чеки в ОФД: ${syncMsg}`, {
+        factoryId,
+        txid,
+      })
+      throw new FiscalDriveSendFirstError('ОФД не ответил')
+    }
+    await log.info('fiscalize', `Отправлено в ОФД: чеков ${sent.receipts}, Z-отчётов ${sent.zReports}`)
+
+    try {
+      return await client.registerReceiptTXID(factoryId, txid)
+    } catch (second) {
+      const secondMsg = second instanceof Error ? second.message : String(second)
+      if (!isFdsSendAllFirstError(secondMsg)) throw second
+      await log.error('fiscalize', `ФМ по-прежнему блокирован (9031) после отправки ${sent.receipts} чеков`, {
+        factoryId,
+        txid,
+      })
+      throw new FiscalDriveSendFirstError(`отправлено ${sent.receipts}, но модуль всё ещё ждёт`)
+    }
+  }
+}
+
+/**
  * Двухшаговая фискализация через FiscalDriveService:
  *   1. GetTXID — записать JSON-чек в БД FDS, получить TXID
  *   2. RegisterTXID — подписать ФМ, получить FiscalSign+QR
@@ -1106,7 +1201,9 @@ async function fiscalizeFiscalDrive(
   const client = new FiscalDriveClient({ baseUrl })
   let txid: number
   try {
-    txid = await client.getReceiptTXID(factoryId, receipt)
+    // GetTXID только кладёт чек в БД сервиса — подписи и отправки ещё нет,
+    // поэтому при сбое карты один повтор безопасен.
+    txid = await withCardRetry(() => client.getReceiptTXID(factoryId, receipt), 'GetTXID')
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     await log.error('fiscalize', `FiscalDrive GetTXID ошибка: ${msg}`, {
@@ -1114,6 +1211,7 @@ async function fiscalizeFiscalDrive(
       factoryId,
       request: receipt,
     })
+    if (isCardNotConnectedError(msg, '')) throw new CardNotConnectedError()
     throw e
   }
 
@@ -1121,7 +1219,7 @@ async function fiscalizeFiscalDrive(
 
   let answer
   try {
-    answer = await client.registerReceiptTXID(factoryId, txid)
+    answer = await registerWithRecovery(client, factoryId, txid)
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     await log.error('fiscalize', `FiscalDrive RegisterTXID ошибка (TXID=${txid}): ${msg}`, {
@@ -1140,12 +1238,20 @@ async function fiscalizeFiscalDrive(
     if (isShiftClosedError(msg, '')) {
       throw new ShiftNotOpenError()
     }
+    // Карта не отозвалась и на повторе — понятное сообщение вместо Go-текста.
+    if (isCardNotConnectedError(msg, '')) {
+      throw new CardNotConnectedError()
+    }
     throw e
   }
 
   await log.info('fiscalize', `FiscalDrive RegisterTXID успешно: ${answer.FiscalSign}`, {
     response: answer,
   })
+
+  // Сразу отправляем чек в ОФД, не задерживая кассира: иначе чеки копятся
+  // в ФМ, и через двое суток он блокирует продажи (см. fds-sync.ts).
+  kickFdsSync()
 
   return { fiscal: mapFdsFiscalAnswer(answer), requestJson }
 }

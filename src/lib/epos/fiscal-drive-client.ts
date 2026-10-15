@@ -301,6 +301,44 @@ export class FiscalDriveClient {
   registerReceiptTXID(factoryId: string, txid: number): Promise<FiscalDriveFiscalAnswer> {
     return this.request('POST', `/FiscalDrive/Receipt/RegisterTXID/${enc(factoryId)}?TXID=${txid}`)
   }
+
+  /**
+   * Отправить накопленные чеки в ОФД (до `itemsCount` штук за вызов, не
+   * больше 32) и передать подтверждения в ФМ — тот стирает отправленное.
+   *
+   * Сам FiscalDriveService в ОФД НЕ ходит — только по этой команде кассы.
+   * Без неё чеки копятся в ФМ, и через 2 суток он блокирует продажи
+   * (`9031 - SEND_ALL_RECEIPTS_FIRST`) — так встал Хазрати Имом 15.10.2026.
+   */
+  syncFullReceipts(factoryId: string, itemsCount = 32): Promise<FiscalDriveSyncResult> {
+    return this.request(
+      'POST',
+      `/DataBase/Files/Sync/FullReceipts/${enc(factoryId)}?ItemsCount=${itemsCount}`,
+    )
+  }
+
+  /** То же для Z-отчётов: закрытые смены тоже нужно доставить в ОФД. */
+  syncZReports(factoryId: string, itemsCount = 32): Promise<FiscalDriveSyncResult> {
+    return this.request(
+      'POST',
+      `/DataBase/Files/Sync/ZReports/${enc(factoryId)}?ItemsCount=${itemsCount}`,
+    )
+  }
+}
+
+/** Ответ /DataBase/Files/Sync/*: что ушло в ОФД за этот вызов. */
+export interface FiscalDriveSyncResult {
+  Items?: Array<{ TerminalID?: string; ReceiptSeq?: number; StatusText?: string }>
+  SuccessfulsCount?: number
+}
+
+/**
+ * ФМ не регистрирует чек, пока в ОФД не уйдут старые
+ * (`9031 - SEND_ALL_RECEIPTS_FIRST`): самый старый неотправленный чек
+ * старше двух суток. Лечится отправкой — см. `syncFullReceipts`.
+ */
+export function isFdsSendAllFirstError(message: string): boolean {
+  return /9031|SEND_ALL_RECEIPTS_FIRST/i.test(message)
 }
 
 // ── Mappers ─────────────────────────────────────────────────────────────────

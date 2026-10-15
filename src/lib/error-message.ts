@@ -46,7 +46,25 @@ export function formatErrorForUser(e: unknown): string {
     return formatMoyskladError(e)
   }
 
+  // Ошибки, у которых текст уже написан для кассира.
+  if (e instanceof Error && (e as { userFacing?: boolean }).userFacing) return e.message
+
   const raw = e instanceof Error ? e.message : String(e)
+
+  // FiscalDriveService: блокировка ФМ из-за неотправленных чеков и сбой карты
+  // (касса обычно ловит их раньше, но Смена и прочие экраны — сюда).
+  if (/9031|SEND_ALL_RECEIPTS_FIRST/i.test(raw)) {
+    return (
+      'Фискальный модуль не принимает чеки: в ОФД давно не уходили старые чеки. ' +
+      'Проверьте интернет на кассе и повторите — касса отправит их сама.'
+    )
+  }
+  if (/SCARD_W_UNRESPONSIVE_CARD|SCARD_W_REMOVED_CARD|no card found/i.test(raw)) {
+    return (
+      'Фискальная карта не отвечает. Повторите ещё раз; если не помогает — ' +
+      'переподключите USB-модуль и перезапустите службу FiscalDriveService.'
+    )
+  }
 
   // Postgres constraint violations — сервер не маскирует, текст SQL утечкой
   if (/inv_items_check|violates check constraint/i.test(raw)) {
