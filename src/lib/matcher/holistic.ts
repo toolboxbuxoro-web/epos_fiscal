@@ -12,20 +12,26 @@
  *          уважая available и cost-floor (не в убыток).
  *
  * Алгоритм:
- *   Фаза 1 (greedy крупное) — крупные SKU по убыванию sellPrice,
- *           но НЕ съедаем всё: оставляем резерв `holisticFillerReserveTiyin`
- *           под филлеры. Это предотвращает ситуацию когда крупный товар
- *           вписался ровно, а дробить остаток нечем.
+ *   Фаза 1 (greedy крупное) — крупные SKU по убыванию sellPrice, сколько
+ *           влезает в сумму чека.
  *
- *   Фаза 2 (DP exact-sum) — оставшийся `remaining` собираем точным
- *           subset-sum на филлерах (sellPrice ≤ holisticFillerThresholdTiyin).
- *           DP по сумме с шагом ~1000 тийинов, размер таблицы маленький
- *           (типично remaining ≤ 50k, ≤50 buckets × ≤30 filler-SKU).
+ *   Фаза 2 (мелочь на остаток) — что крупным не закрылось, добираем
+ *           филлерами (sellPrice ≤ holisticFillerThresholdTiyin) НАИМЕНЬШИМ
+ *           числом штук: точно, если сумма достижима, иначе ближайшую снизу.
  *
- *   Фаза 3 (delta-патч) — если DP не нашёл exact, берём closest-below
- *           и компенсируем недостачу через bump (увеличение priceTiyin
- *           одной из выбранных строк) или discount (если closest-above
- *           ближе и cost-floor позволяет). Cap = `maxBumpPerItemTiyin`.
+ *   Фаза 3 (delta-патч) — недобор закрываем надбавкой (bump) к крупной
+ *           строке, перебор — скидкой не ниже cost-floor.
+ *           Cap = `maxBumpPerItemTiyin`.
+ *
+ * Мелочь — дефицит, её берём только на хвост. До 0.12.2 фаза 1 намеренно
+ * оставляла под филлеры резерв 30 000 сум, а точная сборка брала первую
+ * найденную комбинацию — и каждый чек «съедал» 30–60 тысяч мелочи (пачки
+ * по 10–20 штук). Прогон истории с 01.09 по 22.10.2026 (2 379 чеков,
+ * склад восстановлен по журналу): партия мелочи жила в среднем 1,9 дня,
+ * 7 910 винтов ушли за 10 дней. Без резерва и с наименьшим числом штук —
+ * 2 306 штук мелочи вместо 20 724 за тот же период, все чеки собраны, а
+ * себестоимость списанного почти та же (+1%).
+ * Инструмент прогона — `__tests__/history-replay.test.ts`.
  *
  * Гарантии (если возвращён Ok):
  *   - Σ (line.priceTiyin - line.discountTiyin) = target (exact)
@@ -60,11 +66,15 @@ import {
 } from './strategies'
 import type { HolisticLine, HolisticPlan, MatcherOptions } from './types'
 
-const DEFAULT_FILLER_RESERVE_TIYIN: Tiyin = 3_000_000 // 30 000 сум
 const DEFAULT_FILLER_THRESHOLD_TIYIN: Tiyin = 2_000_000 // 20 000 сум selling
 const DEFAULT_MAX_LINES = 30
 const DEFAULT_MAX_BUMP_PER_LINE_TIYIN: Tiyin = 1_000_000 // 10 000 сум
-const DP_BUCKET_TIYIN: Tiyin = 100_000 // 1000 сум — шаг округления цен (`roundUpToSum` default)
+/**
+ * Предел размера таблицы добора (сумм × филлеров). Дальше — простой
+ * жадный добор: таблица на десятки мегабайт подвесила бы кассу, а такой
+ * остаток бывает только при совсем пустом складе крупного.
+ */
+const MAX_DP_CELLS = 5_000_000
 
 export type HolisticRejectReason =
   | 'POOL_EMPTY'
@@ -164,7 +174,6 @@ function planHolisticWithCap(
     return { ok: false, reason: 'POOL_EMPTY', detail: 'пул товаров пуст' }
   }
 
-  const fillerReserve = opts.holisticFillerReserveTiyin ?? DEFAULT_FILLER_RESERVE_TIYIN
   const fillerThreshold = opts.holisticFillerThresholdTiyin ?? DEFAULT_FILLER_THRESHOLD_TIYIN
   const maxLines = opts.holisticMaxLines ?? DEFAULT_MAX_LINES
   const maxBumpPerLine = opts.maxBumpPerItemTiyin ?? DEFAULT_MAX_BUMP_PER_LINE_TIYIN
@@ -270,11 +279,8 @@ function planHolisticWithCap(
     }
   }
 
-  // ── Фаза 1: greedy крупное (с резервом под филлеры) ──
+  // ── Фаза 1: greedy крупное ──
   const notes: string[] = []
-  const hasFillers = working.some(
-    (w) => w.poolItem.sellingPrice <= fillerThreshold && w.remainingAvailable > 0,
-  )
   let remaining = target
 
   for (const w of working) {
@@ -291,14 +297,11 @@ function planHolisticWithCap(
     )
     if (unitFloor > sell) continue
 
-    // Целевой бюджет фазы 1: либо весь remaining (если филлеров нет),
-    // либо remaining - fillerReserve (оставляем под фазу 2).
-    const phase1Budget = hasFillers
-      ? Math.max(0, remaining - fillerReserve)
-      : remaining
-    if (phase1Budget < sell) continue
+    // Без резерва под мелочь: крупное закрывает всё, что может, — мелочь
+    // идёт только на хвост (см. заголовок файла).
+    if (remaining < sell) continue
 
-    const fitsByBudget = Math.floor(phase1Budget / sell)
+    const fitsByBudget = Math.floor(remaining / sell)
     const fitsByStock = w.remainingAvailable
     const qty = Math.min(fitsByBudget, fitsByStock)
     if (qty <= 0) continue
@@ -308,7 +311,7 @@ function planHolisticWithCap(
     remaining -= qty * sell
   }
 
-  // ── Фаза 2: точная сборка остатка через DP subset-sum (с повторами) ──
+  // ── Фаза 2: остаток — мелочью, наименьшим числом штук ──
   if (remaining > 0) {
     const fillers = working
       .filter((w) => {
@@ -329,23 +332,13 @@ function planHolisticWithCap(
       .sort((a, b) => b.poolItem.sellingPrice - a.poolItem.sellingPrice)
 
     if (fillers.length > 0 && remaining >= cheapest) {
-      const dpPicks = dpExactSum(remaining, fillers)
-      if (dpPicks) {
-        for (const { workingIndex, qty } of dpPicks) {
-          const w = fillers[workingIndex]!
-          w.pickedQty += qty
-          w.remainingAvailable -= qty
-          remaining -= qty * w.poolItem.sellingPrice
-        }
-      } else {
-        // DP exact не нашлось — берём closest-below и фаза 3 закрывает delta.
-        const below = dpClosestBelow(remaining, fillers)
-        for (const { workingIndex, qty } of below) {
-          const w = fillers[workingIndex]!
-          w.pickedQty += qty
-          w.remainingAvailable -= qty
-          remaining -= qty * w.poolItem.sellingPrice
-        }
+      // Точно — если сумма достижима, иначе ближайшая снизу; разницу
+      // закроет фаза 3.
+      for (const { workingIndex, qty } of dpFewestPieces(remaining, fillers)) {
+        const w = fillers[workingIndex]!
+        w.pickedQty += qty
+        w.remainingAvailable -= qty
+        remaining -= qty * w.poolItem.sellingPrice
       }
     }
   }
@@ -540,126 +533,127 @@ function planHolisticWithCap(
 }
 
 /**
- * DP exact-sum: найти комбинацию qty_i для каждого filler-SKU такую что
- * Σ (sellPrice_i × qty_i) = target.
+ * Мелочь на сумму ≤ target наименьшим числом штук: точно, если сумма
+ * достижима, иначе ближайшая снизу (разницу закроет фаза 3).
  *
- * Возвращает picks или null если exact-sum не достижим.
+ * Почему «наименьшим»: раньше бралась первая найденная комбинация, и на
+ * остаток 22 000 уходили 22 винта по 1 000 вместо трёх товаров по 7 000.
+ * Чек выглядел неправдоподобно, а дешёвые приходы кончались за дни.
  *
- * Алгоритм: bounded subset-sum с повторами через reachability-DP.
- * Квантуем по `DP_BUCKET_TIYIN` (шаг 1000 сум = шаг округления selling-цены).
+ * Ограниченный рюкзак «минимум монет». Шаг сумм — НОД цен филлеров: при
+ * округлении до 1000 сум это 1000 сум и больше, а у магазина с другим
+ * шагом (100, 500) таблица просто мельче — товары с «некруглой» ценой не
+ * выпадают из подбора. Филлеры по одному за проход; для суммы b на проходе f:
+ *   best_f[b] = min по q ∈ [0, maxQty] (best_{f-1}[b − q·step] + q).
+ * Минимум по окну q считается монотонной очередью отдельно для каждого
+ * остатка b mod step — O(сумм) на филлер, не O(сумм × штук): при снятом
+ * потолке штук (повтор без лимита в planHolistic) у товара бывает 7 000+
+ * штук в остатке, и прямой перебор q подвешивал бы кассу.
  *
- * Каждый filler обрабатывается ОДИН раз, и для каждого srcBucket в текущем
- * reachable пробуем добавить qty=1..maxQty копий — это аккуратно соблюдает
- * bounded-условие (никаких следов "сколько уже взяли" по цепочке).
- *
- * Структура: reach[b] = parent-info, либо null если bucket недостижим.
- * После обработки filler f, новые bucket'ы могли появиться только через
- * добавление 1+ копий именно f к bucket'ам, достижимым ДО f.
- *
- * Сложность: O(F × |reachable| × maxQty). Для F=30, |reachable|≤500, maxQty≤50
- * это 750k операций — мс-scale в JS.
+ * На каждом проходе запоминаем, сколько штук ЭТОГО филлера взяли; план
+ * восстанавливается проходами с конца. При равенстве штук выигрывает
+ * филлер раньше по списку — они отсортированы по убыванию цены.
  */
-function dpExactSum(
-  target: Tiyin,
-  fillers: WorkingItem[],
-): DpPick[] | null {
-  if (target <= 0) return []
-  if (target % DP_BUCKET_TIYIN !== 0) {
-    // Селлинг цены кратны DP_BUCKET_TIYIN (roundUpToSum=1000). Если target
-    // не кратен — exact-sum невозможен без bump'а. Возвращаем null чтобы
-    // вызвать closest-below + bump path.
-    return null
-  }
-  const targetBuckets = target / DP_BUCKET_TIYIN
+function dpFewestPieces(target: Tiyin, fillers: WorkingItem[]): DpPick[] {
+  const usable = fillers.filter((w) => w.poolItem.sellingPrice > 0 && w.remainingAvailable > 0)
+  if (target <= 0 || usable.length === 0) return []
+  const unit = usable.reduce((g, w) => gcd(g, w.poolItem.sellingPrice), 0)
+  const T = Math.floor(target / unit)
+  if (T <= 0) return []
+  if ((T + 1) * fillers.length > MAX_DP_CELLS) return greedyBelow(target, fillers)
 
-  // reach[b] = { fillerIndex, qtyTaken, prev } — как мы пришли в b,
-  // или null если bucket недостижим. reach[0] — стартовое состояние.
-  type ParentInfo = { fillerIndex: number; qtyTaken: number; prev: number }
-  const reach: (ParentInfo | null)[] = new Array(targetBuckets + 1).fill(null)
-  // Маркер для bucket=0 (специальный): нет родителя, но достижим.
-  reach[0] = { fillerIndex: -1, qtyTaken: 0, prev: -1 }
+  const INF = 0x3fffffff
+  let best = new Int32Array(T + 1).fill(INF)
+  best[0] = 0
+  const takenByStage: Array<Uint16Array | null> = []
 
   for (let f = 0; f < fillers.length; f++) {
     const sell = fillers[f]!.poolItem.sellingPrice
-    if (sell <= 0 || sell % DP_BUCKET_TIYIN !== 0) continue
-    const stepBuckets = sell / DP_BUCKET_TIYIN
-    if (stepBuckets <= 0) continue
-    const maxQty = fillers[f]!.remainingAvailable
-    if (maxQty <= 0) continue
-
-    // Снимок reach ДО обработки этого filler — чтобы добавлять только новые
-    // достижения, не зацикливая «беру f → реход через f → беру f ещё раз»
-    // в один проход.
-    const snapshot: (ParentInfo | null)[] = reach.slice()
-    for (let srcBucket = 0; srcBucket <= targetBuckets; srcBucket++) {
-      if (snapshot[srcBucket] === null) continue
-      // Пробуем взять qty штук filler[f] поверх snapshot[srcBucket].
-      for (let qty = 1; qty <= maxQty; qty++) {
-        const dstBucket = srcBucket + qty * stepBuckets
-        if (dstBucket > targetBuckets) break
-        // Если уже достижимо — не перезаписываем (любой путь к target нас устраивает).
-        if (reach[dstBucket] !== null) continue
-        reach[dstBucket] = { fillerIndex: f, qtyTaken: qty, prev: srcBucket }
+    const maxQty = Math.min(fillers[f]!.remainingAvailable, 0xffff)
+    if (sell <= 0 || maxQty <= 0) {
+      takenByStage.push(null)
+      continue
+    }
+    const step = sell / unit
+    const next = new Int32Array(T + 1)
+    const taken = new Uint16Array(T + 1)
+    const queue = new Int32Array(Math.floor(T / step) + 2)
+    for (let r = 0; r < step && r <= T; r++) {
+      // Очередь индексов j (сумма r + j·step) по возрастанию best − j.
+      let head = 0
+      let tail = 0
+      for (let j = 0, b = r; b <= T; j++, b += step) {
+        const cur = best[b]!
+        if (cur !== INF) {
+          const key = cur - j
+          while (tail > head && best[r + queue[tail - 1]! * step]! - queue[tail - 1]! >= key) tail--
+          queue[tail++] = j
+        }
+        while (tail > head && queue[head]! < j - maxQty) head++
+        let value = cur
+        let q = 0
+        if (tail > head) {
+          const src = queue[head]!
+          const cand = best[r + src * step]! + (j - src)
+          if (cand < value) {
+            value = cand
+            q = j - src
+          }
+        }
+        next[b] = value
+        taken[b] = q
       }
     }
-
-    // Ранний выход: если target уже достижим — можно собирать восстановление.
-    if (reach[targetBuckets] !== null) break
+    best = next
+    takenByStage.push(taken)
   }
 
-  if (reach[targetBuckets] === null) return null
-
-  // Восстанавливаем picks: проходим цепочку parent'ов от target до 0.
-  const counts = new Map<number, number>() // fillerIndex → суммарный qty
-  let cur = targetBuckets
-  // Безопасность от поломанной цепочки.
-  let safety = targetBuckets + 10
-  while (cur > 0 && safety-- > 0) {
-    const step = reach[cur]
-    if (!step) return null
-    if (step.fillerIndex >= 0) {
-      counts.set(
-        step.fillerIndex,
-        (counts.get(step.fillerIndex) ?? 0) + step.qtyTaken,
-      )
-    }
-    cur = step.prev
-  }
-  if (safety < 0) return null
-
+  let b = T
+  while (b > 0 && best[b] === INF) b--
   const picks: DpPick[] = []
-  counts.forEach((qty, workingIndex) => picks.push({ workingIndex, qty }))
+  for (let f = fillers.length - 1; f >= 0 && b > 0; f--) {
+    const q = takenByStage[f]?.[b] ?? 0
+    if (q > 0) {
+      picks.push({ workingIndex: f, qty: q })
+      b -= q * (fillers[f]!.poolItem.sellingPrice / unit)
+    }
+  }
   return picks
 }
 
 /**
- * Closest-below: ближайшая достижимая сумма ≤ target. Использует ту же DP-таблицу
- * но возвращает максимальный достижимый bucket. Гарантированно возвращает что-то
- * (как минимум пустой пик, если ни один филлер не помещается).
+ * Запасной добор для огромного остатка: филлеры по убыванию цены, пока
+ * влезают. Неточно, но мгновенно — разницу закроет фаза 3.
  */
-function dpClosestBelow(
-  target: Tiyin,
-  fillers: WorkingItem[],
-): DpPick[] {
-  if (target <= 0) return []
-  // Простая жадность: берём филлеры по убыванию цены, пока влезают.
-  // (DP closest-below был бы точнее, но усложнение не стоит — фаза 3 bump
-  //  закроет небольшую разницу.)
-  const picks = new Map<number, number>()
+function greedyBelow(target: Tiyin, fillers: WorkingItem[]): DpPick[] {
+  const picks: DpPick[] = []
   let remaining = target
-  for (let f = 0; f < fillers.length; f++) {
+  for (let f = 0; f < fillers.length && remaining > 0; f++) {
     const sell = fillers[f]!.poolItem.sellingPrice
-    const maxQty = fillers[f]!.remainingAvailable
-    if (sell <= 0 || maxQty <= 0) continue
-    const take = Math.min(Math.floor(remaining / sell), maxQty)
+    const take = sell > 0 ? Math.min(Math.floor(remaining / sell), fillers[f]!.remainingAvailable) : 0
     if (take <= 0) continue
-    picks.set(f, take)
+    picks.push({ workingIndex: f, qty: take })
     remaining -= take * sell
-    if (remaining <= 0) break
   }
-  const result: DpPick[] = []
-  picks.forEach((qty, workingIndex) => result.push({ workingIndex, qty }))
-  return result
+  return picks
+}
+
+/** Для тестов: добор мелочи на сумму — индексы во входном списке и штуки. */
+export function _fewestPiecesForTests(
+  target: Tiyin,
+  fillers: Array<{ sellingPrice: Tiyin; qty: number }>,
+): Array<{ index: number; qty: number }> {
+  const working = fillers.map<WorkingItem>((f) => ({
+    poolItem: { item: {} as PoolItem['item'], sellingPrice: f.sellingPrice },
+    remainingAvailable: f.qty,
+    pickedQty: 0,
+  }))
+  return dpFewestPieces(target, working).map((p) => ({ index: p.workingIndex, qty: p.qty }))
+}
+
+function gcd(a: number, b: number): number {
+  while (b) [a, b] = [b, a % b]
+  return a
 }
 
 // ── Внутренние типы ──────────────────────────────────────────────────

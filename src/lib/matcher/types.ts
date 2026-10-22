@@ -325,13 +325,6 @@ export interface MatcherOptions {
   maxQtyPerLine?: number
   holisticMaxLines?: number
   /**
-   * Резерв (в тийинах) под филлеры в фазе 1 holistic-планировщика.
-   * Жадный greedy не «съест» весь target крупными SKU — оставит этот
-   * резерв для последующего exact-sum DP на мелких товарах.
-   * По умолчанию 3 000 000 (30 000 сум).
-   */
-  holisticFillerReserveTiyin?: Tiyin
-  /**
    * Граница «крупное / мелкое» для holistic-планировщика (тийины
    * за 1 шт продажной цены). Товары с `sellPrice ≤ этого значения`
    * считаются филлерами и идут в фазу 2 (DP), остальные — в фазу 1

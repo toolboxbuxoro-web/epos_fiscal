@@ -4,4 +4,4 @@
  * Должна совпадать с `package.json::version` и
  * `src-tauri/tauri.conf.json::version`.
  */
-export const APP_VERSION = '0.12.1'
+export const APP_VERSION = '0.12.2'

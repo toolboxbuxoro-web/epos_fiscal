@@ -788,7 +788,7 @@ describe('planHolistic — per-line floor reject интегрирован в о�
     const pool = mkPool([mkPoolItem(big, priceBig), mkPoolItem(badFiller, priceBadFiller)])
 
     const target = priceBig + priceBadFiller
-    const r = planHolistic(target, pool, { holisticFillerReserveTiyin: 0 })
+    const r = planHolistic(target, pool)
     // Детерминированный исход (проверено прогоном): фаза 1 берёт 1×big
     // (unitFloor 4_704_000 ≤ 5_000_000 → ОК), фаза 2 полностью исключает
     // badFiller (его unitFloor 1_176_000 > его sellingPrice 1_000_000 —
