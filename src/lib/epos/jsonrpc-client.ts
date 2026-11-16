@@ -322,7 +322,13 @@ export class JsonRpcEposClient {
    */
   async getZReportInfo(): Promise<JsonRpcZReportInfo | null> {
     try {
-      return await this.call<JsonRpcZReportInfo>('Api.GetZReportInfo')
+      const info = await this.call<JsonRpcZReportInfo>('Api.GetZReportInfo')
+      // После закрытия смены Communicator отдаёт «пустую» запись следующего
+      // Z-отчёта: без времени открытия и закрытия. Это не открытая смена
+      // (closeZReport на ней отвечает 36909) — иначе экран показывал бы
+      // «Смена открыта», а переключение программы считало бы смену незакрытой.
+      if (info && !info.OpenTime && !info.CloseTime) return null
+      return info
     } catch (e) {
       const msg = String(e instanceof Error ? e.message : e).toLowerCase()
       // Z-отчёт ещё не открыт — это нормально, не ошибка

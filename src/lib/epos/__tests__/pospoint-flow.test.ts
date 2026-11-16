@@ -1231,12 +1231,14 @@ describe('переключение кассы на другую программ
     json: async () => payload,
   })
 
-  function epos(state: { zOpen?: boolean; unsent?: number; down?: boolean }) {
+  function epos(state: { zOpen?: boolean; unsent?: number; down?: boolean; blank?: boolean }) {
     H.fetch = async (url: string, init?: any) => {
       if (state.down) throw new Error('error sending request: Connection refused (os error 61)')
       const body = JSON.parse(String(init.body))
       if (body.method === 'Api.GetZReportInfo') {
-        return reply({ jsonrpc: '2.0', id: body.id, result: { CloseTime: state.zOpen ? '' : '2026-11-09 21:00:00', Number: 7 } })
+        return reply({ jsonrpc: '2.0', id: body.id, result: state.blank
+            ? { OpenTime: '', CloseTime: '', Number: 546 }
+            : { OpenTime: '2026-11-09 09:00:00', CloseTime: state.zOpen ? '' : '2026-11-09 21:00:00', Number: 7 } })
       }
       if (body.method === 'Api.GetUnsentCount') {
         return reply({ jsonrpc: '2.0', id: body.id, result: { Count: state.unsent ?? 0, TerminalID: 'T' } })
@@ -1247,6 +1249,11 @@ describe('переключение кассы на другую программ
 
   it('E-POS: смена закрыта, всё отправлено — можно', async () => {
     epos({})
+    expect(await R.checkSwitchReadiness('epos', 'pospoint')).toEqual({ status: 'ready', notes: [] })
+  })
+
+  it('E-POS после закрытия отдаёт пустую запись смены (без времени) — это закрытая смена', async () => {
+    epos({ blank: true })
     expect(await R.checkSwitchReadiness('epos', 'pospoint')).toEqual({ status: 'ready', notes: [] })
   })
 
