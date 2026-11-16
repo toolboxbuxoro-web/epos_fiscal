@@ -105,9 +105,12 @@ async function checkFiscalDrive(): Promise<SwitchReadiness> {
     const z = await client.getZReportInfo(factoryId, 0)
     if (z && z.CloseTime === '') reasons.push('Закройте смену в разделе «Смена» (сейчас она открыта в FiscalDriveService).')
     const mem = await client.getFiscalMemoryInfo(factoryId)
-    if (mem.ReceiptsCount > 0 || mem.ZReportsCount > 0) {
+    // Только чеки: ReceiptsCount — «ещё не отправлены в ОФД». ZReportsCount —
+    // сколько всего Z-отчётов в ФМ за всё время (у Хазрати 243), а не очередь
+    // на отправку; по нему блокировать нельзя — касса не переключилась бы никогда.
+    if (mem.ReceiptsCount > 0) {
       reasons.push(
-        `В фискальном модуле остались не отправленные в ОФД: чеков ${mem.ReceiptsCount}, Z-отчётов ${mem.ZReportsCount}. ` +
+        `В фискальном модуле остались не отправленные в ОФД чеки: ${mem.ReceiptsCount}. ` +
           'Проверьте интернет и повторите — переключаться можно, когда всё уйдёт.',
       )
     }

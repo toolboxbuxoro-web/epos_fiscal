@@ -1283,7 +1283,7 @@ describe('переключение кассы на другую программ
       }
       if (path.includes('/Sync/ZReports')) return reply({ Items: [], SuccessfulsCount: 0 })
       if (path.includes('/ZReport/Info')) return reply({ CloseTime: '2026-11-09 21:00:00' })
-      if (path.includes('/FiscalMemory/Info')) return reply({ ReceiptsCount: memory, ZReportsCount: 0 })
+      if (path.includes('/FiscalMemory/Info')) return reply({ ReceiptsCount: memory, ZReportsCount: 243 })
       throw new Error(`unexpected ${url}`)
     }
     const r = await R.checkSwitchReadiness('fiscaldrive', 'pospoint')
@@ -1303,7 +1303,7 @@ describe('переключение кассы на другую программ
     }
     const r = await R.checkSwitchReadiness('fiscaldrive', 'pospoint')
     expect(r.status).toBe('blocked')
-    expect((r as { reasons: string[] }).reasons.join(' ')).toMatch(/чеков 2, Z-отчётов 1/)
+    expect((r as { reasons: string[] }).reasons.join(' ')).toMatch(/чеки: 2/)
   })
 
   it('E-POS занят (не ответил вовремя) — «подождите», а не «выключен»', async () => {
