@@ -140,4 +140,6 @@ export interface FiscalReceiptInfo {
   FiscalSign: string
   AppletVersion?: string
   QRCodeURL: string
+  /** Сырой ответ кассы (Pospoint) — уходит в response_json для сверки. */
+  Raw?: unknown
 }

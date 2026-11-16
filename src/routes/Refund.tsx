@@ -25,7 +25,6 @@ import { AlertCircle, ArrowLeft, TriangleAlert, Undo2 } from 'lucide-react'
 import {
   getDb,
   getMsReceipt,
-  getRefundByOriginalFiscalId,
   getRefundState,
   listRefundsByOriginalFiscalId,
   type FiscalReceiptRow,
@@ -123,6 +122,8 @@ export default function Refund() {
    * денег. Ref проверяется СИНХРОННО в самом начале doRefund.
    */
   const submitLockRef = useRef(false)
+  /** Сколько возвратов по чеку было при загрузке — заметить новый перед отправкой. */
+  const loadedRefundsRef = useRef(0)
 
   // Поля формы
   const [refundCashStr, setRefundCashStr] = useState('')
@@ -186,6 +187,7 @@ export default function Refund() {
       const state = await getRefundState(fiscalId)
       setRefundState(state)
       const allRefunds = await listRefundsByOriginalFiscalId(fiscalId)
+      loadedRefundsRef.current = allRefunds.length
       // FullRefund блокирует UI полностью.
       const fullExisting = allRefunds.find((r) => r.is_partial === 0) ?? null
       setExisting(fullExisting)
@@ -298,9 +300,14 @@ export default function Refund() {
       // промежуток времени — другой пользователь/сессия могла оформить refund.
       // Перечитываем существующий refund СИНХРОННО до Communicator. Если упало
       // (БД locked) — не глотаем, абортим: не уверены = не шлём refund.
-      let fresh: FiscalRefundRow | null
+      //
+      // Запрещает только ПОЛНЫЙ возврат. Частичных может быть несколько —
+      // остаток по количеству проверяет processRefund. Раньше здесь любой
+      // прошлый возврат блокировал экран, и вернуть остаток после первого
+      // частичного возврата было нельзя.
+      let fresh: FiscalRefundRow[]
       try {
-        fresh = await getRefundByOriginalFiscalId(fiscalReceipt.id)
+        fresh = await listRefundsByOriginalFiscalId(fiscalReceipt.id)
       } catch (checkErr) {
         setError(
           'Не удалось проверить существующий возврат: ' +
@@ -309,13 +316,23 @@ export default function Refund() {
         )
         return
       }
-      if (fresh) {
-        setExisting(fresh)
+      const freshFull = fresh.find((r) => r.is_partial === 0)
+      if (freshFull) {
+        setExisting(freshFull)
         toast.error(
-          `Этот чек уже был возвращён ранее (FiscalSign ${fresh.fiscal_sign}). ` +
+          `Этот чек уже был возвращён ранее (FiscalSign ${freshFull.fiscal_sign}). ` +
             `Повторный refund запрещён.`,
           { duration: 6000 },
         )
+        return
+      }
+      if (fresh.length !== loadedRefundsRef.current) {
+        // Пока экран был открыт, по чеку оформили другой возврат — показываем
+        // актуальные остатки, кассир проверит количество и нажмёт снова.
+        await load()
+        toast.error('По этому чеку только что оформлен другой возврат — данные обновлены, проверьте количество.', {
+          duration: 7000,
+        })
         return
       }
       // Собираем selectedItems если partial-режим (для full передаём undefined).

@@ -29,6 +29,21 @@
  */
 
 import {
+  buildPospointRefund,
+  clearPendingAttempt,
+  fiscalFormatOf,
+  getPendingAttempt,
+  inputFingerprint,
+  isPospointShiftClosed,
+  mapPospointAnswer,
+  PospointOutcomeUnknownError,
+  pospointRefundPayCheck,
+  PospointUserError,
+  resolvePendingAttempt,
+  runPospointForeground,
+  sendRefundPospoint,
+} from './pospoint'
+import {
   getDb,
   getMsReceipt,
   getRefundByOriginalFiscalId,
@@ -111,6 +126,11 @@ export interface ProcessRefundOptions {
    *   - Кнопка «Возврат» в History остаётся активной (можно вернуть остаток)
    */
   selectedItems?: PartialRefundItem[]
+  /**
+   * Без печати — когда фоновая проверка сохраняет возврат Pospoint, который
+   * пробит раньше, а покупатель давно ушёл.
+   */
+  silent?: boolean
 }
 
 export interface ProcessRefundResult {
@@ -141,6 +161,44 @@ export class RefundAlreadyExistsError extends Error {
  *      Можно делать повторно (но не больше original qty в сумме).
  */
 export async function processRefund(opts: ProcessRefundOptions): Promise<ProcessRefundResult> {
+  // Pospoint: операции с кассой строго по одной (см. runPospointForeground).
+  if ((await getSetting(SettingKey.FiscalBackend)) === 'pospoint') {
+    return runPospointForeground(() => processRefundImpl(opts))
+  }
+  return processRefundImpl(opts)
+}
+
+/**
+ * Сохранить возврат Pospoint, который пробит, но не сохранён (исход был
+ * неизвестен, кассир возврат не повторил). Зовёт фоновая проверка: возврат
+ * берётся из журнала, в ОФД ничего не уходит, лента не печатается.
+ */
+export async function completePospointRefund(payCheckNumber: string): Promise<ProcessRefundResult | null> {
+  // В тестовом режиме processRefund ничего не сохраняет (и строит полный план).
+  if ((await getSetting(SettingKey.TestMode)) === 'true') {
+    throw new Error('Включён тестовый режим — сохранить пробитый возврат нельзя. Выключите тестовый режим.')
+  }
+  const pending = await getPendingAttempt(payCheckNumber)
+  const snap = pending?.kind === 'refund' ? (pending.snapshot as RefundPlan | null) : null
+  if (!snap?.originalFiscalId) return null
+  return processRefund({ originalFiscalId: snap.originalFiscalId, reason: snap.reason, silent: true })
+}
+
+/** Что и на какие суммы возвращаем. Для Pospoint — ещё и снимок в журнале попыток. */
+interface RefundPlan {
+  isPartial: boolean
+  refundItems: JsonRpcItem[]
+  snapshotEntries: RefundSnapshotEntry[]
+  refundItemsTotal: number
+  refundCash: number
+  refundCard: number
+  refundQr: number
+  /** Для доведения возврата из журнала (см. completePospointRefund). */
+  originalFiscalId?: number
+  reason?: string
+}
+
+async function processRefundImpl(opts: ProcessRefundOptions): Promise<ProcessRefundResult> {
   // 1. Грузим оригинал и предыдущие refund'ы (для проверки over-refund).
   const original = await loadOriginal(opts.originalFiscalId)
   const previousRefunds = await listRefundsByOriginalFiscalId(opts.originalFiscalId)
@@ -154,98 +212,54 @@ export async function processRefund(opts: ProcessRefundOptions): Promise<Process
   // 2. Парсим оригинальный чек.
   const originalReceipt = parseRequest(original.fr.request_json)
 
-  // 3. Определяем режим: full или partial.
-  const isPartial = !!(opts.selectedItems && opts.selectedItems.length > 0)
+  // Возврат проходит только через ту программу, которой пробита продажа:
+  // Pospoint ищет чек продажи у себя и чужой не вернёт (36872).
+  const fiscalBackend = (await getSetting(SettingKey.FiscalBackend)) ?? 'epos'
+  const viaPospoint = fiscalFormatOf(original.fr.request_json) === 'pospoint'
+  if (viaPospoint !== (fiscalBackend === 'pospoint')) {
+    throw new PospointUserError(
+      viaPospoint
+        ? 'Этот чек пробит через Pospoint, а касса сейчас работает через другую программу. Верните его, когда касса снова будет на Pospoint.'
+        : 'Этот чек пробит до перехода на Pospoint — через Pospoint его не вернуть: возврат проходит там, где была продажа.',
+    )
+  }
+  const testMode = (await getSetting(SettingKey.TestMode)) === 'true'
 
-  // 4. Считаем какие qty уже были возвращены (для каждого originalItemIndex).
-  // Используется и для проверки over-refund в partial-режиме, и для блокировки
-  // full-refund если есть partial'ы (часть уже вернули).
-  const alreadyRefundedByIndex = new Map<number, number>()
-  for (const r of previousRefunds) {
-    if (!r.refunded_items_snapshot) continue
-    try {
-      const snap = JSON.parse(r.refunded_items_snapshot) as Array<{
-        originalItemIndex: number
-        qtyMilli: number
-      }>
-      for (const s of snap) {
-        alreadyRefundedByIndex.set(
-          s.originalItemIndex,
-          (alreadyRefundedByIndex.get(s.originalItemIndex) ?? 0) + s.qtyMilli,
-        )
+  // Pospoint: прошлая попытка этого возврата осталась без ответа. Нашлась в
+  // Pospoint — сохраняем ЕЁ (строки и суммы из журнала), а не то, что кассир
+  // выбрал сейчас; не нашлась — пробиваем заново под тем же номером.
+  let pospointPayCheck = ''
+  let recovered: { fiscal: FiscalReceiptInfo; requestJson: string } | null = null
+  let priorPlan: RefundPlan | null = null
+  if (fiscalBackend === 'pospoint' && !testMode) {
+    pospointPayCheck = pospointRefundPayCheck(
+      original.fr.request_json,
+      original.fr.receipt_seq,
+      previousRefunds.length + 1,
+    )
+    const prior = await resolvePendingAttempt(pospointPayCheck, 'refund')
+    if (prior.status === 'found') {
+      // Уже сохранён (фоновой проверкой) — второй раз не пишем.
+      const dup = previousRefunds.find((r) => r.fiscal_sign === prior.answer.fiscalSign)
+      if (dup) {
+        await clearPendingAttempt(pospointPayCheck)
+        throw new RefundAlreadyExistsError(dup)
       }
-    } catch {
-      // битый snapshot — пропускаем, пусть refund разрешится
+      priorPlan = prior.pending.snapshot as RefundPlan
+      recovered = { fiscal: mapPospointAnswer(prior.answer), requestJson: prior.pending.requestJson }
+      await log.warn('refund', 'Pospoint: прошлая попытка возврата пробита — сохраняю её, новый возврат не отправляю', {
+        payCheckNumber: pospointPayCheck,
+        fiscalSign: prior.answer.fiscalSign,
+      })
     }
   }
 
-  // 5. В full-режиме НЕЛЬЗЯ если уже был partial — иначе двойной refund на
-  // ту же часть. Кассир должен через partial довозвращать остаток.
-  if (!isPartial && previousRefunds.length > 0) {
-    throw new Error(
-      `На этот чек уже был частичный возврат (${previousRefunds.length} шт). ` +
-        `Полный возврат невозможен — оформите частичный на остаток через ` +
-        `«Частичный возврат» с qty оставшегося.`,
-    )
-  }
-
-  // 6. Билдим refund Items[] (либо все, либо selected).
-  const { refundItems, snapshotEntries, refundItemsTotal } = isPartial
-    ? buildPartialRefundItems(originalReceipt.Items, opts.selectedItems!, alreadyRefundedByIndex)
-    : buildFullRefundItems(originalReceipt.Items)
-
-  // 7. Определяем суммы возврата по каналам оплаты.
-  // - При full: по дефолту = как было оплачено (cash/card 1:1 с оригиналом).
-  // - При partial: пропорционально refundItemsTotal / originalTotal.
-  //   Если кассир явно передал refundCashTiyin/CardTiyin — используем их (override).
-  let refundCash: number
-  let refundCard: number
-  let refundQr: number
-  if (opts.refundCashTiyin !== undefined || opts.refundCardTiyin !== undefined) {
-    // Явный override от UI.
-    refundCash = opts.refundCashTiyin ?? 0
-    refundCard = opts.refundCardTiyin ?? 0
-    refundQr = opts.refundQrTiyin ?? 0
-  } else if (isPartial) {
-    // Пропорциональный split: refundCash = origCash * (refundTotal / origTotal).
-    const origTotal = originalReceipt.ReceivedCash + originalReceipt.ReceivedCard
-    if (origTotal <= 0) {
-      refundCash = refundItemsTotal
-      refundCard = 0
-      refundQr = 0
-    } else {
-      const ratio = refundItemsTotal / origTotal
-      refundCash = Math.round(originalReceipt.ReceivedCash * ratio)
-      // Корректировка чтобы cash + card = refundItemsTotal ровно (избегаем
-      // off-by-1 из округления).
-      refundCard = refundItemsTotal - refundCash
-      refundQr = 0
-    }
-  } else {
-    // Full refund без override — берём суммы оригинала как есть.
-    refundCash = originalReceipt.ReceivedCash
-    refundCard = originalReceipt.ReceivedCard
-    refundQr = 0
-  }
-
+  const plan = priorPlan ?? planRefund(opts, originalReceipt, previousRefunds)
+  const { isPartial, refundItems, snapshotEntries, refundItemsTotal, refundQr } = plan
+  let { refundCash, refundCard } = plan
   const refundTotal = refundCash + refundCard + refundQr
-  if (refundTotal <= 0) {
-    throw new Error('Сумма возврата = 0. Укажите какую сумму и каким способом возвращаем.')
-  }
-
-  // 8. Sanity-check: refundTotal должен совпадать с items total ± 100 сум
-  // (EPOS tolerance 10000 тийинов). Иначе Communicator вернёт "math error".
-  const itemsVsAmountDiff = Math.abs(refundTotal - refundItemsTotal)
-  if (itemsVsAmountDiff > 10000) {
-    throw new Error(
-      `Сумма возврата ${tiyinFmt(refundTotal)} не совпадает с суммой позиций ` +
-        `${tiyinFmt(refundItemsTotal)} (разница ${tiyinFmt(itemsVsAmountDiff)} > 100 сум). ` +
-        `Скорректируйте Наличные/Карту чтобы итог равнялся сумме выбранных товаров.`,
-    )
-  }
 
   // 4. Тестовый режим — skip Communicator + /unconsume.
-  const testMode = (await getSetting(SettingKey.TestMode)) === 'true'
   if (testMode) {
     await log.info(
       'refund',
@@ -260,21 +274,22 @@ export async function processRefund(opts: ProcessRefundOptions): Promise<Process
       DateTime: formatTestDateTime(new Date()),
       AppletVersion: 'TEST',
     }
-    await maybePrintRefundReceipt(
-      original,
-      originalReceipt,
-      fakeFiscal,
-      refundCash,
-      refundCard,
-      true,
-      refundItems,
-      isPartial,
-    )
+    if (!opts.silent) {
+      await maybePrintRefundReceipt(
+        original,
+        originalReceipt,
+        fakeFiscal,
+        refundCash,
+        refundCard,
+        true,
+        refundItems,
+        isPartial,
+      )
+    }
     return { fiscal: fakeFiscal, refundDbId: 0 }
   }
 
-  // 5. Отправляем возврат в ФМ — EPOS JSON-RPC или FiscalDriveService.
-  const fiscalBackend = (await getSetting(SettingKey.FiscalBackend)) ?? 'epos'
+  // 5. Отправляем возврат в ФМ — EPOS JSON-RPC, FiscalDriveService или Pospoint.
   let fiscal: FiscalReceiptInfo
   let requestJson: string
 
@@ -286,10 +301,62 @@ export async function processRefund(opts: ProcessRefundOptions): Promise<Process
   // именно формулировкой FDS (`9023 - ZREPORT_IS_ALREADY_CLOSED`) и
   // обоснован сам хелпер. Тот же приём что и в fiscalize() — см. там.
   try {
-    if (fiscalBackend === 'fiscaldrive') {
+    if (recovered) {
+      fiscal = recovered.fiscal
+      requestJson = recovered.requestJson
+    } else if (fiscalBackend === 'fiscaldrive') {
       const r = await sendRefundFiscalDrive(original, refundItems, refundCash, refundCard)
       fiscal = r.fiscal
       requestJson = r.requestJson
+    } else if (fiscalBackend === 'pospoint') {
+      if (refundQr > 0) {
+        throw new PospointUserError('Pospoint возвращает только наличными или картой — уберите сумму QR.')
+      }
+      // Строку продажи касса ищет по ИКПУ/штрихкоду — нужен номер строки
+      // оригинала для каждой строки возврата.
+      const originalIndexes = isPartial
+        ? snapshotEntries.map((e) => e.originalItemIndex)
+        : refundItems.map((_, i) => i)
+      const built = buildPospointRefund({
+        originalRequestJson: original.fr.request_json,
+        originalReceiptSeq: original.fr.receipt_seq,
+        lines: refundItems,
+        originalIndexes,
+        refundCash,
+        refundCard,
+        cardKind: original.fr.card_kind,
+        // Свой номер у каждого возврата по чеку — и тот же при повторе
+        // после сбоя: Pospoint второй раз его не пробьёт.
+        refundIndex: previousRefunds.length + 1,
+      })
+      // Касса не вернёт больше стоимости товаров — тийины округления
+      // урезаны; сохраняем ровно то, что уйдёт в ОФД.
+      refundCash = built.refundCash
+      refundCard = built.refundCard
+      const r = await sendRefundPospoint({
+        built,
+        originalFiscalSign: original.fr.fiscal_sign,
+        inputFp: inputFingerprint({
+          items: refundItems.map((it, i) => [originalIndexes[i], it.Amount]),
+          refundCash,
+          refundCard,
+        }),
+        snapshot: {
+          ...plan,
+          refundCash,
+          refundCard,
+          originalFiscalId: opts.originalFiscalId,
+          reason: opts.reason,
+        } satisfies RefundPlan,
+      })
+      fiscal = r.fiscal
+      requestJson = r.requestJson
+      // Под этим номером возврат пробит раньше и уже сохранён — второй раз не пишем.
+      const dup = r.recovered ? previousRefunds.find((x) => x.fiscal_sign === r.fiscal.FiscalSign) : undefined
+      if (dup) {
+        await clearPendingAttempt(pospointPayCheck)
+        throw new RefundAlreadyExistsError(dup)
+      }
     } else {
       // ⚠️ КРИТИЧНО для привязки к оригиналу в ОФД (иначе «бириктирилмаган»):
       //   1. `refundInfo` camelCase — основной по доке E-POS. PascalCase игнорируется.
@@ -365,6 +432,13 @@ export async function processRefund(opts: ProcessRefundOptions): Promise<Process
       }
     }
   } catch (refundErr) {
+    if (refundErr instanceof PospointOutcomeUnknownError) {
+      await log.error('refund', `Pospoint: неизвестно, пробит ли возврат — повтор сначала проверит: ${refundErr.message}`, {
+        originalFiscalId: opts.originalFiscalId,
+        payCheckNumber: pospointPayCheck,
+        fmMaySigned: refundErr.fmMaySigned,
+      })
+    }
     // Смена закрыта — распознаём формулировку ОБОИХ протоколов (EPOS code
     // 36909 / ZREPORT_IS_NOT_OPEN; FiscalDriveService HTTP 500 с телом
     // "9023 - ZREPORT_IS_ALREADY_CLOSED"). Оригинальная ошибка уже
@@ -374,7 +448,10 @@ export async function processRefund(opts: ProcessRefundOptions): Promise<Process
     const err = refundErr as { code?: number; data?: unknown; message?: string }
     const dataStr =
       typeof err.data === 'string' ? err.data : JSON.stringify(err.data ?? '')
-    if (isShiftClosedError(String(err.message ?? refundErr), dataStr, err.code)) {
+    if (
+      isShiftClosedError(String(err.message ?? refundErr), dataStr, err.code) ||
+      isPospointShiftClosed(refundErr)
+    ) {
       throw new ShiftNotOpenError()
     }
     throw refundErr
@@ -470,6 +547,14 @@ export async function processRefund(opts: ProcessRefundOptions): Promise<Process
     )
   }
 
+  // Возврат сохранён — попытка Pospoint больше не нужна (снимаем только
+  // теперь: упади запись в БД, повтор найдёт возврат и сохранит его).
+  if (pospointPayCheck) {
+    await clearPendingAttempt(pospointPayCheck).catch((e) =>
+      log.warn('refund', `Pospoint: не снял попытку из журнала: ${e instanceof Error ? e.message : String(e)}`),
+    )
+  }
+
   // 7. Возврат остатков на сервер (best-effort).
   //
   // Для **полного** refund — возвращаем все match_items на сервер.
@@ -489,18 +574,123 @@ export async function processRefund(opts: ProcessRefundOptions): Promise<Process
   }
 
   // 8. Печать на термопринтер.
-  await maybePrintRefundReceipt(
-    original,
-    originalReceipt,
-    fiscal,
-    refundCash,
-    refundCard,
-    false,
-    refundItems,
-    isPartial,
-  )
+  if (!opts.silent) {
+    await maybePrintRefundReceipt(
+      original,
+      originalReceipt,
+      fiscal,
+      refundCash,
+      refundCard,
+      false,
+      refundItems,
+      isPartial,
+    )
+  }
 
   return { fiscal, refundDbId }
+}
+
+/**
+ * Что и на какие суммы возвращаем: все позиции или выбранные, деньги — как
+ * указал кассир или в пропорции оплаты продажи. Бросает понятные ошибки на
+ * повторный/лишний возврат и на расхождение суммы с позициями.
+ */
+function planRefund(
+  opts: ProcessRefundOptions,
+  originalReceipt: JsonRpcReceipt,
+  previousRefunds: FiscalRefundRow[],
+): RefundPlan {
+  // 3. Определяем режим: full или partial.
+  const isPartial = !!(opts.selectedItems && opts.selectedItems.length > 0)
+
+  // 4. Считаем какие qty уже были возвращены (для каждого originalItemIndex).
+  // Используется и для проверки over-refund в partial-режиме, и для блокировки
+  // full-refund если есть partial'ы (часть уже вернули).
+  const alreadyRefundedByIndex = new Map<number, number>()
+  for (const r of previousRefunds) {
+    if (!r.refunded_items_snapshot) continue
+    try {
+      const snap = JSON.parse(r.refunded_items_snapshot) as Array<{
+        originalItemIndex: number
+        qtyMilli: number
+      }>
+      for (const s of snap) {
+        alreadyRefundedByIndex.set(
+          s.originalItemIndex,
+          (alreadyRefundedByIndex.get(s.originalItemIndex) ?? 0) + s.qtyMilli,
+        )
+      }
+    } catch {
+      // битый snapshot — пропускаем, пусть refund разрешится
+    }
+  }
+
+  // 5. В full-режиме НЕЛЬЗЯ если уже был partial — иначе двойной refund на
+  // ту же часть. Кассир должен через partial довозвращать остаток.
+  if (!isPartial && previousRefunds.length > 0) {
+    throw new Error(
+      `На этот чек уже был частичный возврат (${previousRefunds.length} шт). ` +
+        `Полный возврат невозможен — оформите частичный на остаток через ` +
+        `«Частичный возврат» с qty оставшегося.`,
+    )
+  }
+
+  // 6. Билдим refund Items[] (либо все, либо selected).
+  const { refundItems, snapshotEntries, refundItemsTotal } = isPartial
+    ? buildPartialRefundItems(originalReceipt.Items, opts.selectedItems!, alreadyRefundedByIndex)
+    : buildFullRefundItems(originalReceipt.Items)
+
+  // 7. Определяем суммы возврата по каналам оплаты.
+  // - При full: по дефолту = как было оплачено (cash/card 1:1 с оригиналом).
+  // - При partial: пропорционально refundItemsTotal / originalTotal.
+  //   Если кассир явно передал refundCashTiyin/CardTiyin — используем их (override).
+  let refundCash: number
+  let refundCard: number
+  let refundQr: number
+  if (opts.refundCashTiyin !== undefined || opts.refundCardTiyin !== undefined) {
+    // Явный override от UI.
+    refundCash = opts.refundCashTiyin ?? 0
+    refundCard = opts.refundCardTiyin ?? 0
+    refundQr = opts.refundQrTiyin ?? 0
+  } else if (isPartial) {
+    // Пропорциональный split: refundCash = origCash * (refundTotal / origTotal).
+    const origTotal = originalReceipt.ReceivedCash + originalReceipt.ReceivedCard
+    if (origTotal <= 0) {
+      refundCash = refundItemsTotal
+      refundCard = 0
+      refundQr = 0
+    } else {
+      const ratio = refundItemsTotal / origTotal
+      refundCash = Math.round(originalReceipt.ReceivedCash * ratio)
+      // Корректировка чтобы cash + card = refundItemsTotal ровно (избегаем
+      // off-by-1 из округления).
+      refundCard = refundItemsTotal - refundCash
+      refundQr = 0
+    }
+  } else {
+    // Full refund без override — берём суммы оригинала как есть.
+    refundCash = originalReceipt.ReceivedCash
+    refundCard = originalReceipt.ReceivedCard
+    refundQr = 0
+  }
+
+  const refundTotal = refundCash + refundCard + refundQr
+  if (refundTotal <= 0) {
+    throw new Error('Сумма возврата = 0. Укажите какую сумму и каким способом возвращаем.')
+  }
+
+  // 8. Sanity-check: refundTotal должен совпадать с items total ± 100 сум
+  // (EPOS tolerance 10000 тийинов). Иначе Communicator вернёт "math error".
+  const itemsVsAmountDiff = Math.abs(refundTotal - refundItemsTotal)
+  if (itemsVsAmountDiff > 10000) {
+    throw new Error(
+      `Сумма возврата ${tiyinFmt(refundTotal)} не совпадает с суммой позиций ` +
+        `${tiyinFmt(refundItemsTotal)} (разница ${tiyinFmt(itemsVsAmountDiff)} > 100 сум). ` +
+        `Скорректируйте Наличные/Карту чтобы итог равнялся сумме выбранных товаров.`,
+    )
+  }
+
+  return { isPartial, refundItems, snapshotEntries, refundItemsTotal, refundCash, refundCard, refundQr }
 }
 
 // ── FiscalDriveService — возврат ──────────────────────────────────────────────
@@ -1181,7 +1371,9 @@ export async function getDefaultRefundAmounts(
       )
       .catch(() => {})
   }
-  if (refund) {
+  // Только для ПОЛНОГО возврата: после частичного следующий частичный
+  // делится по оплате продажи, а не по суммам прошлого возврата.
+  if (refund && refund.is_partial === 0) {
     return {
       cash: refund.refund_cash_tiyin,
       card: refund.refund_card_tiyin,

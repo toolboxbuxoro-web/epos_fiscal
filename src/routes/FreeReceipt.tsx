@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Banknote, CreditCard, ListPlus, Send, Split, Wand2 } from 'lucide-react'
 import { loadMatcherPool, planHolistic } from '@/lib/matcher'
@@ -7,6 +7,7 @@ import type { HolisticPlan, MatcherOptions } from '@/lib/matcher/types'
 import {
   buildFreeMatchResult,
   buildSyntheticMsReceipt,
+  FREE_RECEIPT_PREFIX,
   resolvePayment,
   type FreePayKind,
 } from '@/lib/free-receipt'
@@ -18,6 +19,8 @@ import {
   ShiftNotOpenError,
 } from '@/lib/epos'
 import { getSetting, SettingKey } from '@/lib/db'
+import { getPendingAttempt, listPendingAttempts, PospointOutcomeUnknownError } from '@/lib/epos/pospoint'
+import { describeSettleResult, settlePendingAttempt } from '@/lib/epos/pospoint-settle'
 import { formatErrorForUser } from '@/lib/error-message'
 import { tiyinToSumDisplay } from '@/lib/format'
 import { log } from '@/lib/log'
@@ -58,6 +61,22 @@ export default function FreeReceipt() {
    * МойСклад, а здесь её нет.
    */
   const [receiptUid, setReceiptUid] = useState<string | null>(null)
+  /**
+   * Номер чека, исход которого неизвестен (Pospoint не ответил). Пока
+   * попытка не разобрана, новый номер не выдаём: повтор под тем же номером
+   * сначала спросит Pospoint и второй чек не пробьёт, а под новым — пробил бы.
+   */
+  const unresolvedUid = useRef<string | null>(null)
+  const fiscalizeLock = useRef(false)
+  /** Новый номер чека — или тот, что ждёт разбора. */
+  const nextUid = () => unresolvedUid.current ?? crypto.randomUUID()
+  /**
+   * Чек по сумме с неизвестным исходом, оставшийся с прошлого раза (кассир
+   * ушёл с экрана или программу перезапустили). Пока его не разобрали, новый
+   * не пробиваем: если это та же покупка, вышел бы второй чек в ОФД.
+   */
+  const [leftover, setLeftover] = useState<{ key: string; at: number } | null>(null)
+  const [settling, setSettling] = useState(false)
   const [planning, setPlanning] = useState(false)
   const [fiscalizing, setFiscalizing] = useState(false)
   const [manualOpen, setManualOpen] = useState(false)
@@ -68,8 +87,33 @@ export default function FreeReceipt() {
     void (async () => {
       setOpts(await loadMatcherOptionsFromSettings())
       setTestMode((await getSetting(SettingKey.TestMode)) === 'true')
+      if ((await getSetting(SettingKey.FiscalBackend)) !== 'pospoint') return
+      const left = (await listPendingAttempts().catch(() => [])).find(
+        ([key, p]) => p.kind === 'sale' && key.startsWith(FREE_RECEIPT_PREFIX),
+      )
+      if (left) setLeftover({ key: left[0], at: left[1].at })
     })()
   }, [])
+
+  /** Разобрать оставшийся чек: пробит — сохраняем, не пробит — снимаем. */
+  async function settleLeftover() {
+    if (!leftover || settling) return
+    setSettling(true)
+    try {
+      const r = await settlePendingAttempt(leftover.key)
+      const text = describeSettleResult(r)
+      if (r.status === 'saved' || r.status === 'cleared' || r.status === 'none') {
+        setLeftover(null)
+        toast.success(text, { duration: 8000 })
+      } else {
+        toast.error(text, { duration: 10000 })
+      }
+    } catch (e) {
+      toast.error(formatErrorForUser(e), { duration: 8000 })
+    } finally {
+      setSettling(false)
+    }
+  }
 
   // Сумма вводится в сумах — так её называет кассир и так она написана на
   // ценнике. Внутри везде тийины.
@@ -100,7 +144,7 @@ export default function FreeReceipt() {
         return
       }
       setPlan(outcome.plan)
-      setReceiptUid(crypto.randomUUID())
+      setReceiptUid(nextUid())
     } catch (e) {
       setError(formatErrorForUser(e))
     } finally {
@@ -109,7 +153,10 @@ export default function FreeReceipt() {
   }
 
   async function doFiscalize() {
-    if (!plan || !sumValid || !receiptUid || fiscalizing) return
+    if (!plan || !sumValid || !receiptUid || fiscalizing || leftover || fiscalizeLock.current) return
+    fiscalizeLock.current = true
+    // Номер этой попытки: экран мог поменять receiptUid, пока чек уходил.
+    const uid = receiptUid
     setFiscalizing(true)
     setError(null)
     try {
@@ -117,7 +164,7 @@ export default function FreeReceipt() {
         sumTiyin: plan.totalTiyin,
         payment,
         nowMs: Date.now(),
-        uid: receiptUid,
+        uid,
       })
 
       await log.info('fiscalize', `Чек по сумме: ${tiyinToSumDisplay(plan.totalTiyin)}`, {
@@ -132,15 +179,41 @@ export default function FreeReceipt() {
         receivedCard: payment.cardTiyin,
         cardKind: cardInvolved ? cardKind : undefined,
       })
+      unresolvedUid.current = null
 
-      toast.success(
-        testMode
-          ? 'Тестовый режим: чек напечатан, в ОФД не отправлен'
-          : `Чек пробит: ${result.fiscal.FiscalSign}`,
-        { duration: 6000 },
-      )
+      if (result.recoveredPrior) {
+        // Касса успела пробить прошлую попытку — сохранена она, новый чек не
+        // отправлялся. Сумма могла отличаться от введённой сейчас.
+        toast.success(
+          `Касса успела пробить прошлую попытку этого чека — сохранена она (признак ${result.fiscal.FiscalSign}). ` +
+            'Новый чек не отправлялся; сверьте сумму в «Чеках».',
+          { duration: 12000 },
+        )
+      } else {
+        toast.success(
+          testMode
+            ? 'Тестовый режим: чек напечатан, в ОФД не отправлен'
+            : `Чек пробит: ${result.fiscal.FiscalSign}`,
+          { duration: 6000 },
+        )
+      }
       navigate('/history')
     } catch (e) {
+      if (e instanceof PospointOutcomeUnknownError) {
+        // Номер — тот, под которым ушла попытка; повтор пойдёт под ним же.
+        unresolvedUid.current = uid
+        setReceiptUid(uid)
+        setError(`${e.message} Нажмите «Фискализировать» ещё раз — программа сначала проверит прошлую попытку.`)
+        toast.error('Неизвестно, пробит ли чек', { duration: 8000 })
+        return
+      }
+      // Попытка разобрана (в журнале её больше нет) — номер можно менять.
+      if (
+        unresolvedUid.current &&
+        !(await getPendingAttempt(`${FREE_RECEIPT_PREFIX}${unresolvedUid.current}`).catch(() => null))
+      ) {
+        unresolvedUid.current = null
+      }
       if (e instanceof ShiftNotOpenError) {
         setError(e.message)
         toast.error('Смена ККМ не открыта', { duration: 6000 })
@@ -155,12 +228,13 @@ export default function FreeReceipt() {
         // Остатки разошлись, пока кассир собирал чек. План устарел —
         // пересобираем, иначе повтор упрётся в ту же нехватку.
         setPlan(null)
-        setReceiptUid(null)
+        setReceiptUid(unresolvedUid.current)
         setError('Остатки изменились — товар разобрали. Подберите заново.')
         return
       }
       setError(formatErrorForUser(e))
     } finally {
+      fiscalizeLock.current = false
       setFiscalizing(false)
     }
   }
@@ -199,6 +273,21 @@ export default function FreeReceipt() {
         </Card>
       )}
 
+      {leftover && (
+        <Card>
+          <Card.Body className="space-y-2 text-body">
+            <div className="text-warning">
+              Чек по сумме от {new Date(leftover.at).toLocaleString('ru-RU')} остался без ответа кассы — неизвестно,
+              пробит ли он. Проверьте его, прежде чем пробивать новый: если это та же покупка, иначе выйдет второй
+              чек.
+            </div>
+            <Button variant="secondary" size="sm" loading={settling} onClick={() => void settleLeftover()}>
+              Проверить прошлый чек
+            </Button>
+          </Card.Body>
+        </Card>
+      )}
+
       <Card>
         <Card.Body className="space-y-4">
           <div>
@@ -206,10 +295,11 @@ export default function FreeReceipt() {
             <div className="flex items-center gap-2">
               <Input
                 value={sumInput}
+                disabled={fiscalizing}
                 onChange={(e) => {
                   setSumInput(e.target.value.replace(/[^\d.,]/g, ''))
                   setPlan(null)
-                  setReceiptUid(null)
+                  setReceiptUid(unresolvedUid.current)
                 }}
                 placeholder="0"
                 inputMode="decimal"
@@ -305,7 +395,7 @@ export default function FreeReceipt() {
             <Button
               onClick={autoPlan}
               loading={planning}
-              disabled={!sumValid}
+              disabled={!sumValid || fiscalizing}
               icon={<Wand2 size={16} />}
             >
               Подобрать
@@ -313,7 +403,7 @@ export default function FreeReceipt() {
             <Button
               variant="secondary"
               onClick={() => setManualOpen(true)}
-              disabled={!sumValid || planning}
+              disabled={!sumValid || planning || fiscalizing}
               icon={<ListPlus size={16} />}
             >
               Собрать вручную
@@ -379,8 +469,9 @@ export default function FreeReceipt() {
           <Card.Footer>
             <div className="flex flex-wrap items-center gap-3">
               <Button
-                onClick={doFiscalize}
+                onClick={() => void doFiscalize()}
                 loading={fiscalizing}
+                disabled={!!leftover}
                 icon={<Send size={16} />}
               >
                 {testMode ? 'Напечатать (тест)' : 'Фискализировать'}
@@ -410,7 +501,7 @@ export default function FreeReceipt() {
           onClose={() => setManualOpen(false)}
           onDone={(built) => {
             setPlan(built)
-            setReceiptUid((prev) => prev ?? crypto.randomUUID())
+            setReceiptUid((prev) => prev ?? nextUid())
             setManualOpen(false)
             toast.success(
               `Собрано вручную: ${built.lines.length} ${plural(built.lines.length)} на ` +

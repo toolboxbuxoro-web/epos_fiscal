@@ -22,6 +22,7 @@ import { listLogs, type LogRow } from '@/lib/log'
 import { getInventorySseStatus } from '@/lib/inventory'
 import { getSetting, SettingKey } from '@/lib/db'
 import { subscribePollerStatus } from '@/lib/poller-runtime'
+import { getPospointHealth, type PospointHealth } from '@/lib/epos/pospoint-sync'
 import type { PollerStatus } from '@/lib/moysklad/poller'
 
 export type IssueSeverity = 'warning' | 'error'
@@ -70,6 +71,54 @@ async function collectIssues(): Promise<SystemIssue[]> {
   return issues
 }
 
+/** Одна проблема Pospoint для панели состояния — самая важная. */
+function pospointIssue(pp: PospointHealth): SystemIssue | null {
+  const settings = { label: 'Открыть Настройки', href: '/settings' }
+  const err = (id: string, title: string, detail: string, withSettings = false): SystemIssue => ({
+    id: `fiscalize.pospoint-${id}`,
+    severity: 'error',
+    source: 'fiscalize',
+    title,
+    detail,
+    ...(withSettings ? { action: settings } : {}),
+  })
+  switch (pp.state) {
+    case 'no-key':
+      return err('no-key', 'Pospoint: не задан ключ кассы', 'Без ключа чеки не пробиваются', true)
+    case 'test-key':
+      return err('test-key', 'Pospoint: указан тестовый ключ', 'С ним чеки не фискализируются — вставьте ключ этой кассы', true)
+    case 'bad-key':
+      return err('bad-key', 'Pospoint не принял ключ кассы', 'Проверьте ключ в Настройках', true)
+    case 'inactive':
+      return err('inactive', 'Pospoint: касса не активна', 'Проверьте регистрацию и подписку или обратитесь в поддержку Pospoint')
+    case 'fiscal-off':
+      return err('fiscal-off', 'Pospoint: выключен фискальный режим', 'Включите его в настройках программы Pospoint')
+    case 'demo-limit':
+      return err('demo-limit', 'Pospoint: исчерпан лимит демо-режима', 'Обратитесь в Pospoint')
+    case 'pos-auth':
+      return err('pos-auth', 'Pospoint: касса не авторизована в ФМ', 'Обратитесь в поддержку Pospoint')
+    case 'down':
+      return err('down', 'Pospoint не отвечает', 'Откройте программу Pospoint, войдите и включите «Режим интеграции»')
+    case 'fm-disconnected':
+      return err('fm', 'Pospoint: фискальный модуль не подключён', 'Проверьте USB-ридер ФМ')
+    default:
+      break
+  }
+  if (pp.unsent > 0 && pp.unsentSince && Date.now() - pp.unsentSince > 2 * 3600 * 1000) {
+    const day = Date.now() - pp.unsentSince > 24 * 3600 * 1000
+    return {
+      id: 'fiscalize.pospoint-unsent',
+      severity: day ? 'error' : 'warning',
+      source: 'fiscalize',
+      title: `Pospoint: ${pp.unsent} чеков не ушло в ОФД`,
+      detail: day
+        ? 'Больше суток — проверьте интернет на кассе, иначе ФМ заблокирует продажи'
+        : 'Проверьте интернет на кассе — Pospoint отправит их сам',
+    }
+  }
+  return null
+}
+
 /** Проверки которые есть только во время рендера (через хуки). */
 function buildIssuesFromState(opts: {
   poller: PollerStatus | null
@@ -78,6 +127,8 @@ function buildIssuesFromState(opts: {
   sseStatus: 'connected' | 'disconnected' | 'connecting' | 'idle'
   remoteEnabled: boolean
   testMode: boolean
+  /** Состояние Pospoint; null — касса не на Pospoint. */
+  pospoint?: PospointHealth | null
 }): SystemIssue[] {
   const issues: SystemIssue[] = []
 
@@ -140,6 +191,21 @@ function buildIssuesFromState(opts: {
     }
   }
 
+  // ── Pospoint ──────────────────────────────────────────────────────
+  const pp = opts.pospoint
+  const ppIssue = pp ? pospointIssue(pp) : null
+  if (ppIssue) issues.push(ppIssue)
+  if (pp && pp.pending > 0) {
+    issues.push({
+      id: 'fiscalize.pospoint-pending',
+      severity: 'warning',
+      source: 'fiscalize',
+      title: `Pospoint: ${pp.pending} ${pp.pending === 1 ? 'чек' : 'чеков'} с неизвестным исходом`,
+      detail: 'Пробит ли чек, проверится сам; подробности — Настройки → Pospoint',
+      action: { label: 'Открыть Настройки', href: '/settings' },
+    })
+  }
+
   // Test mode — это не «ошибка», но видеть нужно. Включаем как warning
   // чтобы отображалось в Status panel.
   if (opts.testMode) {
@@ -168,6 +234,7 @@ export function useSystemStatus(): SystemStatusSummary {
   >('idle')
   const [remoteEnabled, setRemoteEnabled] = useState(false)
   const [testMode, setTestMode] = useState(false)
+  const [pospoint, setPospoint] = useState<PospointHealth | null>(null)
   const [logIssues, setLogIssues] = useState<SystemIssue[]>([])
 
   // Poller
@@ -188,6 +255,8 @@ export function useSystemStatus(): SystemStatusSummary {
       ])
       if (cancelled) return
       setTestMode(tm === 'true')
+      const pp = getPospointHealth()
+      setPospoint(pp.state === 'off' || pp.state === 'unknown' ? null : pp)
       setDemandConfigured(!!storeId && !!stateId)
       setRemoteEnabled(re === 'true')
       setSseStatus(getInventorySseStatus())
@@ -221,6 +290,7 @@ export function useSystemStatus(): SystemStatusSummary {
     sseStatus,
     remoteEnabled,
     testMode,
+    pospoint,
   })
   const issues = [...stateIssues, ...logIssues]
 

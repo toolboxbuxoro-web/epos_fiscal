@@ -229,8 +229,10 @@ export const SettingKey = {
    * Бэкенд фискализации.
    *   - `'epos'`        (default) — E-POS Communicator JSON-RPC на :3448/rpc/api
    *   - `'fiscaldrive'` — FiscalDriveService REST на :3449 (двухшаговый GetTXID→RegisterTXID)
+   *   - `'pospoint'`    — кассовая программа Pospoint («мобильная касса») на :6461
    *
    * Магазин 1 (Хонабод) = 'epos'. Магазин 2 (Хазрати Имом) = 'fiscaldrive'.
+   * E-POS Communicator скоро отключат — все кассы переходят на 'pospoint'.
    */
   FiscalBackend: 'fiscal.backend',
   /**
@@ -246,6 +248,34 @@ export const SettingKey = {
    * Аналог EposCommunicatorUrl для нового бэкенда.
    */
   FiscalDriveBaseUrl: 'fiscal.drive_base_url',
+  /** Адрес Pospoint, по умолчанию 'http://127.0.0.1:6461'. */
+  PospointUrl: 'fiscal.pospoint_url',
+  /**
+   * Ключ кассы Pospoint — выдаёт Pospoint при регистрации кассы. Без него чек
+   * не пробивается. В request_json и логи не попадает.
+   */
+  PospointKey: 'fiscal.pospoint_key',
+  /**
+   * Кэш единиц измерения по ИКПУ из справочника tasnif (через getMxikInfo
+   * Pospoint): JSON `{ [ИКПУ]: { at, packages: [{ code, name }] } }`.
+   * Pospoint требует в каждой позиции и код, и название единицы.
+   */
+  PospointUnitsCache: 'fiscal.pospoint_units',
+  /**
+   * Журнал попыток Pospoint, исход которых неизвестен (нет ответа, сбой):
+   * JSON `{ [payCheckNumber]: { kind, inputFp, requestJson, snapshot, at, … } }`.
+   * Повтор того же документа сначала сверяется с ним — так в учёт попадает
+   * ровно то, что ушло в ОФД, даже если подбор с тех пор изменился.
+   */
+  PospointPending: 'fiscal.pospoint_pending',
+  /** С какого момента (epoch ms) в ФМ висят неотправленные в ОФД чеки — переживает перезапуск. */
+  PospointUnsentSince: 'fiscal.pospoint_unsent_since',
+  /**
+   * 'true' — кассир уже работал с ФМ через Pospoint (чек, смена, проверка
+   * подключения): старая программа выключена, фоновой проверке можно трогать
+   * ФМ. Сбрасывается при переключении программы фискализации.
+   */
+  PospointFmHandedOver: 'fiscal.pospoint_fm_handed_over',
 } as const
 
 export type SettingKey = (typeof SettingKey)[keyof typeof SettingKey]

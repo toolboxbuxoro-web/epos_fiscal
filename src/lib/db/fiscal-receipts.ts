@@ -196,6 +196,16 @@ export async function getFiscalReceiptById(
   return rows[0] ?? null
 }
 
+/** Чек по фискальному признаку (уникален) — не сохранён ли он уже. */
+export async function getFiscalReceiptBySign(fiscalSign: string): Promise<FiscalReceiptRow | null> {
+  const db = await getDb()
+  const rows = await db.select<FiscalReceiptRow[]>(
+    `SELECT * FROM fiscal_receipts WHERE fiscal_sign = $1 LIMIT 1`,
+    [fiscalSign],
+  )
+  return rows[0] ?? null
+}
+
 export async function getFiscalReceiptByMsId(msReceiptId: number): Promise<FiscalReceiptRow | null> {
   const db = await getDb()
   const rows = await db.select<FiscalReceiptRow[]>(

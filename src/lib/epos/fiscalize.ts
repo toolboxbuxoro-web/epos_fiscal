@@ -1,6 +1,7 @@
 import {
   createMatch,
   getFiscalReceiptByMsId,
+  getFiscalReceiptBySign,
   insertFiscalReceipt,
   setMsReceiptStatus,
   upsertMsReceipt,
@@ -27,6 +28,68 @@ function getEffectiveLines(build: BuildMatchResult): FiscalLine[] {
     return build.holistic.lines
   }
   return build.positions.flatMap((pm) => pm.candidates)
+}
+
+/** Строка для ленты — из плана или из того, что реально ушло в ОФД. */
+export interface PrintLine {
+  name: string
+  classCode: string
+  /** Тысячные. */
+  quantity: number
+  priceTiyin: number
+  discountTiyin: number
+  vatTiyin: number
+  vatPercent: number
+}
+
+function printLinesOfBuild(build: BuildMatchResult): PrintLine[] {
+  return getEffectiveLines(build).map((c) => ({
+    name: c.esfItem.name,
+    classCode: c.esfItem.class_code,
+    quantity: c.quantity,
+    priceTiyin: c.priceTiyin,
+    discountTiyin: c.discountTiyin,
+    vatTiyin: c.vatTiyin,
+    vatPercent: c.esfItem.vat_percent,
+  }))
+}
+
+function printLinesOfStored(items: StoredReceiptItem[]): PrintLine[] {
+  return items.map((i) => ({
+    name: i.Name,
+    classCode: i.SPIC,
+    quantity: i.Amount,
+    priceTiyin: i.Price,
+    discountTiyin: i.Discount,
+    vatTiyin: i.VAT,
+    vatPercent: i.VATPercent,
+  }))
+}
+
+/** То, чем довести продажу Pospoint, если ответ пришёл не сразу (см. журнал попыток). */
+interface PospointSaleSnapshot {
+  build: BuildMatchResult
+  /** ms_receipts.id, если чек открыт из документа МойСклад. */
+  msReceiptId?: number
+  receivedCash: number
+  receivedCard: number
+  cardKind?: 'fiz' | 'corp'
+  excludePaymentTiyin: number
+}
+
+/** Что именно пытались пробить: товары, количество, суммы, оплата. */
+function saleFingerprint(
+  lines: FiscalLine[],
+  receivedCash: number,
+  receivedCard: number,
+  cardKind: 'fiz' | 'corp' | undefined,
+): string {
+  return inputFingerprint({
+    lines: lines.map((l) => [l.esfItem.id, l.quantity, l.priceTiyin, l.discountTiyin]),
+    receivedCash,
+    receivedCard,
+    cardKind: cardKind ?? null,
+  })
 }
 import {
   applyItemsUpdate,
@@ -61,6 +124,20 @@ import {
   type FiscalDriveReceipt,
 } from './fiscal-drive-client'
 import { kickFdsSync, sendPendingToOfd, type PendingSendResult } from './fds-sync'
+import {
+  clearPendingAttempt,
+  fiscalizePospoint,
+  getPendingAttempt,
+  inputFingerprint,
+  isPospointShiftClosed,
+  mapPospointAnswer,
+  PospointOutcomeUnknownError,
+  resolvePendingAttempt,
+  runPospointForeground,
+  updatePendingAttempt,
+  storedItemsOf,
+  type StoredReceiptItem,
+} from './pospoint'
 import type { FiscalReceiptInfo } from './types'
 
 export interface FiscalizeOptions {
@@ -108,12 +185,22 @@ export interface FiscalizeOptions {
    * `fiscal_receipts.excluded_payment_tiyin` для отчёта «что ушло мимо ОФД».
    */
   excludePaymentTiyin?: number
+  /**
+   * Без печати чека — когда фоновая проверка сохраняет чек Pospoint, который
+   * пробит раньше, а покупатель давно ушёл.
+   */
+  silent?: boolean
 }
 
 export interface FiscalizeResult {
   fiscal: FiscalReceiptInfo
   fiscalReceiptDbId: number
   matchDbId: number | null
+  /**
+   * Сохранён чек ПРОШЛОЙ попытки этого документа (Pospoint успел его пробить),
+   * а не текущий подбор — экран должен сказать об этом кассиру.
+   */
+  recoveredPrior?: boolean
 }
 
 /**
@@ -130,6 +217,43 @@ export async function fiscalize(
   build: BuildMatchResult,
   opts: FiscalizeOptions = {},
 ): Promise<FiscalizeResult> {
+  // Pospoint: операции с кассой строго по одной (двойной клик, фоновое
+  // доведение). Другие бэкенды не трогаем — у Communicator нет таймаутов,
+  // и зависший чек там не должен держать следующий.
+  if ((await getSetting(SettingKey.FiscalBackend)) === 'pospoint') {
+    return runPospointForeground(() => fiscalizeImpl(build, opts))
+  }
+  return fiscalizeImpl(build, opts)
+}
+
+/**
+ * Сохранить продажу Pospoint, которая пробита, но не сохранена: исход был
+ * неизвестен, а кассир документ не повторил. Зовёт фоновая проверка. Чек
+ * берётся из журнала (план и оплата той попытки), в ОФД ничего не уходит,
+ * лента не печатается.
+ */
+export async function completePospointSale(payCheckNumber: string): Promise<FiscalizeResult | null> {
+  // В тестовом режиме fiscalize ничего не сохраняет — настоящий чек так не довести.
+  if ((await getSetting(SettingKey.TestMode)) === 'true') {
+    throw new Error('Включён тестовый режим — сохранить пробитый чек нельзя. Выключите тестовый режим.')
+  }
+  const pending = await getPendingAttempt(payCheckNumber)
+  const snap = pending?.kind === 'sale' ? (pending.snapshot as PospointSaleSnapshot | null) : null
+  if (!snap?.build) return null
+  return fiscalize(snap.build, {
+    msReceiptId: snap.msReceiptId,
+    receivedCash: snap.receivedCash,
+    receivedCard: snap.receivedCard,
+    cardKind: snap.cardKind,
+    excludePaymentTiyin: snap.excludePaymentTiyin,
+    silent: true,
+  })
+}
+
+async function fiscalizeImpl(
+  build: BuildMatchResult,
+  opts: FiscalizeOptions,
+): Promise<FiscalizeResult> {
   const eposUrl =
     (await getSetting(SettingKey.EposCommunicatorUrl)) ??
     'http://localhost:3448/rpc/api'
@@ -137,7 +261,7 @@ export async function fiscalize(
   // токен не нужен. Поле в Settings оставлено только для обратной
   // совместимости БД старых установок и UI его не показывает.
 
-  const effectiveLines = getEffectiveLines(build)
+  let effectiveLines = getEffectiveLines(build)
   if (effectiveLines.length === 0) {
     throw new Error('Нечего отправлять в Communicator: пустой план')
   }
@@ -162,7 +286,7 @@ export async function fiscalize(
   // = sum(priceTiyin - discountTiyin). Совпадает с rd.sum если включена
   // discountForExactSum и хватает запаса по себестоимости.
   // В holistic-режиме — это totalTiyin плана (по конструкции = receipt.sum).
-  const matchedTotal = effectiveLines.reduce(
+  let matchedTotal = effectiveLines.reduce(
     (s, c) => s + c.priceTiyin - c.discountTiyin,
     0,
   )
@@ -184,8 +308,10 @@ export async function fiscalize(
   // отрицательное значение — FiscalDrive ждёт беззнаковое и отвергает чек
   // целиком, а EPOS может принять молча и записать в ОФД неверную оплату.
   // Клампим и авто-расчёт, и явное переопределение из UI.
-  const receivedCash = Math.max(0, opts.receivedCash ?? auto?.receivedCash ?? 0)
-  const receivedCard = Math.max(0, opts.receivedCard ?? auto?.receivedCard ?? 0)
+  let receivedCash = Math.max(0, opts.receivedCash ?? auto?.receivedCash ?? 0)
+  let receivedCard = Math.max(0, opts.receivedCard ?? auto?.receivedCard ?? 0)
+  let cardKind = opts.cardKind
+  let excludePayment = Math.max(0, opts.excludePaymentTiyin ?? 0)
 
   // ── Тестовый режим (сухой прогон) ────────────────────────────
   // UI отрабатывает «как будто» фискализация прошла, но в Communicator
@@ -214,16 +340,83 @@ export async function fiscalize(
       AppletVersion: 'TEST',
     }
     // Печать всё равно отправляем — она не имеет побочных эффектов в ОФД.
-    await maybePrintReceipt(
-      build,
-      fakeFiscal,
-      receivedCash,
-      receivedCard,
-      false,
-      true,
-      opts.cardKind,
-    )
+    if (!opts.silent) {
+      await maybePrintReceipt(
+        build,
+        fakeFiscal,
+        receivedCash,
+        receivedCard,
+        false,
+        true,
+        cardKind,
+      )
+    }
     return { fiscal: fakeFiscal, fiscalReceiptDbId: 0, matchDbId: null }
+  }
+
+  // Бэкенд читаем сразу — от него зависят и защита от дубля, и pre-flight.
+  const fiscalBackend = (await getSetting(SettingKey.FiscalBackend)) ?? 'epos'
+
+  // ── Pospoint: прошлая попытка этого документа с неизвестным исходом ──
+  // Номер документа (payCheckNumber) защищает от второго чека в ОФД, но
+  // сохранить надо то, что РЕАЛЬНО пробито: если прошлая попытка нашлась в
+  // Pospoint — берём её план и оплату из журнала, а не текущий подбор
+  // (кассир мог пересобрать чек после сбоя).
+  let pospointPayCheck = ''
+  let pospointFp = ''
+  let recovered: { fiscal: FiscalReceiptInfo; requestJson: string; stored: StoredReceiptItem[] } | null = null
+  // Резервы прошлой попытки, которые уже подтверждаются её чеком (упала
+  // только запись в БД) — повтор подтверждает их же, а не резервирует заново.
+  let priorReservations: ReservationInfo[] | null = null
+  if (fiscalBackend !== 'pospoint' && build.receipt.id) {
+    // Касса переключена с Pospoint, а по документу осталась попытка с
+    // неизвестным исходом: он мог уже уйти в ОФД через Pospoint.
+    const left = await getPendingAttempt(build.receipt.id).catch(() => null)
+    if (left) {
+      throw new Error(
+        'По этому документу осталась попытка Pospoint с неизвестным исходом — он мог уже уйти в ОФД. ' +
+          'Верните кассу на Pospoint и разберите попытку (Настройки → Pospoint) или обратитесь к администратору.',
+      )
+    }
+  }
+  if (fiscalBackend === 'pospoint') {
+    if (!build.receipt.id) {
+      throw new Error('Pospoint: у чека нет номера документа — без него не защититься от двойного пробития')
+    }
+    pospointPayCheck = build.receipt.id
+    pospointFp = saleFingerprint(effectiveLines, receivedCash, receivedCard, cardKind)
+    const prior = await resolvePendingAttempt(pospointPayCheck, 'sale')
+    if (prior.status === 'found') {
+      const snap = prior.pending.snapshot as PospointSaleSnapshot
+      await log.warn(
+        'fiscalize',
+        `Pospoint: прошлая попытка чека ${build.receipt.name} пробита — сохраняю её, новый чек не отправляю`,
+        {
+          payCheckNumber: pospointPayCheck,
+          fiscalSign: prior.answer.fiscalSign,
+          planChanged: prior.pending.inputFp !== pospointFp,
+        },
+      )
+      build = snap.build
+      effectiveLines = getEffectiveLines(build)
+      matchedTotal = effectiveLines.reduce((s, c) => s + c.priceTiyin - c.discountTiyin, 0)
+      receivedCash = snap.receivedCash
+      receivedCard = snap.receivedCard
+      cardKind = snap.cardKind
+      excludePayment = snap.excludePaymentTiyin
+      recovered = {
+        fiscal: mapPospointAnswer(prior.answer),
+        requestJson: prior.pending.requestJson,
+        stored: storedItemsOf(prior.pending.requestJson),
+      }
+      priorReservations = (prior.pending.reservations as ReservationInfo[] | undefined) ?? null
+      // Уже сохранён (например, фоновой проверкой) — второй раз не пишем.
+      const dup = await getFiscalReceiptBySign(recovered.fiscal.FiscalSign).catch(() => null)
+      if (dup) {
+        await clearPendingAttempt(pospointPayCheck)
+        throw new AlreadyFiscalizedError(dup.fiscal_sign, dup.receipt_seq)
+      }
+    }
   }
 
   // ── Жёсткий guard: ИКПУ обязателен на ВСЁМ пути ──
@@ -237,8 +430,9 @@ export async function fiscalize(
   // эмпирически: фискализация работала без package_code.
   // Применяется ДО любой работы с сервером (резерв, fiscalize) — иначе
   // потратим время и вернём резерв обратно при failure.
+  // Уже пробитый (recovered) чек не проверяем: он в ОФД, его надо сохранить.
   const noIkpuItems: string[] = []
-  for (const c of effectiveLines) {
+  for (const c of recovered ? [] : effectiveLines) {
     if (!c.esfItem.class_code || c.esfItem.class_code.trim() === '') {
       noIkpuItems.push(c.esfItem.name)
     }
@@ -259,14 +453,36 @@ export async function fiscalize(
   // Если включён remote-режим (общий пул через mytoolbox), резервируем
   // все позиции на сервере. Это блокирует другие магазины от списания
   // тех же штук. Если 409 — кто-то опередил, кидаем ошибку для re-match.
-  const reserveResult = await tryRemoteReserve(
-    effectiveLines,
-    build.receipt.id ?? msReceiptId.toString(),
-  )
+  //
+  // Pospoint при сбое разбирается долго (поиск чека, X-отчёт, отправка в
+  // ОФД) — резерв держим 20 минут, а не 5, чтобы confirm не упёрся в
+  // истёкший резерв.
+  //
+  // Уже пробитый чек сохраняем при любом исходе резерва: он в ОФД, а
+  // остатки админ поправит по 🚨 в логах.
+  let reserveResult: { reservations: ReservationInfo[] } = { reservations: [] }
+  if (priorReservations?.length) {
+    reserveResult = { reservations: priorReservations }
+  } else {
+    try {
+      reserveResult = await tryRemoteReserve(
+        effectiveLines,
+        build.receipt.id ?? msReceiptId.toString(),
+        fiscalBackend === 'pospoint' ? 1200 : undefined,
+      )
+    } catch (e) {
+      if (!recovered) throw e
+      await log.error(
+        'fiscalize',
+        `🚨 Pospoint: чек ${recovered.fiscal.FiscalSign} пробит, но списать остатки на сервере не удалось — поправьте приходы вручную`,
+        {
+          error: e instanceof Error ? e.message : String(e),
+          items: effectiveLines.map((c) => ({ id: c.esfItem.server_item_id, name: c.esfItem.name, qty: c.quantity })),
+        },
+      )
+    }
+  }
   // ────────────────────────────────────────────────────────────────────
-
-  // 3+4. Бэкенд читаем сразу — нужен и для pre-flight и для фискализации.
-  const fiscalBackend = (await getSetting(SettingKey.FiscalBackend)) ?? 'epos'
 
   await log.info('fiscalize', `Отправляю чек ${build.receipt.name} в EPOS`, {
     eposUrl,
@@ -278,22 +494,35 @@ export async function fiscalize(
   })
 
   // 3. Pre-flight: версия Communicator в логи (только для epos бэкенда).
-  // При fiscaldrive пропускаем — FiscalDriveService не имеет метода status()
-  // и попытка стучаться на :3448 даёт ненужный warning в логах.
+  // При fiscaldrive и pospoint пропускаем — стучаться на :3448 незачем,
+  // это дало бы лишний warning в логах.
   let communicatorVersion: string | null = null
-  if (fiscalBackend !== 'fiscaldrive') {
+  if (fiscalBackend !== 'fiscaldrive' && fiscalBackend !== 'pospoint') {
     communicatorVersion = await getCommunicatorVersionCached(eposUrl)
   }
 
   // 4. Фискализация — выбираем бэкенд по настройке FiscalBackend:
   //   'epos'        → JSON-RPC на :3448/rpc/api (Api.SendSaleReceipt)
   //   'fiscaldrive' → REST на :3449 (GetTXID → RegisterTXID)
+  //   'pospoint'    → Pospoint на :6461 (registerSaleFull)
 
   let fiscal: FiscalReceiptInfo
   let requestJson: string
+  // Pospoint: строки ровно как ушли в ОФД (цена за единицу целыми сумами) —
+  // их и печатаем.
+  let printStored: StoredReceiptItem[] | null = null
+  // Pospoint вернул уже пробитый раньше чек (14824 или поиск после сбоя).
+  let sentRecovered = false
   try {
-    let result: { fiscal: FiscalReceiptInfo; requestJson: string }
-    if (fiscalBackend === 'fiscaldrive') {
+    let result: {
+      fiscal: FiscalReceiptInfo
+      requestJson: string
+      stored?: StoredReceiptItem[]
+      recovered?: boolean
+    }
+    if (recovered) {
+      result = recovered
+    } else if (fiscalBackend === 'fiscaldrive') {
       const fdsBaseUrl =
         (await getSetting(SettingKey.FiscalDriveBaseUrl)) ?? FISCAL_DRIVE_DEFAULT_URL
       const factoryId = await getSetting(SettingKey.FiscalDriveFactoryId)
@@ -309,46 +538,76 @@ export async function fiscalize(
         effectiveLines,
         receivedCash,
         receivedCard,
-        opts.cardKind,
+        cardKind,
       )
+    } else if (fiscalBackend === 'pospoint') {
+      // Номер документа защищает от двойного пробития: повтор под тем же
+      // номером Pospoint не пробьёт, а вернёт 14824 — и мы заберём первый чек.
+      const snapshot: PospointSaleSnapshot = {
+        build,
+        msReceiptId: opts.msReceiptId,
+        receivedCash,
+        receivedCard,
+        cardKind,
+        excludePaymentTiyin: excludePayment,
+      }
+      result = await fiscalizePospoint({
+        lines: effectiveLines,
+        receivedCash,
+        receivedCard,
+        cardKind,
+        payCheckNumber: pospointPayCheck,
+        inputFp: pospointFp,
+        snapshot,
+      })
     } else {
       result = await fiscalizeJsonRpc(
         eposUrl,
         effectiveLines,
         receivedCash,
         receivedCard,
-        opts.cardKind,
+        cardKind,
       )
     }
     fiscal = result.fiscal
     requestJson = result.requestJson
+    printStored = result.stored ?? null
+    sentRecovered = !recovered && !!result.recovered
   } catch (eposErr) {
     // Расширенный лог: всё что нужно понять «почему чек не пробился».
     // Сохраняется в БД, видно в Логах, можно прислать саппорту E-POS.
     const errMsg = eposErr instanceof Error ? eposErr.message : String(eposErr)
     const errStack = eposErr instanceof Error ? eposErr.stack : undefined
     const eposExtra = eposErr as { code?: number; data?: unknown }
-    await log.error('fiscalize', `❌ Чек НЕ пробился: ${errMsg}`, {
-      eposUrl,
-      communicatorVersion,
-      jsonRpcCode: eposExtra.code,
-      jsonRpcData: eposExtra.data,
-      errorMessage: errMsg,
-      errorStack: errStack,
-      itemsCount: effectiveLines.length,
-      matcherMode: build.mode,
-      matchedTotalTiyin: matchedTotal,
-      receivedCash,
-      receivedCard,
-      // Первые 3 товара с их ИКПУ — для проверки данных
-      sampleItems: effectiveLines.slice(0, 3).map((c) => ({
-        name: c.esfItem.name,
-        class_code: c.esfItem.class_code,
-        package_code: c.esfItem.package_code,
-        vat_percent: c.esfItem.vat_percent,
-        priceTiyin: c.priceTiyin,
-      })),
-    })
+    // Исход неизвестен — чек мог уйти в ОФД; попытка ждёт в журнале.
+    const unknownOutcome = eposErr instanceof PospointOutcomeUnknownError
+    await log.error(
+      'fiscalize',
+      unknownOutcome
+        ? `Pospoint: неизвестно, пробит ли чек ${build.receipt.name} — повтор сначала проверит: ${errMsg}`
+        : `❌ Чек НЕ пробился: ${errMsg}`,
+      {
+        eposUrl,
+        communicatorVersion,
+        jsonRpcCode: eposExtra.code,
+        jsonRpcData: eposExtra.data,
+        errorMessage: errMsg,
+        errorStack: errStack,
+        itemsCount: effectiveLines.length,
+        matcherMode: build.mode,
+        matchedTotalTiyin: matchedTotal,
+        receivedCash,
+        receivedCard,
+        // Первые 3 товара с их ИКПУ — для проверки данных
+        sampleItems: effectiveLines.slice(0, 3).map((c) => ({
+          name: c.esfItem.name,
+          class_code: c.esfItem.class_code,
+          package_code: c.esfItem.package_code,
+          vat_percent: c.esfItem.vat_percent,
+          priceTiyin: c.priceTiyin,
+        })),
+      },
+    )
 
     // EPOS не выдал FiscalSign — отпускаем резерв.
     await releaseRemote(reserveResult.reservations, 'epos-failed').catch(() => {})
@@ -360,7 +619,7 @@ export async function fiscalize(
       typeof eposExtra.data === 'string'
         ? eposExtra.data
         : JSON.stringify(eposExtra.data ?? '')
-    if (isShiftClosedError(errMsg, dataStr, eposExtra.code)) {
+    if (isShiftClosedError(errMsg, dataStr, eposExtra.code) || isPospointShiftClosed(eposErr)) {
       throw new ShiftNotOpenError()
     }
     // Фискальная карта не отозвалась — см. isCardNotConnectedError.
@@ -368,6 +627,18 @@ export async function fiscalize(
       throw new CardNotConnectedError()
     }
     throw eposErr
+  }
+
+  // Чек под этим номером пробит раньше и, возможно, уже сохранён (двойной
+  // клик, повтор после сбоя записи без журнала) — второй раз не списываем
+  // остатки и не пишем.
+  if (sentRecovered) {
+    const dup = await getFiscalReceiptBySign(fiscal.FiscalSign).catch(() => null)
+    if (dup) {
+      await releaseRemote(reserveResult.reservations, 'already-fiscalized').catch(() => {})
+      await clearPendingAttempt(pospointPayCheck).catch(() => {})
+      throw new AlreadyFiscalizedError(dup.fiscal_sign, dup.receipt_seq)
+    }
   }
 
   await log.info('fiscalize', `Чек фискализирован: ${fiscal.FiscalSign}`, {
@@ -378,11 +649,24 @@ export async function fiscalize(
 
   // 4. Confirm резерв → server переводит qty_reserved → qty_consumed.
   // Server is authoritative. SSE придёт обратно и обновит локальный кэш.
-  await confirmRemote(reserveResult.reservations, fiscal.FiscalSign)
+  if (reserveResult.reservations.length > 0) {
+    // Pospoint: резервы — в журнал ДО confirm. Упадёт запись чека в БД —
+    // повтор подтвердит эти же резервы (идемпотентно), а не спишет снова.
+    if (pospointPayCheck && !priorReservations?.length) {
+      await withDbRetry(() =>
+        updatePendingAttempt(pospointPayCheck, { reservations: reserveResult.reservations }),
+      ).catch((e) =>
+        log.error('fiscalize', 'Pospoint: не записал резервы в журнал — при сбое записи чека остатки могут списаться дважды', {
+          error: e instanceof Error ? e.message : String(e),
+        }),
+      )
+    }
+    await confirmRemote(reserveResult.reservations, fiscal.FiscalSign)
+  }
 
   // 5. Сохранить fiscal_receipt (включая card_kind для refund/reprint flow
   // и excluded_payment_tiyin для аудита Click/Payme).
-  const fiscalReceiptDbId = await insertFiscalReceipt({
+  const insertRow = (): ReturnType<typeof insertFiscalReceipt> => insertFiscalReceipt({
     ms_receipt_id: msReceiptId,
     match_id: matchDbId,
     terminal_id: fiscal.TerminalID,
@@ -395,13 +679,25 @@ export async function fiscalize(
     response_json: JSON.stringify(fiscal),
     // card_kind пишем только если оплата картой реально была. Для cash-only
     // чеков и тестового режима — null (строка «Karta turi» не печатается).
-    card_kind: receivedCard > 0 ? (opts.cardKind ?? null) : null,
-    excluded_payment_tiyin: Math.max(0, opts.excludePaymentTiyin ?? 0),
+    card_kind: receivedCard > 0 ? (cardKind ?? null) : null,
+    excluded_payment_tiyin: excludePayment,
     // Попадают в search_text: кассир ищет чек по номеру и по названиям из
     // МойСклад («дрель»), а не по подменённым ИКПУ-именам, ушедшим в ОФД.
     ms_name: build.receipt.name ?? null,
     ms_item_names: build.positions.map((p) => p.source.name),
   })
+  // Чек уже в ОФД: у Pospoint запись повторяем (БД бывает занята фоновым
+  // синком), и даже если не выйдет — попытка остаётся в журнале, повтор
+  // документа сохранит этот же чек.
+  const fiscalReceiptDbId = pospointPayCheck ? await withDbRetry(insertRow) : await insertRow()
+
+  // Чек сохранён — попытка Pospoint больше не нужна. Снимаем только теперь:
+  // упади запись в БД, повтор найдёт чек в Pospoint и сохранит его план.
+  if (pospointPayCheck) {
+    await clearPendingAttempt(pospointPayCheck).catch((e) =>
+      log.warn('fiscalize', `Pospoint: не снял попытку из журнала: ${e instanceof Error ? e.message : String(e)}`),
+    )
+  }
 
   // 6. Статус.
   await setMsReceiptStatus(msReceiptId, 'fiscalized')
@@ -409,17 +705,34 @@ export async function fiscalize(
   // 7. Авто-печать на термопринтер, если включено в Settings.
   // Печать НЕ должна валить фискализацию — чек уже в ОФД, лента это
   // просто удобство для покупателя. Любая ошибка идёт в логи.
-  await maybePrintReceipt(
-    build,
-    fiscal,
-    receivedCash,
-    receivedCard,
-    false,
-    false,
-    opts.cardKind,
-  )
+  if (!opts.silent) {
+    await maybePrintReceipt(
+      build,
+      fiscal,
+      receivedCash,
+      receivedCard,
+      false,
+      false,
+      cardKind,
+      printStored?.length ? printLinesOfStored(printStored) : undefined,
+    )
+  }
 
-  return { fiscal, fiscalReceiptDbId, matchDbId }
+  return { fiscal, fiscalReceiptDbId, matchDbId, ...(recovered ? { recoveredPrior: true } : {}) }
+}
+
+/** Запись в SQLite с повтором: 3 попытки, пауза 0.5 и 1 с. */
+async function withDbRetry<T>(fn: () => Promise<T>): Promise<T> {
+  let last: unknown
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      return await fn()
+    } catch (e) {
+      last = e
+      if (attempt < 3) await new Promise((r) => setTimeout(r, attempt * 500))
+    }
+  }
+  throw last
 }
 
 /**
@@ -639,6 +952,7 @@ export class InventoryConflictError extends Error {
 async function tryRemoteReserve(
   effectiveLines: FiscalLine[],
   ms_receipt_id: string,
+  ttlSeconds?: number,
 ): Promise<{ reservations: ReservationInfo[] }> {
   const cfg = await loadInventoryConfig()
   if (!cfg) {
@@ -782,9 +1096,28 @@ async function tryRemoteReserve(
       .catch(() => {})
   }
 
+  const request = { ms_receipt_id, items, ...(ttlSeconds ? { ttl_seconds: ttlSeconds } : {}) }
   let resp
   try {
-    resp = await client.reserve({ ms_receipt_id, items })
+    resp = await client.reserve(request)
+    // По документу остался активный резерв прошлой попытки (не дошёл
+    // release после сбоя). Сервер тогда отвечает «повтором» — одним id без
+    // списка резервов, и, возможно, под другой подбор. Отпускаем такие
+    // резервы по одному и резервируем заново: кассир пробивает этот документ
+    // сейчас, прошлая попытка закончилась.
+    for (let i = 0; i < 30 && isReserveReplay(resp); i++) {
+      const staleId = resp.reservation_id
+      await log.warn('fiscalize', 'Остался резерв прошлой попытки этого документа — отпускаю и резервирую заново', {
+        ms_receipt_id,
+        staleId,
+      })
+      await client.release({ reservation_ids: [staleId], reason: 'stale-retry' })
+      await deletePendingByReservations([staleId]).catch(() => {})
+      resp = await client.reserve(request)
+    }
+    if (isReserveReplay(resp)) {
+      throw new Error('Не удалось снять старые резервы остатков по этому документу — повторите через несколько минут.')
+    }
   } catch (e) {
     // Сервер может вернуть Postgres-инвариант inv_items_check (qty_consumed +
     // qty_reserved <= qty_received) сырым текстом если сам не успел проверить
@@ -812,6 +1145,12 @@ async function tryRemoteReserve(
     })
   }
   return { reservations: resp.reservations }
+}
+
+/** Ответ reserve «такая резервация уже есть» — без списка резервов. */
+function isReserveReplay(resp: unknown): resp is { ok: true; idempotent_replay: true; reservation_id: string } {
+  const r = resp as { ok?: boolean; idempotent_replay?: boolean; reservations?: unknown; reservation_id?: unknown } | null
+  return !!r && r.ok === true && !Array.isArray(r.reservations) && typeof r.reservation_id === 'string'
 }
 
 /** Inventory server не сконфигурирован — UI показывает с deep-link на Настройки. */
@@ -956,6 +1295,7 @@ export async function maybePrintReceipt(
   isCopy: boolean,
   isTest: boolean = false,
   cardKind?: 'fiz' | 'corp',
+  lines?: PrintLine[],
 ): Promise<void> {
   try {
     const enabled = (await getSetting(SettingKey.PrinterAutoPrint)) === 'true'
@@ -983,6 +1323,7 @@ export async function maybePrintReceipt(
       isCopy,
       isTest,
       cardKind,
+      lines,
     )
     const jobId = await printFiscalReceipt(printerName, data)
     await log.info('fiscalize', `Чек отправлен на печать (job #${jobId})`, {
@@ -1009,33 +1350,34 @@ async function buildReceiptData(
   isCopy: boolean,
   isTest: boolean,
   cardKind?: 'fiz' | 'corp',
+  linesOverride?: PrintLine[],
 ): Promise<ReceiptData> {
   const company = await readCompanySettings()
   const cashier = (await getSetting(SettingKey.MoyskladEmployeeName)) ?? ''
-  const effectiveLines = getEffectiveLines(build)
+  const lines = linesOverride ?? printLinesOfBuild(build)
 
   // Все позиции — после подмены, по продажным ценам, со скидкой если есть.
   // На ленте: Price = до скидки, Discount = размер скидки (показывается
   // отдельной строкой на принтере если > 0).
-  const items = effectiveLines.map((c) => ({
-    name: c.esfItem.name,
-    class_code: c.esfItem.class_code,
+  const items = lines.map((c) => ({
+    name: c.name,
+    class_code: c.classCode,
     qty_str: formatQtyForPrint(c.quantity),
     price_str: formatTiyinForPrint(c.priceTiyin),
     // Пустая строка если скидки нет — Rust пропустит строку «Skidka».
     discount_str:
       c.discountTiyin > 0 ? formatTiyinForPrint(c.discountTiyin) : '',
     vat_str: formatTiyinForPrint(c.vatTiyin),
-    vat_percent: c.esfItem.vat_percent,
+    vat_percent: c.vatPercent,
   }))
 
   // Итог = сумма (price - discount) по всем строкам — то что покупатель
   // реально платит и что должно совпасть с receivedCash + receivedCard.
-  const totalTiyin = effectiveLines.reduce(
+  const totalTiyin = lines.reduce(
     (s, c) => s + c.priceTiyin - c.discountTiyin,
     0,
   )
-  const totalVatTiyin = effectiveLines.reduce((s, c) => s + c.vatTiyin, 0)
+  const totalVatTiyin = lines.reduce((s, c) => s + c.vatTiyin, 0)
 
   return {
     is_copy: isCopy,

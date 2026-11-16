@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { formatErrorForUser } from '@/lib/error-message'
-import { getAllSettings, setSetting, setSettings, SettingKey } from '@/lib/db'
+import { getAllSettings, getSetting, setSetting, setSettings, SettingKey } from '@/lib/db'
 import {
   DEMAND_SYNC_KEY,
   MoyskladClient,
@@ -37,6 +37,10 @@ import { Input } from '@/components/ui/Input'
 import { Select } from '@/components/ui/Select'
 import { toast } from '@/components/ui'
 import { MIN_MARKUP_PERCENT } from '@/lib/matcher/strategies'
+import { PospointSettings } from './Settings/PospointSettings'
+import { POSPOINT_DEFAULT_URL, POSPOINT_TEST_KEY } from '@/lib/epos/pospoint-client'
+import { kickPospointSync } from '@/lib/epos/pospoint-sync'
+import { backendName, checkSwitchReadiness, type FiscalBackendKind } from '@/lib/epos/switch-readiness'
 
 interface FormState {
   // МойСклад: логин и доступ приходят с сервера при входе по коду
@@ -80,9 +84,11 @@ interface FormState {
   // Тестовый режим — фискализация без реальной отправки в Communicator
   testMode: 'true' | 'false'
   // Фискальный бэкенд
-  fiscalBackend: 'epos' | 'fiscaldrive'
+  fiscalBackend: 'epos' | 'fiscaldrive' | 'pospoint'
   fiscalDriveBaseUrl: string
   fiscalDriveFactoryId: string
+  pospointUrl: string
+  pospointKey: string
   // Inventory Server (общий пул приходов через mytoolbox) — обязательно с 0.10+
   invServerUrl: string
   invShopSlug: string
@@ -123,6 +129,8 @@ const empty: FormState = {
   fiscalBackend: 'epos',
   fiscalDriveBaseUrl: 'http://localhost:3449',
   fiscalDriveFactoryId: '',
+  pospointUrl: POSPOINT_DEFAULT_URL,
+  pospointKey: '',
   invServerUrl: '',
   invShopSlug: '',
   invShopApiKey: '',
@@ -139,6 +147,11 @@ export default function Settings() {
   const [busy, setBusy] = useState(false)
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  /**
+   * Старая программа фискализации не ответила на проверку перед
+   * переключением — кассир может переключиться под свою ответственность.
+   */
+  const [switchUnchecked, setSwitchUnchecked] = useState<string | null>(null)
   const [authError, setAuthError] = useState<string | null>(null)
   const [stores, setStores] = useState<MsStore[]>([])
   const [demandStates, setDemandStates] = useState<MsState[]>([])
@@ -248,9 +261,13 @@ export default function Settings() {
       maxDiscountPerItemSum:
         all[SettingKey.MaxDiscountPerItemSum] ?? '2000',
       testMode: (all[SettingKey.TestMode] ?? 'false') as 'true' | 'false',
-      fiscalBackend: (all[SettingKey.FiscalBackend] === 'fiscaldrive' ? 'fiscaldrive' : 'epos') as 'epos' | 'fiscaldrive',
+      fiscalBackend: (all[SettingKey.FiscalBackend] === 'fiscaldrive' || all[SettingKey.FiscalBackend] === 'pospoint'
+        ? all[SettingKey.FiscalBackend]
+        : 'epos') as 'epos' | 'fiscaldrive' | 'pospoint',
       fiscalDriveBaseUrl: all[SettingKey.FiscalDriveBaseUrl] ?? 'http://localhost:3449',
       fiscalDriveFactoryId: all[SettingKey.FiscalDriveFactoryId] ?? '',
+      pospointUrl: all[SettingKey.PospointUrl] ?? POSPOINT_DEFAULT_URL,
+      pospointKey: all[SettingKey.PospointKey] ?? '',
       autoFiscalize: (all[SettingKey.AutoFiscalize] ?? 'false') as 'true' | 'false',
       replacementEnabled: (all[SettingKey.ReplacementEnabled] ?? 'true') as 'true' | 'false',
       invServerUrl: all[SettingKey.InventoryServerUrl] ?? '',
@@ -370,7 +387,13 @@ export default function Settings() {
     })
   }
 
-  async function save() {
+  /**
+   * @param forceSwitch — переключить программу фискализации без проверки
+   *   старой (только кнопкой «Переключить без проверки», когда старая не
+   *   отвечает). Аргумент, а не флаг в состоянии: ранний выход по другой
+   *   ошибке формы не должен «запомнить» разрешение до следующего сохранения.
+   */
+  async function save(forceSwitch = false) {
     // Нижняя граница наценки — MIN_MARKUP_PERCENT (см. strategies.ts).
     // Замер на реальном пуле: при наценке 10/8/5% floor-фильтры инертны
     // (0% пула отсекается), но уже при 3% отсекается 88.5% пула, при 0% —
@@ -390,9 +413,62 @@ export default function Settings() {
       toast.error(msg, { duration: 6000 })
       return
     }
+    if (form.fiscalBackend === 'pospoint' && form.pospointKey.trim() === POSPOINT_TEST_KEY) {
+      const msg =
+        'Это тестовый ключ Pospoint из документации — с ним чеки не фискализируются. ' +
+        'Вставьте ключ этой кассы, выданный Pospoint («Пробный чек» использует тестовый ключ сам).'
+      setError(msg)
+      toast.error(msg, { duration: 6000 })
+      return
+    }
+    if (form.fiscalBackend === 'pospoint' && form.pospointKey.trim() === '') {
+      const msg = 'Не задан ключ кассы Pospoint — без него чеки не пробиваются. Вставьте ключ этой кассы.'
+      setError(msg)
+      toast.error(msg, { duration: 6000 })
+      return
+    }
     setBusy(true)
     setError(null)
     try {
+      // Переключение программы фискализации: старая должна закрыть смену и
+      // отправить в ОФД накопленное — потом её никто не позовёт, а ФМ с
+      // неподтверждёнными чеками через 48 ч блокирует продажи.
+      const currentBackend = ((await getSetting(SettingKey.FiscalBackend)) ?? 'epos') as FiscalBackendKind
+      const switching = currentBackend !== form.fiscalBackend
+      if (switching) {
+        if (forceSwitch) {
+          await log.warn('fiscalize', `Переключение ${currentBackend} → ${form.fiscalBackend} без проверки старой программы`, {
+            reason: switchUnchecked,
+          })
+        } else {
+          const r = await checkSwitchReadiness(currentBackend, form.fiscalBackend)
+          if (r.status === 'blocked' && r.unverified) {
+            // Старая программа ответила ошибкой — так выглядит и отключённый
+            // E-POS. Проверить её нельзя, решает кассир.
+            setSwitchUnchecked(r.unverified)
+            setError(
+              `Не удалось проверить ${backendName(currentBackend)}: ${r.unverified}. Повторите через минуту. ` +
+                'Если ошибка не уходит, а смена в нём закрыта и все чеки ушли в ОФД — переключитесь кнопкой ниже.',
+            )
+            return
+          }
+          if (r.status === 'blocked') {
+            setSwitchUnchecked(null)
+            setError(`Переключиться с ${backendName(currentBackend)} пока нельзя. ${r.reasons.join(' ')}`)
+            return
+          }
+          if (r.status === 'unreachable') {
+            setSwitchUnchecked(r.detail)
+            setError(
+              `Не удалось проверить ${backendName(currentBackend)}: ${r.detail}. ` +
+                'Если смена в нём закрыта и все чеки ушли в ОФД — переключитесь кнопкой ниже.',
+            )
+            return
+          }
+          for (const n of r.notes) toast.success(n, { duration: 6000 })
+        }
+      }
+      setSwitchUnchecked(null)
       await setSettings({
         [SettingKey.MoyskladPollIntervalSec]: form.moyskladPollInterval,
         [SettingKey.EposCommunicatorUrl]: form.eposCommunicatorUrl,
@@ -416,6 +492,8 @@ export default function Settings() {
         [SettingKey.FiscalBackend]: form.fiscalBackend,
         [SettingKey.FiscalDriveBaseUrl]: form.fiscalDriveBaseUrl.replace(/\/$/, ''),
         [SettingKey.FiscalDriveFactoryId]: form.fiscalDriveFactoryId.trim(),
+        [SettingKey.PospointUrl]: form.pospointUrl.trim() || POSPOINT_DEFAULT_URL,
+        [SettingKey.PospointKey]: form.pospointKey.trim(),
         [SettingKey.AutoFiscalize]: form.autoFiscalize,
         [SettingKey.ReplacementEnabled]: form.replacementEnabled,
         [SettingKey.InventoryRemoteEnabled]: "true",
@@ -424,6 +502,19 @@ export default function Settings() {
         [SettingKey.InventoryShopApiKey]: form.invShopApiKey.trim(),
         [SettingKey.TelemetryEnabled]: form.telemetryEnabled,
       })
+      if (switching) {
+        await log.info('fiscalize', `Фискализация переключена: ${currentBackend} → ${form.fiscalBackend}`)
+        // «С какого момента висят неотправленные» — от прошлого периода на
+        // Pospoint; иначе возврат на него сразу дал бы ложную тревогу.
+        await setSetting(SettingKey.PospointUnsentSince, '').catch(() => {})
+        // ФМ ещё может быть у старой программы — фоновая проверка не тронет
+        // его, пока кассир сам не начнёт работать через Pospoint.
+        await setSetting(SettingKey.PospointFmHandedOver, '').catch(() => {})
+      }
+      // Состояние Pospoint в панели — сразу, а не через минуту. Сразу после
+      // переключения — только «жива ли программа»: ФМ ещё может быть у старой
+      // программы, пока кассир её не выключил (см. порядок перехода).
+      if (form.fiscalBackend === 'pospoint') kickPospointSync({ fm: !switching })
       setSaved(true)
     } catch (e) {
       setError(formatErrorForUser(e))
@@ -862,13 +953,19 @@ export default function Settings() {
         <Field label="Бэкенд">
           <Select
             value={form.fiscalBackend}
-            onChange={(e) => setField('fiscalBackend', e.target.value as 'epos' | 'fiscaldrive')}
+            onChange={(e) => {
+              setField('fiscalBackend', e.target.value as 'epos' | 'fiscaldrive' | 'pospoint')
+              // Разрешение «без проверки» относилось к прошлому выбору.
+              setSwitchUnchecked(null)
+            }}
           >
             <option value="epos">E-POS Communicator (JSON-RPC :3448)</option>
             <option value="fiscaldrive">FiscalDriveService (REST :3449)</option>
+            <option value="pospoint">Pospoint — мобильная касса (:6461)</option>
           </Select>
           <div className="mt-1 text-xs text-ink-muted">
-            Магазин 1 (Хонабод) — epos. Магазин 2 (Хазрати Имом) — fiscaldrive.
+            E-POS Communicator скоро отключат — кассы переходят на Pospoint. Переключать
+            после закрытия смены: чеки, пробитые до перехода, через Pospoint не вернуть.
           </div>
         </Field>
       </Section>
@@ -902,6 +999,17 @@ export default function Settings() {
             </Button>
             <span className="text-xs text-ink-muted">{eposTest}</span>
           </div>
+        </Section>
+      )}
+
+      {form.fiscalBackend === 'pospoint' && (
+        <Section title="Pospoint">
+          <PospointSettings
+            url={form.pospointUrl}
+            apiKey={form.pospointKey}
+            onUrl={(v) => setField('pospointUrl', v)}
+            onKey={(v) => setField('pospointKey', v)}
+          />
         </Section>
       )}
 
@@ -1290,9 +1398,18 @@ export default function Settings() {
       )}
 
       <div className="flex items-center gap-3 border-t border-border pt-4">
-        <Button variant="primary" disabled={busy} onClick={save}>
+        <Button variant="primary" disabled={busy} onClick={() => void save()}>
           {busy ? 'Сохранение…' : 'Сохранить остальные настройки'}
         </Button>
+        {switchUnchecked && (
+          <Button
+            variant="secondary"
+            disabled={busy}
+            onClick={() => void save(true)}
+          >
+            Переключить без проверки
+          </Button>
+        )}
         {saved && <span className="text-sm text-success">Сохранено</span>}
       </div>
 

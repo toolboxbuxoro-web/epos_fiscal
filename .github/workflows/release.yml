@@ -73,5 +73,9 @@ jobs:
           releaseName: 'Toolbox Fiscal ${{ github.ref_name }}'
           releaseBody: 'См. CHANGELOG.md'
           releaseDraft: false
-          prerelease: false
+          # Тег с дефисом (v0.13.0-pilot) — предварительный релиз: GitHub не
+          # считает его «последним», и ни одна касса не обновится на него сама
+          # (зеркало на сервере тоже берёт releases/latest). Такую сборку
+          # ставят вручную на одну кассу — см. docs/RELEASE.md → «Пилот».
+          prerelease: ${{ contains(github.ref_name, '-') }}
           args: ${{ matrix.args }}

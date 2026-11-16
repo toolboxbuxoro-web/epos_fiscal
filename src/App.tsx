@@ -21,6 +21,7 @@ import {
 import { ensureTelemetryStarted } from '@/lib/telemetry'
 import { ensureSalesSyncStarted } from '@/lib/sales-sync'
 import { ensureFdsSyncStarted } from '@/lib/epos/fds-sync'
+import { ensurePospointSyncStarted } from '@/lib/epos/pospoint-sync'
 import { backfillSearchText } from '@/lib/db'
 import { Toaster } from '@/components/ui'
 import { AppVersionBadge } from '@/components/AppVersionBadge'
@@ -54,6 +55,7 @@ export default function App() {
     // раз в 10 минут, иначе через двое суток ФМ блокирует продажи.
     // Только для бэкенда fiscaldrive. Idempotent, никогда не throw'ит.
     ensureFdsSyncStarted()
+    ensurePospointSyncStarted()
 
     // Разовая индексация старых чеков для поиска в Истории (migration 014).
     // Делаем на старте, чтобы к моменту открытия Истории поиск уже работал.

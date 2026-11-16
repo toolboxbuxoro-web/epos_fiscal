@@ -194,6 +194,9 @@ export async function flushLogsToServer(): Promise<void> {
 export function scrubText(s: string): string {
   return (
     s
+      // Ключ кассы Pospoint — 40 hex-символов. Мы его не логируем, но если
+      // попадёт в текст ошибки (эхо запроса) — на сервер он уйти не должен.
+      .replace(/(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])/gi, '[KEY]')
       // ПИНФЛ — строго 14 цифр подряд (избегаем матча сумм/timestamp).
       // Контекст: '"pinfl":"12345678901234"' / 'PINFL 12345678901234'.
       // Заменяем последовательность 14 цифр окружённую non-digit ничем.

@@ -14,6 +14,15 @@ import {
   type JsonRpcZReportInfo,
 } from '@/lib/epos'
 import { getSetting, SettingKey } from '@/lib/db'
+import {
+  getPospointClient,
+  isPospointShiftClosed,
+  mapPospointXReport,
+  mapPospointZReport,
+  markPospointFmHandedOver,
+  toUserError,
+} from '@/lib/epos/pospoint'
+import { PospointError } from '@/lib/epos/pospoint-client'
 import { tiyinToSumDisplay } from '@/lib/format'
 import { log } from '@/lib/log'
 import {
@@ -37,10 +46,11 @@ import {
  */
 export default function Zreport() {
   const [info, setInfo] = useState<JsonRpcZReportInfo | null>(null)
+  const currentInfo = info
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
-  const [backend, setBackend] = useState<'epos' | 'fiscaldrive'>('epos')
+  const [backend, setBackend] = useState<'epos' | 'fiscaldrive' | 'pospoint'>('epos')
 
   async function getEposClient() {
     const url =
@@ -76,8 +86,30 @@ export default function Zreport() {
   async function refresh() {
     setLoading(true)
     setError(null)
-    const backend = ((await getSetting(SettingKey.FiscalBackend)) ?? 'epos') as 'epos' | 'fiscaldrive'
+    const backend = ((await getSetting(SettingKey.FiscalBackend)) ?? 'epos') as
+      | 'epos'
+      | 'fiscaldrive'
+      | 'pospoint'
     setBackend(backend)
+
+    if (backend === 'pospoint') {
+      try {
+        const client = await getPospointClient()
+        setInfo(mapPospointXReport(await client.getXReport()))
+        setError(null)
+      } catch (e) {
+        // -14 «смена не открыта» — не ошибка, а обычное состояние экрана.
+        if (isPospointShiftClosed(e)) {
+          setInfo(null)
+          setError(null)
+        } else {
+          setError(toUserError(e, 'shift').message)
+        }
+      } finally {
+        setLoading(false)
+      }
+      return
+    }
 
     if (backend === 'fiscaldrive') {
       try {
@@ -126,6 +158,19 @@ export default function Zreport() {
     setError(null)
     const backend = (await getSetting(SettingKey.FiscalBackend)) ?? 'epos'
     try {
+      if (backend === 'pospoint') {
+        // Если смена уже открыта, Pospoint тоже отвечает success — защита не нужна.
+        const client = await getPospointClient()
+        try {
+          await client.openZReport()
+        } catch (e) {
+          throw toUserError(e, 'shift')
+        }
+        await markPospointFmHandedOver()
+        await log.info('epos', 'Pospoint: смена открыта')
+        await refresh()
+        return
+      }
       if (backend === 'fiscaldrive') {
         // Защита от двойного открытия через FDS
         const existing = await getZReportInfoFds().catch(() => null)
@@ -189,6 +234,32 @@ export default function Zreport() {
       // Сохраняем info ДО закрытия (после ФМ может вернуть пустой
       // или другую смену) — нам нужно для печати Z-отчёта с теми же тоталами.
       const closingInfo = info
+      if (backend === 'pospoint') {
+        const client = await getPospointClient()
+        let zInfo: JsonRpcZReportInfo
+        try {
+          const z = await client.closeZReport()
+          zInfo = mapPospointZReport(z)
+          await log.info('epos', `Pospoint: смена закрыта (Z-отчёт ${z.reportNumber ?? ''})`, { z })
+        } catch (e) {
+          if (isPospointShiftClosed(e)) {
+            setError('Смена не открыта или уже закрыта. Нажмите «Обновить» — данные подтянутся.')
+            return
+          }
+          if (e instanceof PospointError && e.has(36907, 36914)) {
+            setError('В смене нет чеков — закрывать нечего.')
+            return
+          }
+          throw toUserError(e, 'shift')
+        }
+        // Печатаем Z по ответу закрытия — там номер отчёта и время закрытия.
+        try { await printReport(true, zInfo) } catch (printErr) {
+          const msg = printErr instanceof Error ? printErr.message : String(printErr)
+          await log.warn('epos', `Z-отчёт не распечатался: ${msg}`)
+        }
+        await refresh()
+        return
+      }
       if (backend === 'fiscaldrive') {
         const { client, factoryId } = await getFdsClient()
         await client.closeZReport(factoryId)
@@ -272,7 +343,8 @@ export default function Zreport() {
    *
    * @param close `true` = Z-отчёт (после закрытия смены), `false` = X-отчёт.
    */
-  async function printReport(close: boolean) {
+  async function printReport(close: boolean, override?: JsonRpcZReportInfo) {
+    const info = override ?? currentInfo
     if (!info) return
     setBusy(true)
     setError(null)
@@ -337,7 +409,13 @@ export default function Zreport() {
     <div className="space-y-4">
       <PageHeader
         title="Смена ККМ"
-        subtitle={backend === 'fiscaldrive' ? 'Текущий X/Z-отчёт от FiscalDriveService' : 'Текущий X/Z-отчёт от EPOS Communicator'}
+        subtitle={
+          backend === 'pospoint'
+            ? 'Текущий X/Z-отчёт от Pospoint'
+            : backend === 'fiscaldrive'
+              ? 'Текущий X/Z-отчёт от FiscalDriveService'
+              : 'Текущий X/Z-отчёт от EPOS Communicator'
+        }
         action={
           <Button
             variant="ghost"
@@ -366,7 +444,11 @@ export default function Zreport() {
             <EmptyState
               icon={<Lock size={48} />}
               title="Смена не открыта"
-              description="Чтобы пробивать чеки — откройте смену. Communicator зарегистрирует X-отчёт, после чего фискализация заработает."
+              description={
+                backend === 'pospoint'
+                  ? 'Pospoint откроет смену сам на первом чеке. Открыть заранее — кнопкой ниже.'
+                  : 'Чтобы пробивать чеки — откройте смену. Communicator зарегистрирует X-отчёт, после чего фискализация заработает.'
+              }
               action={
                 <Button
                   variant="primary"
@@ -398,7 +480,8 @@ export default function Zreport() {
             {/* Информация о смене */}
             <Card>
               <Card.Body className="space-y-3">
-                <Row label="Номер текущего Z-отчёта" value={info.Number.toString()} bold />
+                {/* Pospoint в X-отчёте номер смены не сообщает — прочерк, а не «0». */}
+                <Row label="Номер текущего Z-отчёта" value={info.Number ? info.Number.toString() : '—'} bold />
                 <Row label="Номер фискального модуля" value={info.TerminalID} mono />
                 <Row label="Время открытия смены" value={formatRowDate(info.OpenTime)} />
                 <Row

@@ -41,6 +41,7 @@ import {
   CardNotConnectedError,
 } from '@/lib/epos'
 import { syncFromServer } from '@/lib/inventory'
+import { PospointOutcomeUnknownError } from '@/lib/epos/pospoint'
 import {
   MoyskladClient,
   enrichWithVariants,
@@ -114,6 +115,11 @@ export default function Receipt() {
   const [busy, setBusy] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [fiscalizing, setFiscalizing] = useState(false)
+  /**
+   * Синхронный замок от двойного клика: state обновляется только после
+   * перерисовки, и второй клик успевает пройти проверку `fiscalizing`.
+   */
+  const fiscalizeLock = useRef(false)
   const [testMode, setTestMode] = useState(false)
   /**
    * Если этот ms_receipt УЖЕ фискализирован — храним фискальный чек.
@@ -561,6 +567,8 @@ export default function Receipt() {
       setError('Оплата отгрузки не определена — пробить чек нельзя. Нажмите «Проверить снова».')
       return
     }
+    if (fiscalizeLock.current) return
+    fiscalizeLock.current = true
     setFiscalizing(true)
     setError(null)
     setShiftNotOpen(false)
@@ -590,7 +598,17 @@ export default function Receipt() {
         )
         return
       }
-      toast.success(`Чек фискализирован: ${result.fiscal.FiscalSign}`)
+      if (result.recoveredPrior) {
+        // Касса успела пробить прошлую попытку этого документа — сохранена
+        // она (её подбор и оплата), новый чек не отправлялся.
+        toast.success(
+          `Касса успела пробить прошлую попытку этого документа — сохранена она (признак ${result.fiscal.FiscalSign}). ` +
+            'Новый чек не отправлялся.',
+          { duration: 10000 },
+        )
+      } else {
+        toast.success(`Чек фискализирован: ${result.fiscal.FiscalSign}`)
+      }
       nav('/history')
     } catch (e) {
       // Multi-shop конфликт: другой магазин успел забрать товар.
@@ -722,9 +740,19 @@ export default function Receipt() {
         })
         return
       }
+      // Pospoint не ответил, пробит ли чек — НЕ failed: чек мог уйти в ОФД.
+      // Повтор сначала спросит Pospoint и второй чек не пробьёт.
+      if (e instanceof PospointOutcomeUnknownError) {
+        setError(e.message)
+        toast.error('Неизвестно, пробит ли чек. Нажмите «Фискализировать» ещё раз — программа сначала проверит.', {
+          duration: 10000,
+        })
+        return
+      }
       setError(formatErrorForUser(e))
       await setMsReceiptStatus(receipt.id, 'failed').catch(() => undefined)
     } finally {
+      fiscalizeLock.current = false
       setFiscalizing(false)
     }
   }
