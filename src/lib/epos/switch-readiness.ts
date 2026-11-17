@@ -24,7 +24,7 @@ import { FiscalDriveClient, FiscalDriveError, FISCAL_DRIVE_DEFAULT_URL } from '.
 import { sendPendingToOfd } from './fds-sync'
 import { JsonRpcEposClient, JsonRpcEposError } from './jsonrpc-client'
 import { flushOfd, getPospointClient, isPospointShiftClosed, listPendingAttempts, PospointUserError } from './pospoint'
-import { isNotSent, PospointError, PospointUnavailableError } from './pospoint-client'
+import { PospointError, PospointUnavailableError } from './pospoint-client'
 
 export type FiscalBackendKind = 'epos' | 'fiscaldrive' | 'pospoint'
 
@@ -50,10 +50,22 @@ function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
 }
 
-/** Сбой связи со старой программой: выключена → «не отвечает», иначе — «занята». */
+/** Наш таймаут: программа приняла соединение, но не успела ответить. */
+function isTimeout(e: unknown): boolean {
+  if (e instanceof Error && e.name === 'AbortError') return true
+  return /cancell?ed|abort|timed? ?out/i.test(errText(e))
+}
+
+/**
+ * Сбой связи со старой программой: не успела ответить → «занята, подождите»;
+ * всё остальное → «не отвечает» (кассир может переключиться под свою
+ * ответственность). По тексту «выключена» не узнать: reqwest на отказ в
+ * соединении пишет только «error sending request for url (…)», поэтому
+ * отличаем по обратному признаку — был ли это наш таймаут.
+ */
 function transportFailure(name: string, e: unknown): SwitchReadiness {
   const msg = errText(e)
-  if (isNotSent(msg)) return { status: 'unreachable', detail: `${name} не отвечает (${msg})` }
+  if (!isTimeout(e)) return { status: 'unreachable', detail: `${name} не отвечает (${msg})` }
   return {
     status: 'blocked',
     reasons: [`${name} не ответил вовремя — возможно, отправляет чеки в ОФД. Подождите минуту и повторите.`],

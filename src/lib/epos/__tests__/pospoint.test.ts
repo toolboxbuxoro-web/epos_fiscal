@@ -39,10 +39,22 @@ const {
 
 type FetchCall = { url: string; body: Record<string, unknown> | null }
 
+const isHealth = (url: unknown) => String(url).endsWith('/health')
+const healthUp = () => new Response(JSON.stringify({ status: 'UP' }), { status: 200 })
+
+/**
+ * Программа запущена: на /health отвечает «UP» (клиент спрашивает его перед
+ * каждым запросом), остальное — как задано в тесте.
+ */
+function alive<A extends [string, RequestInit?]>(impl: (...a: A) => Promise<Response>): typeof fetch {
+  return ((...a: A) => (isHealth(a[0]) ? Promise.resolve(healthUp()) : impl(...a))) as unknown as typeof fetch
+}
+
 /** fetch, который отвечает заранее заданными телами и запоминает запросы. */
 function fakeFetch(responses: Array<unknown | ((body: Record<string, unknown>) => unknown)>) {
   const calls: FetchCall[] = []
   const impl = vi.fn(async (url: string, init?: RequestInit) => {
+    if (isHealth(url)) return healthUp()
     const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : null
     calls.push({ url, body })
     const next = responses.shift()
@@ -117,7 +129,7 @@ describe('клиент: формат запроса и ответа', () => {
       order.push(`end ${method}`)
       return new Response(JSON.stringify({ id: 1, result: {} }), { status: 200 })
     })
-    const c = new PospointClient({ baseUrl: freshUrl(), key: 'K', fetchImpl: impl as unknown as typeof fetch })
+    const c = new PospointClient({ baseUrl: freshUrl(), key: 'K', fetchImpl: alive(impl) })
     const a = c.syncWithOfd()
     const b = c.checkFmStatus()
     await new Promise((r) => setTimeout(r, 10))
@@ -138,8 +150,8 @@ describe('клиент: формат запроса и ответа', () => {
       return new Response(JSON.stringify({ id: 1, result: { id: 1, fiscalSign: 'F', isConnected: true } }), { status: 200 })
     })
     const url = freshUrl()
-    const fg = new PospointClient({ baseUrl: url, key: 'K', fetchImpl: impl as unknown as typeof fetch })
-    const bg = new PospointClient({ baseUrl: url, key: 'K', background: true, fetchImpl: impl as unknown as typeof fetch })
+    const fg = new PospointClient({ baseUrl: url, key: 'K', fetchImpl: alive(impl) })
+    const bg = new PospointClient({ baseUrl: url, key: 'K', background: true, fetchImpl: alive(impl) })
     const first = bg.syncWithOfd() // уже выполняется — его не обогнать
     await new Promise((r) => setTimeout(r, 5))
     const waitingBg = bg.checkFmStatus()
@@ -156,21 +168,35 @@ describe('клиент: формат запроса и ответа', () => {
     await expect(c.checkFmStatus()).resolves.toEqual({ isConnected: true })
   })
 
-  it('соединение не установлено — PospointUnavailableError (чек точно не ушёл)', async () => {
-    const impl = vi.fn(async () => {
-      throw new Error('error sending request for url: tcp connect error: Connection refused (os error 61)')
+  it('программа выключена — PospointUnavailableError, запрос с чеком не уходит', async () => {
+    // Так reqwest сообщает об отказе в соединении на кассе: причины в тексте нет.
+    const urls: string[] = []
+    const impl = vi.fn(async (url: string) => {
+      urls.push(url)
+      throw new Error('error sending request for url (http://127.0.0.1:6461/health)')
     })
     const c = new PospointClient({ baseUrl: freshUrl(), key: 'K', fetchImpl: impl as unknown as typeof fetch })
     const e = await c.registerSaleFull({ items: [], byCash: 0, byCard: 0, type: 'SALE', payCheckNumber: 'X' }).catch((x) => x)
     expect(e).toBeInstanceOf(PospointUnavailableError)
     expect(client.isPospointOutcomeUnknown(e)).toBe(false)
+    expect(urls.every((u) => u.endsWith('/health'))).toBe(true)
+  })
+
+  it('программа жива, но запрос оборвался без причины в тексте — исход неизвестен', async () => {
+    const impl = vi.fn(async () => {
+      throw new Error('error sending request for url (http://127.0.0.1:6461/pospoint)')
+    })
+    const c = new PospointClient({ baseUrl: freshUrl(), key: 'K', fetchImpl: alive(impl) })
+    const e = await c.registerSaleFull({ items: [], byCash: 0, byCard: 0, type: 'SALE', payCheckNumber: 'X' }).catch((x) => x)
+    expect(e).toBeInstanceOf(PospointNoAnswerError)
+    expect(client.isPospointOutcomeUnknown(e)).toBe(true)
   })
 
   it('соединение оборвалось после отправки — исход неизвестен', async () => {
     const impl = vi.fn(async () => {
       throw new Error('error sending request: connection closed before message completed')
     })
-    const c = new PospointClient({ baseUrl: freshUrl(), key: 'K', fetchImpl: impl as unknown as typeof fetch })
+    const c = new PospointClient({ baseUrl: freshUrl(), key: 'K', fetchImpl: alive(impl) })
     const e = await c.registerSaleFull({ items: [], byCash: 0, byCard: 0, type: 'SALE', payCheckNumber: 'X' }).catch((x) => x)
     expect(e).toBeInstanceOf(PospointNoAnswerError)
     expect(client.isPospointOutcomeUnknown(e)).toBe(true)
@@ -203,7 +229,7 @@ describe('клиент: формат запроса и ответа', () => {
         (_url: string, init?: RequestInit) =>
           new Promise<Response>((_res, rej) => init!.signal!.addEventListener('abort', () => rej(new Error('aborted')))),
       )
-      const c = new PospointClient({ baseUrl: freshUrl(), key: 'K', fetchImpl: impl as unknown as typeof fetch })
+      const c = new PospointClient({ baseUrl: freshUrl(), key: 'K', fetchImpl: alive(impl) })
       const p = c.registerSaleFull({ items: [], byCash: 0, byCard: 0, type: 'SALE', payCheckNumber: 'X' }).catch((e) => e)
       await vi.advanceTimersByTimeAsync(89_000)
       await vi.advanceTimersByTimeAsync(2_000)

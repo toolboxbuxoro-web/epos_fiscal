@@ -98,7 +98,11 @@ export class PospointBadResponseError extends Error {
   }
 }
 
-/** До программы не достучаться: не запущена, не выполнен вход или выключен «Режим интеграции». */
+/**
+ * До программы не достучаться: не запущена, не выполнен вход, выключен «Режим
+ * интеграции» — или он включён, а сервер интеграции не поднялся (лечится
+ * выключением и включением переключателя). Запрос не уходил: чек не пробит.
+ */
 export class PospointUnavailableError extends Error {
   constructor(
     readonly method: string,
@@ -421,6 +425,13 @@ export class PospointClient {
 
   private async send<T>(method: string, params: object, timeoutMs: number): Promise<T> {
     const f = this.opts.fetchImpl ?? fetch
+    // «Программа выключена» узнаём ДО отправки. По тексту ошибки этого не
+    // понять: reqwest на отказ в соединении отвечает тем же «error sending
+    // request for url (…)», что и на обрыв посреди запроса. Без проверки
+    // выключенный Pospoint выглядел как «ответ потерялся»: чек попадал в
+    // журнал с неизвестным исходом и блокировался до сверки (Хазрати, 17.11).
+    // /health отвечает сразу, даже когда касса занята чеком.
+    if (!(await this.health())) throw new PospointUnavailableError(method, 'нет ответа на /health')
     const body = {
       method,
       id: nextRequestId(),

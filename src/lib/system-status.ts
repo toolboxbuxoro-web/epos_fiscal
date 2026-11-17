@@ -98,7 +98,7 @@ function pospointIssue(pp: PospointHealth): SystemIssue | null {
     case 'pos-auth':
       return err('pos-auth', 'Pospoint: касса не авторизована в ФМ', 'Обратитесь в поддержку Pospoint')
     case 'down':
-      return err('down', 'Pospoint не отвечает', 'Откройте программу Pospoint, войдите и включите «Режим интеграции»')
+      return err('down', 'Pospoint не отвечает', 'Откройте программу Pospoint, войдите и включите «Режим интеграции». Уже включён — выключите и включите снова')
     case 'fm-disconnected':
       return err('fm', 'Pospoint: фискальный модуль не подключён', 'Проверьте USB-ридер ФМ')
     default:

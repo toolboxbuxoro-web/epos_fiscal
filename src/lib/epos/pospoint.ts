@@ -829,7 +829,7 @@ export function toUserError(e: unknown, op: Operation): Error {
   if (e instanceof PospointUserError) return e
   if (e instanceof PospointUnavailableError) {
     return new PospointUserError(
-      'Программа Pospoint не отвечает. Откройте Pospoint, войдите и включите «Режим интеграции» (значок вверху экрана) и «Использовать локальный адрес», затем повторите.',
+      'Программа Pospoint не отвечает. Откройте Pospoint, войдите и включите «Режим интеграции» (значок вверху экрана) и «Использовать локальный адрес». Если они уже включены — выключите и включите «Режим интеграции» снова. Чек не пробит, затем повторите.',
     )
   }
   if (e instanceof PospointNoAnswerError || e instanceof PospointBadResponseError) {

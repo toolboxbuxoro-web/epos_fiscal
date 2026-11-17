@@ -268,15 +268,15 @@ class FakePospoint {
       json: async () => payload,
     })
     if (String(url).endsWith('/health')) {
-      if (this.down) return Promise.reject(new Error('error sending request: Connection refused (os error 61)'))
+      if (this.down) return Promise.reject(new Error('error sending request for url (http://127.0.0.1:6461/pospoint)'))
       return Promise.resolve(reply({ status: 'UP' }))
     }
-    if (this.down) return Promise.reject(new Error('error sending request: Connection refused (os error 61)'))
+    if (this.down) return Promise.reject(new Error('error sending request for url (http://127.0.0.1:6461/pospoint)'))
     const body = JSON.parse(String(init.body))
     const fault = this.faults[body.method]?.shift()
     if (fault?.kind === 'refused') {
       this.calls.push({ method: body.method, params: body.params, t: Date.now(), served: false })
-      return Promise.reject(new Error('error sending request: Connection refused (os error 61)'))
+      return Promise.reject(new Error('error sending request for url (http://127.0.0.1:6461/pospoint)'))
     }
     const signal: AbortSignal | undefined = init?.signal
     return new Promise((resolve, reject) => {
@@ -735,6 +735,28 @@ describe('продажа', () => {
     expect(r2.ok, msg(r2)).toBe(true)
     expect(fake.sales()).toHaveLength(1)
     expect(H.fr).toHaveLength(1)
+  })
+
+  it('Pospoint выключен в момент чека — «не отвечает», документ не блокируется; включили — один чек', async () => {
+    // Хазрати Имом, 17.11.2026: сервер интеграции не поднялся, а отказ в
+    // соединении приходит без причины в тексте — чек считался «исход
+    // неизвестен» и блокировался до сверки.
+    fake.down = true
+    const b = mkBuild([cand(esf(1), 1000, 2_400_000)], 'doc-off')
+    const r1 = await sell(b, cash(2_400_000))
+    expect(r1.ok).toBe(false)
+    expect(r1.error).not.toBeInstanceOf(M.pp.PospointOutcomeUnknownError)
+    expect(msg(r1)).toMatch(/Pospoint не отвечает.*Чек не пробит/s)
+    expect(await pendingNames()).toEqual([])
+    expect(alarms()).toEqual([])
+    expect(H.fr).toHaveLength(0)
+
+    fake.down = false
+    const r2 = await sell(b, { ...cash(2_400_000), msReceiptId: r1.msReceiptId })
+    expect(r2.ok, msg(r2)).toBe(true)
+    expect(fake.sales()).toHaveLength(1)
+    expect(H.fr).toHaveLength(1)
+    expect(await pendingNames()).toEqual([])
   })
 
   it('исход неизвестен (касса молчит и на поиск) — повтор с другим подбором сохраняет ПРОШЛЫЙ чек', async () => {
@@ -1233,7 +1255,7 @@ describe('переключение кассы на другую программ
 
   function epos(state: { zOpen?: boolean; unsent?: number; down?: boolean; blank?: boolean }) {
     H.fetch = async (url: string, init?: any) => {
-      if (state.down) throw new Error('error sending request: Connection refused (os error 61)')
+      if (state.down) throw new Error('error sending request for url (http://127.0.0.1:6461/pospoint)')
       const body = JSON.parse(String(init.body))
       if (body.method === 'Api.GetZReportInfo') {
         return reply({ jsonrpc: '2.0', id: body.id, result: state.blank
