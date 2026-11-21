@@ -628,15 +628,49 @@ async function lookupReceipt(
 }
 
 /** Снимок счётчиков смены: X-отчёт, 'closed' — смена не открыта, null — не узнали. */
-type XSnap = { saleCount: number; refundCount: number; lastReceiptSeq: number | null } | 'closed' | null
+export type XSnap = { saleCount: number; refundCount: number; lastReceiptSeq: number } | 'closed' | null
 
 async function xSnapshot(client: PospointClient): Promise<XSnap> {
   try {
     const x = await client.getXReport()
-    return { saleCount: x.saleCount ?? 0, refundCount: x.refundCount ?? 0, lastReceiptSeq: x.lastReceiptSeq ?? null }
+    // Пустая смена: Pospoint отдаёт 0 (или не отдаёт поле) — сводим к 0,
+    // иначе «нет поля» и «0» сравнивались бы как сдвиг счётчиков.
+    return { saleCount: x.saleCount ?? 0, refundCount: x.refundCount ?? 0, lastReceiptSeq: x.lastReceiptSeq ?? 0 }
   } catch (e) {
     return isPospointShiftClosed(e) ? 'closed' : null
   }
+}
+
+/**
+ * Пауза после открытия смены. Pospoint открывает смену сам на первом чеке, и
+ * если открытие и чек попадают в одну секунду, ФМ отвергает чек с 36888
+ * «время чека в прошлом» (время чека должно быть позже открытия смены).
+ */
+export const SHIFT_OPEN_SETTLE_MS = 1_500
+
+/**
+ * Смена закрыта — открываем её сами и ждём, пока время уйдёт за секунду
+ * открытия; только потом отправляем чек. Возвращает снимок счётчиков, с
+ * которым сравнивать после сбоя.
+ */
+async function prepareShift(client: PospointClient, source: 'fiscalize' | 'refund'): Promise<XSnap> {
+  const before = await xSnapshot(client)
+  if (before !== 'closed') return before
+  await log.info(source, 'Pospoint: смена закрыта — открываю её перед чеком')
+  try {
+    await client.openZReport()
+  } catch (e) {
+    // Смену мог успеть открыть кто-то ещё (кассир в самом Pospoint) — проверяем.
+    const now = await xSnapshot(client)
+    if (now === 'closed' || now === null) {
+      throw new PospointUserError(
+        `Смена в Pospoint закрыта, и открыть её не удалось: ${toUserError(e, 'shift').message} Чек не пробит — откройте смену в разделе «Смена» и повторите.`,
+        e instanceof PospointError ? e.codes : [],
+      )
+    }
+  }
+  await new Promise((res) => setTimeout(res, SHIFT_OPEN_SETTLE_MS))
+  return xSnapshot(client)
 }
 
 /**
@@ -660,12 +694,21 @@ function isFmAbsent(e: unknown): boolean {
   return e instanceof PospointError && e.errors.every((x) => x.code === 4240 || x.code === 4100)
 }
 
-/** Сдвинулись ли счётчики смены: true / false, null — сравнить не по чему. */
-function xMoved(before: XSnap, after: XSnap, op: 'sale' | 'refund'): boolean | null {
+/**
+ * Сдвинулись ли счётчики смены: true / false, null — сравнить не по чему.
+ *
+ * Смена была закрыта: Pospoint открывает её сам на первом чеке, даже если
+ * чек ФМ отверг, — поэтому «смена открылась» не значит «чек подписан».
+ * Смотрим только счётчики. lastReceiptSeq у пустой смены Pospoint отдаёт 0,
+ * а не пустое значение: прежняя проверка `!== null` принимала этот 0 за
+ * подписанный чек и блокировала документ до сверки (Хонабод 20.11,
+ * Донбозор 21.11 — оба раза первый чек дня с ошибкой 36888).
+ */
+export function xMoved(before: XSnap, after: XSnap, op: 'sale' | 'refund'): boolean | null {
   if (before === null || after === null) return null
   if (before === 'closed') {
     if (after === 'closed') return false
-    return (op === 'sale' ? after.saleCount : after.refundCount) > 0 || after.lastReceiptSeq !== null
+    return (op === 'sale' ? after.saleCount : after.refundCount) > 0 || after.lastReceiptSeq > 0
   }
   if (after === 'closed') return null
   const key = op === 'sale' ? 'saleCount' : 'refundCount'
@@ -789,6 +832,14 @@ export async function sendWithRecovery(
         )
       }
       // Точно не пробит. Поправимое лечим и пробуем ещё раз.
+      if (attempt === 0 && e instanceof PospointError && e.has(36888, 36916)) {
+        // «Время чека в прошлом»: чаще всего чек попал в ту же секунду, что
+        // и открытие смены. Через пару секунд проходит; если часы компьютера
+        // и правда отстают — повтор получит ту же ошибку и кассир увидит её.
+        await log.warn(source, `Pospoint: ФМ ответил «время чека в прошлом» (${codes.join(', ')}) — повторяю через 2 сек`)
+        await new Promise((res) => setTimeout(res, 2_000))
+        return sendWithRecovery(client, op, payCheckNumber, call, { before: await xSnapshot(client) }, attempt + 1)
+      }
       if (attempt === 0 && e instanceof PospointError) {
         const unsent = e.has(36886, 36889, 37105) || (e.has(36913) && (op === 'sale' || isApplet4() !== false))
         if (unsent) {
@@ -972,16 +1023,15 @@ export async function fiscalizePospoint(input: {
     at: Date.now(),
   }
   await setPendingAttempt(input.payCheckNumber, attempt)
-  const before = await xSnapshot(client)
-
-  await log.info('fiscalize', 'Отправляю registerSaleFull в Pospoint', {
-    url: client.baseUrl,
-    payCheckNumber: input.payCheckNumber,
-    params: sale.params,
-  })
 
   let result: SendResult
   try {
+    const before = await prepareShift(client, 'fiscalize')
+    await log.info('fiscalize', 'Отправляю registerSaleFull в Pospoint', {
+      url: client.baseUrl,
+      payCheckNumber: input.payCheckNumber,
+      params: sale.params,
+    })
     result = await sendWithRecovery(
       client,
       'sale',
@@ -1201,11 +1251,11 @@ export async function sendRefundPospoint(input: {
     at: Date.now(),
   }
   await setPendingAttempt(payCheckNumber, attempt)
-  const before = await xSnapshot(client)
-  await log.info('refund', 'Отправляю registerRefundFull в Pospoint', { url: client.baseUrl, params: built.params })
 
   let result: SendResult
   try {
+    const before = await prepareShift(client, 'refund')
+    await log.info('refund', 'Отправляю registerRefundFull в Pospoint', { url: client.baseUrl, params: built.params })
     result = await sendWithRecovery(client, 'refund', payCheckNumber, () => client.registerRefundFull(built.params), {
       before,
     })

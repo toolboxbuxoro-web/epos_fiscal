@@ -87,6 +87,34 @@ beforeEach(() => {
   settings.clear()
 })
 
+describe('сверка счётчиков смены после сбоя (xMoved)', () => {
+  const snap = (saleCount: number, refundCount: number, lastReceiptSeq: number) => ({ saleCount, refundCount, lastReceiptSeq })
+
+  it('смена была закрыта, Pospoint открыл её, а чек ФМ отверг (пустая смена, номер 0) — не сдвинулись', () => {
+    // Хонабод 20.11, Донбозор 21.11: так выглядел X-отчёт после 36888.
+    expect(pp.xMoved('closed', snap(0, 0, 0), 'sale')).toBe(false)
+    expect(pp.xMoved('closed', snap(0, 0, 0), 'refund')).toBe(false)
+  })
+
+  it('смена была закрыта, а в ней появился чек — сдвинулись', () => {
+    expect(pp.xMoved('closed', snap(1, 0, 1), 'sale')).toBe(true)
+    expect(pp.xMoved('closed', snap(0, 1, 1), 'refund')).toBe(true)
+    expect(pp.xMoved('closed', snap(0, 0, 7), 'sale')).toBe(true)
+  })
+
+  it('смена осталась закрытой — не сдвинулись; X-отчёт не прочитан — сравнить не по чему', () => {
+    expect(pp.xMoved('closed', 'closed', 'sale')).toBe(false)
+    expect(pp.xMoved('closed', null, 'sale')).toBe(null)
+    expect(pp.xMoved(null, snap(0, 0, 0), 'sale')).toBe(null)
+  })
+
+  it('открытая смена: сравнение счётчиков', () => {
+    expect(pp.xMoved(snap(3, 0, 3), snap(3, 0, 3), 'sale')).toBe(false)
+    expect(pp.xMoved(snap(3, 0, 3), snap(4, 0, 4), 'sale')).toBe(true)
+    expect(pp.xMoved(snap(3, 0, 3), 'closed', 'sale')).toBe(null)
+  })
+})
+
 describe('клиент: формат запроса и ответа', () => {
   it('POST /pospoint: id только цифрами, версия 1.0.2, ключ кассы', async () => {
     const f = fakeFetch([{ id: 1, result: { id: 77, fiscalSign: 'FS' } }])
@@ -423,7 +451,7 @@ describe('ключ кассы', () => {
 
 describe('защита от двойного пробития (sendWithRecovery)', () => {
   const answer = { id: 9, fiscalSign: 'FS9', fmNo: 'LG4', time: Date.parse('2026-11-09T10:00:00'), url: 'u' }
-  const x = (saleCount: number, refundCount = 0, lastReceiptSeq: number | null = saleCount + refundCount) => ({
+  const x = (saleCount: number, refundCount = 0, lastReceiptSeq: number = saleCount + refundCount) => ({
     saleCount,
     refundCount,
     lastReceiptSeq,

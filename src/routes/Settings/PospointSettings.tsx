@@ -77,7 +77,7 @@ export function PospointSettings({ url, apiKey, onUrl, onKey }: Props) {
       const client = new PospointClient({ baseUrl: url, key })
       if (!(await client.health())) {
         setMsg(
-          `Pospoint не отвечает по адресу ${client.baseUrl}. Откройте программу, войдите и включите «Режим интеграции» и «Использовать локальный адрес».`,
+          `Pospoint не отвечает по адресу ${client.baseUrl}. Откройте программу, войдите и включите «Режим интеграции» и «Использовать локальный адрес». Если они уже включены — выключите и включите «Режим интеграции» снова.`,
         )
         return
       }

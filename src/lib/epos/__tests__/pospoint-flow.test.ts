@@ -236,6 +236,12 @@ class FakePospoint {
   fmUnsentBlock = false
   fmNeedsSync = false
   fmConnected = true
+  /**
+   * Как настоящий ФМ: чек, пришедший при закрытой смене, Pospoint открывает
+   * смену и отправляет в ту же секунду — ФМ отвергает его с 36888, смена
+   * остаётся открытой и пустой.
+   */
+  timePastOnAutoOpen = false
   down = false
   strictRefundValue = false
   faults: Record<string, Fault[]> = {}
@@ -387,8 +393,9 @@ class FakePospoint {
             refundCashTotal: t(rf, 'byCash'),
             refundCardTotal: t(rf, 'byCard'),
             totalVat: 0,
-            firstReceiptSeq: inShift[0]?.id,
-            lastReceiptSeq: inShift.at(-1)?.id,
+            // Настоящий Pospoint у пустой смены отдаёт 0, а не пустое значение.
+            firstReceiptSeq: inShift[0]?.id ?? 0,
+            lastReceiptSeq: inShift.at(-1)?.id ?? 0,
           },
         }
       }
@@ -454,6 +461,10 @@ class FakePospoint {
     if (p.payCheckNumber && this.byPay(p.payCheckNumber)) return err(id, 14824)
     if (this.fmNeedsSync) return err(id, 37008)
     if (this.fmUnsentBlock && this.unsent > 0) return err(id, 36889)
+    if (!this.shiftOpen && this.timePastOnAutoOpen) {
+      this.shiftOpen = true
+      return err(id, 36888)
+    }
     this.shiftOpen = true
     const rid = ++this.nextId
     const answer = this.answerFor(rid)
@@ -498,6 +509,11 @@ class FakePospoint {
       this.notes.push(`сумма возврата ${cash + card} > стоимости позиций с учётом скидок ${valueT.toFixed(3)} (тийины)`)
       if (this.strictRefundValue) return err(id, 14807)
     }
+    if (!this.shiftOpen && this.timePastOnAutoOpen) {
+      this.shiftOpen = true
+      return err(id, 36888)
+    }
+    this.shiftOpen = true
     const rid = ++this.nextId
     const answer = this.answerFor(rid)
     this.receipts.push({ id: rid, kind: 'refund', payCheckNumber: p.payCheckNumber, params: structuredClone(p), answer, shift: this.shiftNo, refundOf: sale.id })
@@ -786,6 +802,62 @@ describe('продажа', () => {
     expect(await pendingNames()).toEqual([])
   })
 
+  it('первый чек дня при закрытой смене — открываем смену сами и ждём; ФМ не отвергает чек', async () => {
+    // Хонабод 20.11, Донбозор 21.11: Pospoint открывал смену сам и в ту же
+    // секунду слал чек — ФМ отвечал 36888, документ блокировался до сверки.
+    fake.timePastOnAutoOpen = true
+    const r = await sell(mkBuild([cand(esf(1), 1000, 2_400_000)], 'doc-morning'), cash(2_400_000))
+    expect(r.ok, msg(r)).toBe(true)
+    expect(fake.count('openZReport')).toBe(1)
+    expect(fake.count('registerSaleFull')).toBe(1)
+    const open = fake.calls.find((c) => c.method === 'openZReport')!
+    const sale = fake.calls.find((c) => c.method === 'registerSaleFull')!
+    expect(sale.t - open.t).toBeGreaterThanOrEqual(1_000)
+    expect(fake.sales()).toHaveLength(1)
+    expect(await pendingNames()).toEqual([])
+    expect(alarms()).toEqual([])
+  })
+
+  it('смена уже открыта — лишний раз не открываем', async () => {
+    fake.shiftOpen = true
+    const r = await sell(mkBuild([cand(esf(1), 1000, 2_400_000)]), cash(2_400_000))
+    expect(r.ok, msg(r)).toBe(true)
+    expect(fake.count('openZReport')).toBe(0)
+  })
+
+  it('ФМ ответил «время чека в прошлом» (36888) — чек не пробит: повтор через 2 сек, без блокировки', async () => {
+    fake.shiftOpen = true
+    fake.inject('registerSaleFull', { kind: 'error', codes: [36888] })
+    const r = await sell(mkBuild([cand(esf(1), 1000, 2_400_000)], 'doc-tp'), cash(2_400_000))
+    expect(r.ok, msg(r)).toBe(true)
+    expect(fake.count('registerSaleFull')).toBe(2)
+    expect(fake.sales()).toHaveLength(1)
+    expect(H.fr).toHaveLength(1)
+    expect(await pendingNames()).toEqual([])
+    expect(alarms()).toEqual([])
+  })
+
+  it('часы компьютера и правда отстают (36888 каждый раз) — «проверьте время», документ не блокируется', async () => {
+    fake.shiftOpen = true
+    fake.inject('registerSaleFull', { kind: 'error', codes: [36888] }, { kind: 'error', codes: [36888] })
+    const r = await sell(mkBuild([cand(esf(1), 1000, 2_400_000)], 'doc-clock'), cash(2_400_000))
+    expect(r.ok).toBe(false)
+    expect(r.error).not.toBeInstanceOf(M.pp.PospointOutcomeUnknownError)
+    expect(msg(r)).toMatch(/Время на компьютере/)
+    expect(fake.count('registerSaleFull')).toBe(2)
+    expect(await pendingNames()).toEqual([])
+    expect(alarms()).toEqual([])
+  })
+
+  it('смена закрыта и не открывается — понятная ошибка, чек не отправлен, документ не блокируется', async () => {
+    fake.inject('openZReport', { kind: 'error', codes: [37011] })
+    const r = await sell(mkBuild([cand(esf(1), 1000, 2_400_000)], 'doc-noopen'), cash(2_400_000))
+    expect(r.ok).toBe(false)
+    expect(msg(r)).toMatch(/открыть её не удалось.*Чек не пробит/s)
+    expect(fake.count('registerSaleFull')).toBe(0)
+    expect(await pendingNames()).toEqual([])
+  })
+
   it('ФМ подписал чек, а Pospoint номер не записал — документ заблокирован до сверки', async () => {
     fake.inject('registerSaleFull', { kind: 'phantom' })
     const b = mkBuild([cand(esf(1), 1000, 2_400_000)], 'doc-E')
@@ -984,6 +1056,21 @@ describe('возврат', () => {
     expect(await pendingNames()).toEqual([])
     expect(inv('unconsume')).toHaveLength(1)
     expect(H.refunds[0].request_json).not.toContain('REAL-KEY')
+  })
+
+  it('возврат при закрытой смене — смену открываем сами, ФМ не отвергает возврат', async () => {
+    const { row, sale } = await saleFor([cand(esf(1), 1000, 2_400_000)], { cashTiyin: 2_400_000, cardTiyin: 0 })
+    // Смена закрылась (конец дня), возврат — утром.
+    fake.shiftOpen = false
+    fake.shiftNo++
+    fake.timePastOnAutoOpen = true
+    const opens = fake.count('openZReport')
+    const r = await settle(M.processRefund({ originalFiscalId: row.id }))
+    expect(r.ok, msg(r)).toBe(true)
+    expect(fake.count('openZReport')).toBe(opens + 1)
+    expect(fake.refundsOf(sale.id)).toHaveLength(1)
+    expect(await pendingNames()).toEqual([])
+    expect(alarms()).toEqual([])
   })
 
   it('строки с одним ИКПУ: касса находит именно выбранную строку', async () => {
